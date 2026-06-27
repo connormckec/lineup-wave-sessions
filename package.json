@@ -1,0 +1,13 @@
+{
+  "name": "ap-session-watcher",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "playwright": "1.46.0"
+  }
+}

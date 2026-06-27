@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0a0f1e">
+<title>AP Sessions</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#080d1a;--card:#101824;--card2:#0c1422;--border:#1a2744;--border2:#243350;
+  --text:#e2e8f0;--sub:#64748b;--muted:#2a3a55;
+  --blue:#3b82f6;--green:#22c55e;--orange:#f59e0b;--red:#ef4444;
+  --nav-h:62px;
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden}
+#app{display:flex;flex-direction:column;height:100dvh;max-width:480px;margin:0 auto}
+
+/* ── Status bar ── */
+#status-bar{padding:12px 16px 10px;background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0;display:flex;justify-content:space-between;align-items:center}
+#status-bar h1{font-size:17px;font-weight:700;letter-spacing:-.3px}
+#status-meta{font-size:11px;color:var(--sub);margin-top:2px;display:flex;align-items:center;gap:5px}
+#ntfy-dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+#ntfy-dot.ok{background:var(--green)}
+#refresh-btn{width:34px;height:34px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+#refresh-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#refresh-btn.spinning svg{animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Content & tabs ── */
+#content{flex:1;overflow:hidden;position:relative}
+.pane{position:absolute;inset:0;overflow-y:auto;padding:12px 12px calc(var(--nav-h)+4px);display:none}
+.pane.active{display:block}
+
+/* ── Bottom nav ── */
+#nav{height:var(--nav-h);background:var(--card);border-top:1px solid var(--border);display:flex;flex-shrink:0}
+.nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border:none;background:none;color:var(--sub);font-size:10px;font-family:inherit;cursor:pointer}
+.nav-btn.on{color:var(--blue)}
+.nav-btn svg{width:21px;height:21px;stroke-width:1.8;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+.wbadge{min-width:18px;height:18px;background:var(--blue);color:#fff;border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center}
+
+/* ── Day chips ── */
+.chips{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:10px}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex-shrink:0;padding:6px 14px;border-radius:20px;border:1px solid var(--border2);background:transparent;color:var(--sub);font-size:13px;font-family:inherit;cursor:pointer;white-space:nowrap}
+.chip.on{background:rgba(59,130,246,.15);border-color:var(--blue);color:var(--blue);font-weight:600}
+
+/* ── Session cards ── */
+.sc{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;margin-bottom:7px;cursor:pointer}
+.sc.watching{border-color:var(--blue);background:rgba(59,130,246,.04)}
+.sc:active{background:var(--card2)}
+.sc-bar{width:4px;height:40px;border-radius:2px;flex-shrink:0}
+.sc-main{flex:1;min-width:0}
+.sc-time{font-size:15px;font-weight:600;line-height:1.2}
+.sc-level{font-size:12px;margin-top:2px}
+.sc-wave{font-size:11px;color:var(--sub);margin-top:1px}
+.sc-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.status-pill{display:flex;align-items:center;gap:5px;font-size:12px;font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-open{background:var(--green)}
+.dot-full{background:#374151}
+.dot-low{background:var(--orange)}
+.slot-tag{font-size:11px;font-weight:700;color:var(--orange);background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.25);border-radius:6px;padding:2px 6px;white-space:nowrap}
+.bell-btn{width:36px;height:36px;border-radius:50%;border:1.5px solid var(--border2);background:transparent;color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .12s}
+.bell-btn.on{border-color:var(--blue);background:rgba(59,130,246,.15);color:var(--blue)}
+.bell-btn svg{width:17px;height:17px;stroke-width:2;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+.bell-btn.on svg{fill:currentColor}
+
+/* ── Watch tab ── */
+.wc{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:13px 14px;margin-bottom:8px}
+.wc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.wc-title{font-size:14px;font-weight:600}
+.wc-meta{font-size:12px;color:var(--sub);margin-top:2px}
+.wc-status{font-size:13px;font-weight:600;display:flex;align-items:center;gap:5px;margin-top:4px}
+.rm-btn{background:transparent;border:1px solid var(--border2);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0}
+.empty{text-align:center;padding:48px 20px;color:var(--sub);line-height:1.8;font-size:14px}
+
+/* ── Setup tab ── */
+.setup-block{margin-bottom:22px}
+.setup-block h3{font-size:14px;font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:7px}
+.setup-block p{font-size:13px;color:var(--sub);line-height:1.6;margin-bottom:10px}
+.step{display:flex;gap:10px;margin-bottom:9px;align-items:flex-start}
+.step-n{width:22px;height:22px;border-radius:50%;background:var(--muted);color:var(--sub);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step p{font-size:13px;color:var(--sub);line-height:1.5;margin:0}
+.mono-box{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:monospace;font-size:13px;color:#7dd3fc;word-break:break-all;margin-bottom:8px}
+.pill-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.carrier{padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--sub);font-size:12px;cursor:pointer;font-family:inherit}
+.carrier.on{border-color:var(--blue);background:rgba(59,130,246,.12);color:var(--blue)}
+input.field{width:100%;background:var(--card2);border:1px solid var(--border2);border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px;font-family:inherit;outline:none;margin-bottom:8px}
+input.field:focus{border-color:var(--blue)}
+.btn{padding:10px 18px;border-radius:10px;border:none;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn-blue{background:var(--blue);color:#fff}
+.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--sub)}
+.divider{height:1px;background:var(--border);margin:16px 0}
+.lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="status-bar">
+    <div>
+      <div id="title-row" style="display:flex;align-items:center;gap:8px">
+        <h1>🏄 AP Sessions</h1>
+      </div>
+      <div id="status-meta">
+        <div id="ntfy-dot"></div>
+        <span id="status-text">Loading...</span>
+      </div>
+    </div>
+    <button id="refresh-btn" onclick="refresh()" aria-label="Refresh sessions">
+      <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+    </button>
+  </div>
+
+  <div id="content">
+
+    <!-- BROWSE TAB -->
+    <div class="pane active" id="pane-browse">
+      <div class="chips" id="day-chips"></div>
+      <div class="chips" id="level-chips"></div>
+      <div id="session-list"></div>
+    </div>
+
+    <!-- WATCHING TAB -->
+    <div class="pane" id="pane-watching">
+      <div id="watch-list"></div>
+    </div>
+
+    <!-- SETUP TAB -->
+    <div class="pane" id="pane-setup">
+      <div class="setup-block">
+        <h3>📱 Push notifications</h3>
+        <p>Install the free <strong>Ntfy</strong> app (App Store or Google Play). Then subscribe to your topic:</p>
+        <div class="lbl">Your Ntfy topic (from Railway env var)</div>
+        <div class="mono-box" id="ntfy-topic-box">Set NTFY_TOPIC in Railway → Variables</div>
+        <div id="ntfy-status-msg" style="font-size:12px;color:var(--sub);margin-bottom:10px"></div>
+        <div class="step"><div class="step-n">1</div><p>Install Ntfy from the App Store or Google Play (it's free)</p></div>
+        <div class="step"><div class="step-n">2</div><p>Open Ntfy → tap <strong>+</strong> → subscribe to the topic above</p></div>
+        <div class="step"><div class="step-n">3</div><p>That's it — notifications will come through instantly like texts</p></div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="setup-block">
+        <h3>💬 Or: real SMS texts (free, no account)</h3>
+        <p>Every US carrier has an email-to-SMS gateway. Add your number + carrier as a Railway env var called <code style="font-size:12px;background:var(--card2);padding:2px 5px;border-radius:4px">SMS_ADDRESS</code>.</p>
+        <div class="lbl">Pick your carrier</div>
+        <div class="pill-row" id="carrier-pills"></div>
+        <div class="lbl">Your 10-digit number</div>
+        <input class="field" type="tel" id="phone-input" placeholder="7575551234" maxlength="10" oninput="updateSms()">
+        <div class="lbl">Set this as SMS_ADDRESS in Railway → Variables</div>
+        <div class="mono-box" id="sms-address">Select carrier + enter number</div>
+        <button class="btn btn-outline" onclick="copySms()">Copy address</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="setup-block">
+        <h3>⚙️ Watcher settings</h3>
+        <p>These are Railway env vars you can set in the Variables tab to tune the watcher.</p>
+        <div style="font-size:12px;color:var(--sub);line-height:2">
+          <code style="color:#7dd3fc">NTFY_TOPIC</code> — your push notification topic<br>
+          <code style="color:#7dd3fc">LOW_SLOTS_THRESHOLD</code> — alert when slots ≤ this (default: 2)<br>
+          <code style="color:#7dd3fc">CHECK_EVERY_MINS</code> — how often to check (default: 5)<br>
+          <code style="color:#7dd3fc">SMS_ADDRESS</code> — your carrier SMS email address
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <nav id="nav">
+    <button class="nav-btn on" onclick="showTab('browse',this)" id="nav-browse">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      Browse
+    </button>
+    <button class="nav-btn" onclick="showTab('watching',this)" id="nav-watching">
+      <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      <span id="watch-badge">Watching</span>
+    </button>
+    <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Setup
+    </button>
+  </nav>
+
+</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const LEVELS = {
+  'Intermediate':    {s:'INT', c:'#3b82f6', pri:true},
+  'Progressive':     {s:'PRG', c:'#22c55e', pri:true},
+  'Advanced Turns':  {s:'AT',  c:'#8b5cf6', pri:true},
+  'Advanced Barrels':{s:'AB',  c:'#ec4899', pri:true},
+  'Expert Turns':    {s:'ET',  c:'#f97316', pri:false},
+  'Expert Barrels':  {s:'EB',  c:'#ef4444', pri:false},
+  'Pro Turns':       {s:'PT',  c:'#eab308', pri:false},
+  'Boogie Nitez':    {s:'BOG', c:'#a855f7', pri:false},
+};
+
+const CARRIERS = {
+  'AT&T':       '@txt.att.net',
+  'Verizon':    '@vtext.com',
+  'T-Mobile':   '@tmomail.net',
+  'Sprint':     '@messaging.sprintpcs.com',
+  'Cricket':    '@mms.cricketwireless.net',
+  'Metro PCS':  '@mymetropcs.com',
+  'Boost':      '@sms.myboostmobile.com',
+  'US Cellular':'@email.uscc.net',
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let data       = { sessions: [], watchList: [], history: {}, lastCheck: null, ntfyOk: false };
+let activeDay  = null;
+let carrier    = localStorage.getItem('carrier') || '';
+
+// ── Fetch from server ─────────────────────────────────────────────────────────
+async function refresh() {
+  const btn = document.getElementById('refresh-btn');
+  btn.classList.add('spinning');
+  try {
+    const res  = await fetch('/api/status');
+    data = await res.json();
+    const days = [...new Set(data.sessions.map(s => s.dayLabel))];
+    if (!activeDay || !days.includes(activeDay)) activeDay = days[0] || null;
+    renderAll();
+  } catch (e) {
+    document.getElementById('status-text').textContent = 'Connection error';
+  } finally {
+    btn.classList.remove('spinning');
+  }
+}
+
+// ── Render everything ─────────────────────────────────────────────────────────
+function renderAll() {
+  renderStatusBar();
+  renderBrowse();
+  renderWatching();
+  renderSetup();
+}
+
+function renderStatusBar() {
+  const dot  = document.getElementById('ntfy-dot');
+  const txt  = document.getElementById('status-text');
+  const open = data.sessions.filter(s => s.available).length;
+  dot.className = data.ntfyOk ? 'ok' : '';
+
+  let timeStr = 'not checked yet';
+  if (data.lastCheck) {
+    const diff = Math.round((Date.now() - new Date(data.lastCheck)) / 60000);
+    timeStr = diff < 1 ? 'just now' : `${diff}m ago`;
+  }
+  txt.textContent = `${open} open · checked ${timeStr}`;
+}
+
+function renderBrowse() {
+  const days    = [...new Set(data.sessions.map(s => s.dayLabel))];
+  const dayEl   = document.getElementById('day-chips');
+  dayEl.innerHTML = days.map(d =>
+    `<button class="chip${d===activeDay?' on':''}" onclick="setDay('${d}')">${d}</button>`
+  ).join('');
+
+  const daySessions = data.sessions.filter(s => s.dayLabel === activeDay);
+  const levels      = [...new Set(daySessions.map(s => s.level))];
+  const lvlEl       = document.getElementById('level-chips');
+  const filtered    = LEVELS;  // show all that exist in data
+  lvlEl.innerHTML   = levels.filter(l => LEVELS[l]).map(l => {
+    const c = LEVELS[l];
+    return `<button class="chip" style="border-color:${c.c}33;color:${c.c}">${c.s}${c.pri?' ★':''}</button>`;
+  }).join('');
+
+  const listEl = document.getElementById('session-list');
+  listEl.innerHTML = daySessions.map(s => {
+    const cfg     = LEVELS[s.level] || {s:'?',c:'#888'};
+    const watched = data.watchList.some(w => w.key === s.key);
+    const hist    = data.history[s.key] || {};
+    const slots   = s.slots ?? hist.slots;
+    const isLow   = s.available && slots != null && slots <= 2;
+
+    let dotClass = s.available ? 'dot-open' : 'dot-full';
+    let statusTxt = s.available ? 'Open' : 'Full';
+    if (isLow) { dotClass = 'dot-low'; statusTxt = 'Low'; }
+
+    const slotTag = isLow && slots != null
+      ? `<span class="slot-tag">⚡ ${slots} left</span>` : '';
+
+    const sJson = encodeURIComponent(JSON.stringify({
+      key: s.key, ts: s.ts, wave: s.wave, level: s.level,
+      time: s.time, date: s.date, dayLabel: s.dayLabel
+    }));
+
+    return `<div class="sc${watched?' watching':''}" onclick="toggleWatch('${sJson}')">
+      <div class="sc-bar" style="background:${s.available?cfg.c:'#1e293b'}"></div>
+      <div class="sc-main">
+        <div class="sc-time" style="color:${s.available?'#fff':'#475569'}">${s.time}</div>
+        <div class="sc-level" style="color:${s.available?cfg.c:'#334155'}">${s.level}</div>
+        <div class="sc-wave">Wave ${s.wave}</div>
+      </div>
+      <div class="sc-right">
+        ${slotTag}
+        <div class="status-pill" style="color:${s.available?'#e2e8f0':'#475569'}">
+          <div class="dot ${dotClass}"></div>${statusTxt}
+        </div>
+        <button class="bell-btn${watched?' on':''}"
+          onclick="event.stopPropagation();toggleWatch('${sJson}')"
+          aria-label="${watched?'Stop watching':'Watch'} this session">
+          <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        </button>
+      </div>
+    </div>`;
+  }).join('') || '<div class="empty">No sessions for this day yet</div>';
+}
+
+function renderWatching() {
+  const el = document.getElementById('watch-list');
+  const wb = document.getElementById('watch-badge');
+  const n  = data.watchList.length;
+  wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Watching';
+
+  if (!n) {
+    el.innerHTML = '<div class="empty">Tap the 🔔 on any session to watch it.<br>You\'ll be notified when it opens up<br>or when slots are running low.</div>';
+    return;
+  }
+
+  el.innerHTML = data.watchList.map(w => {
+    const cfg  = LEVELS[w.level] || {s:'?',c:'#888'};
+    const live = data.sessions.find(s => s.key === w.key);
+    const hist = data.history[w.key] || {};
+    let statusHtml = '<div class="wc-status" style="color:var(--sub)">⏳ Waiting for next check...</div>';
+
+    if (live) {
+      const slots = live.slots ?? hist.slots;
+      if (live.available) {
+        if (slots != null && slots <= 2) {
+          statusHtml = `<div class="wc-status" style="color:var(--orange)"><div class="dot dot-low"></div>⚡ Only ${slots} slot${slots===1?'':'s'} left!</div>`;
+        } else {
+          const slotStr = slots != null ? ` · ${slots} slots` : '';
+          statusHtml = `<div class="wc-status" style="color:var(--green)"><div class="dot dot-open"></div>Open${slotStr}</div>`;
+        }
+      } else {
+        statusHtml = '<div class="wc-status" style="color:var(--sub)"><div class="dot dot-full"></div>Full — watching for cancellations</div>';
+      }
+    }
+
+    return `<div class="wc">
+      <div class="wc-top">
+        <div>
+          <div class="wc-title" style="color:${cfg.c}">${w.level}</div>
+          <div class="wc-meta">${w.dayLabel} · ${w.time} · Wave ${w.wave}</div>
+        </div>
+        <button class="rm-btn" onclick="removeWatch('${w.id}')">Remove</button>
+      </div>
+      ${statusHtml}
+    </div>`;
+  }).join('');
+}
+
+function renderSetup() {
+  const topicEl = document.getElementById('ntfy-topic-box');
+  const msgEl   = document.getElementById('ntfy-status-msg');
+  if (data.ntfyOk) {
+    topicEl.textContent = 'Topic configured ✓ (see Railway → Variables → NTFY_TOPIC)';
+    topicEl.style.color = '#22c55e';
+    msgEl.textContent   = '✓ Notifications are active';
+    msgEl.style.color   = '#22c55e';
+  } else {
+    topicEl.textContent = 'NTFY_TOPIC not set in Railway Variables';
+    topicEl.style.color = '#f59e0b';
+    msgEl.textContent   = '⚠  Add NTFY_TOPIC in Railway → your project → Variables';
+    msgEl.style.color   = '#f59e0b';
+  }
+
+  const cp = document.getElementById('carrier-pills');
+  cp.innerHTML = Object.keys(CARRIERS).map(name =>
+    `<button class="carrier${carrier===name?' on':''}" onclick="setCarrier('${name}')">${name}</button>`
+  ).join('');
+
+  updateSms();
+}
+
+// ── Watch list management ─────────────────────────────────────────────────────
+async function toggleWatch(sJson) {
+  const s = JSON.parse(decodeURIComponent(sJson));
+  const existing = data.watchList.find(w => w.key === s.key);
+  if (existing) {
+    await fetch(`/api/watch/${existing.id}`, { method: 'DELETE' });
+  } else {
+    await fetch('/api/watch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(s),
+    });
+  }
+  await refresh();
+}
+
+async function removeWatch(id) {
+  await fetch(`/api/watch/${id}`, { method: 'DELETE' });
+  await refresh();
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function showTab(name, btn) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('on'));
+  document.getElementById('pane-' + name).classList.add('active');
+  btn.classList.add('on');
+}
+
+function setDay(d) { activeDay = d; renderBrowse(); }
+
+function setCarrier(c) {
+  carrier = c;
+  localStorage.setItem('carrier', c);
+  renderSetup();
+}
+
+function updateSms() {
+  const phone = (document.getElementById('phone-input').value || '').replace(/\D/g,'');
+  const el    = document.getElementById('sms-address');
+  el.textContent = phone.length === 10 && carrier
+    ? phone + CARRIERS[carrier]
+    : 'Select carrier + enter number';
+}
+
+function copySms() {
+  const addr = document.getElementById('sms-address').textContent;
+  if (addr.includes('@')) navigator.clipboard.writeText(addr).then(() => alert('Copied! Paste as SMS_ADDRESS in Railway → Variables'));
+}
+
+// ── Auto-refresh every 2 minutes ──────────────────────────────────────────────
+refresh();
+setInterval(refresh, 120_000);
+</script>
+</body>
+</html>
