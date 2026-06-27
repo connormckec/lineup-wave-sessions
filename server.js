@@ -59,6 +59,9 @@ let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const datesCheckedDuringScrape = new Set();
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
+let lastHistorySnapshotSavedAt = null;
+let lastLatestSnapshotSavedAt = null;
+const HISTORY_SNAPSHOTS_ENABLED = process.env.HISTORY_SNAPSHOTS !== 'false';
 let scrapeLock = Promise.resolve();
 
 function initSupabaseClient() {
@@ -158,6 +161,9 @@ function getStatusFields() {
     lastScrapeErrorStackPreview: stackPreview(lastScrapeErrorStack),
     dataAgeMinutes,
     scrapeInProgress,
+    totalSessionsTracked: sessions.length,
+    latestSnapshotSavedAt: lastLatestSnapshotSavedAt,
+    historySnapshotsEnabled: supabaseConfigured && HISTORY_SNAPSHOTS_ENABLED,
   };
 }
 
@@ -206,6 +212,7 @@ async function saveLatestSnapshotToSupabase() {
       updated_at: now,
     }, { onConflict: 'id' });
     if (error) throw error;
+    lastLatestSnapshotSavedAt = now;
     console.log(`  Supabase: saved snapshot (${sessions.length} sessions)`);
   } catch (e) {
     console.error('  Supabase save failed:', e.message);
@@ -236,6 +243,71 @@ async function saveScrapeErrorToSupabase(errorMessage) {
     }
   } catch (e) {
     console.error('  Supabase error save failed:', e.message);
+  }
+}
+
+function sessionCapacityForLevel(level) {
+  if (level === 'Progressive') return 18;
+  if (level === 'Pro Turns') return 10;
+  return 12;
+}
+
+function availabilityStatusLabel(s) {
+  if (!s.available) return 'PACKED';
+  if (s.slots == null) return 'OPEN';
+  if (s.slots >= 10) return 'FIRING';
+  if (s.slots >= 5) return 'OPEN';
+  if (s.slots >= 3) return 'GETTING_CROWDED';
+  return 'CLOSING_OUT';
+}
+
+async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) {
+  if (!supabase || !HISTORY_SNAPSHOTS_ENABLED) return;
+  const batch = asSessionArray(scrapedSessions);
+  if (!batch.length) return;
+
+  try {
+    const scrapedAt = new Date().toISOString();
+    const rows = batch.map((s) => {
+      const capacity = sessionCapacityForLevel(s.level);
+      const slotsAvailable = s.slots != null ? s.slots : null;
+      let estimatedBooked = null;
+      let fillRate = null;
+      if (capacity != null && slotsAvailable != null) {
+        estimatedBooked = capacity - slotsAvailable;
+        fillRate = estimatedBooked / capacity;
+      }
+      return {
+        scraped_at: scrapedAt,
+        park: 'atlantic_park',
+        session_key: s.key,
+        iso_date: s.isoDate || s.dateKey,
+        start_ts: s.ts,
+        start_time: s.time,
+        weekday: s.weekday || null,
+        wave_side: s.waveSide || null,
+        session_type: s.level,
+        available: s.available,
+        slots_available: slotsAvailable,
+        capacity,
+        estimated_booked: estimatedBooked,
+        fill_rate: fillRate,
+        status_label: availabilityStatusLabel(s),
+        source_tier: sourceTier,
+        raw: s,
+      };
+    });
+
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await supabase.from('availability_snapshots').insert(chunk);
+      if (error) throw error;
+    }
+
+    lastHistorySnapshotSavedAt = scrapedAt;
+    console.log(`  Supabase: saved ${rows.length} availability snapshot row(s)`);
+  } catch (e) {
+    console.error('  Supabase availability snapshots failed:', e.message);
   }
 }
 
@@ -1249,6 +1321,7 @@ async function runTierScrape(tier) {
       hasFreshScrapeThisBoot = true;
       dataSource = 'memory';
       await saveLatestSnapshotToSupabase();
+      await saveAvailabilitySnapshotsToSupabase(merged, tier);
 
     } catch (e) {
       recordScrapeError(e, `tier ${tier} scrape`);

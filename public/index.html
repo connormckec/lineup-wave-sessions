@@ -383,6 +383,13 @@ input.field:focus{border-color:var(--accent)}
       <div class="divider"></div>
 
       <div class="setup-block">
+        <h3>Data</h3>
+        <p id="tracking-meta" style="font-size:13px;color:var(--sub);margin:0">—</p>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="setup-block">
         <h3>Watcher Settings</h3>
         <p>Configure these in Railway → Variables.</p>
         <div style="font-size:12px;color:var(--sub);line-height:2.2">
@@ -470,6 +477,7 @@ const WAVE_FILTERS = [
   { wave: 2, label: 'Left Wave' },
 ];
 const LESSON_WAVES = [3, 4];
+const BOOKING_TZ = 'America/New_York';
 
 const EXCLUDED_LEVELS = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES  = [5, 6];
@@ -511,8 +519,51 @@ for (let h = 6; h <= 22; h++) {
 }
 
 function todayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date());
+}
+
+function tomorrowKey() {
+  const [y, m, d] = todayKey().split('-').map(Number);
+  const dt = new Date(y, m - 1, d + 1, 12, 0, 0, 0);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+}
+
+function isSessionUpcoming(s, selectedDateKey) {
+  if (selectedDateKey !== todayKey()) return true;
+  if (!s.ts) return true;
+  return s.ts > Math.floor(Date.now() / 1000);
+}
+
+function visibleBrowseSessions() {
+  let filtered = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+  filtered = filtered.filter(matchesWaveFilter);
+  if (activeLevels.size) filtered = filtered.filter(s => activeLevels.has(s.level));
+  filtered = filtered.filter(s => matchesTimeRange(s, filterFromH, filterToH));
+  filtered = filtered.filter(s => isSessionUpcoming(s, activeDayKey));
+  return filtered;
+}
+
+function visibleOpenSessions() {
+  return visibleBrowseSessions().filter(s => s.available);
+}
+
+function browseCountLabel(openCount) {
+  const tk = todayKey();
+  const dateWord = activeDayKey === tk
+    ? 'today'
+    : (activeDayKey === tomorrowKey() ? 'tomorrow' : dateLabel(activeDayKey));
+
+  if (activeLevels.size === 1) {
+    const level = [...activeLevels][0];
+    return `${openCount} ${level} session${openCount === 1 ? '' : 's'} ${dateWord}`;
+  }
+  if (activeWave === 1) {
+    return `${openCount} Right Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+  }
+  if (activeWave === 2) {
+    return `${openCount} Left Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+  }
+  return `${openCount} open session${openCount === 1 ? '' : 's'} ${dateWord}`;
 }
 
 function dateKeyFromSession(s) {
@@ -679,7 +730,6 @@ function renderAll() {
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
-  const open = surfSessions().filter(s => s.available).length;
   dot.className = data.ntfyOk ? 'ok' : '';
 
   const {
@@ -710,13 +760,14 @@ function renderStatusBar() {
     detail = `checked ${ageLabel(dataAgeMinutes) || 'just now'}`;
   }
 
-  const openPart = sessionsCount
-    ? `<span class="open-count">${open} open</span>`
-    : '';
+  if (!sessionsCount && !lastSuccessfulScrape) {
+    txt.innerHTML = `<span class="check-time">${detail}</span>`;
+    return;
+  }
 
-  txt.innerHTML = openPart
-    ? `${openPart}<span class="check-time"> · ${detail}</span>`
-    : `<span class="check-time">${detail}</span>`;
+  const openCount = visibleOpenSessions().length;
+  const countLabel = browseCountLabel(openCount);
+  txt.innerHTML = `<span class="open-count">${countLabel}</span><span class="check-time"> · ${detail}</span>`;
 }
 
 function renderBrowse() {
@@ -742,10 +793,7 @@ function renderBrowse() {
     }),
   ].join('');
 
-  let filtered = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
-  filtered = filtered.filter(matchesWaveFilter);
-  if (activeLevels.size) filtered = filtered.filter(s => activeLevels.has(s.level));
-  filtered = filtered.filter(s => matchesTimeRange(s, filterFromH, filterToH));
+  let filtered = visibleBrowseSessions();
 
   const listEl = document.getElementById('session-list');
   if (!filtered.length) {
@@ -758,8 +806,12 @@ function renderBrowse() {
       msg = 'Not checked yet';
     } else if (!daySessions.length) {
       msg = 'No sessions found for this date';
-    } else {
+    } else if (activeDayKey === todayKey() && daySessions.length && !daySessions.some(s => isSessionUpcoming(s, activeDayKey))) {
+      msg = 'No upcoming sessions today';
+    } else if (daySessions.length) {
       msg = 'No sessions match these filters';
+    } else {
+      msg = 'No sessions found for this date';
     }
     listEl.innerHTML = `<div class="empty">${msg}</div>`;
     return;
@@ -859,6 +911,15 @@ function renderSetup() {
     msgEl.style.color   = '#ff6b35';
   }
 
+  const total = data.totalSessionsTracked ?? data.sessionsCount ?? data.sessions?.length ?? 0;
+  const dates = data.uniqueDatesCount ?? 0;
+  const trackingEl = document.getElementById('tracking-meta');
+  if (trackingEl) {
+    trackingEl.textContent = total
+      ? `Tracking ${total} sessions across ${dates} date${dates === 1 ? '' : 's'}`
+      : 'Waiting for first scrape…';
+  }
+
   document.getElementById('carrier-pills').innerHTML = Object.keys(CARRIERS).map(name =>
     `<button class="carrier${carrier === name ? ' on' : ''}" onclick="setCarrier('${name}')">${name}</button>`
   ).join('');
@@ -895,12 +956,12 @@ function showTab(name, btn) {
 
 function setWave(wave) {
   activeWave = wave;
-  renderBrowse();
+  renderAll();
 }
 
 function toggleLessons() {
   showLessons = !showLessons;
-  renderBrowse();
+  renderAll();
 }
 
 function initTimeSelects() {
@@ -962,18 +1023,18 @@ function applyPicker() {
   filterFromH = pickerDraft.fromH;
   filterToH = pickerDraft.toH;
   closePicker();
-  renderBrowse();
+  renderAll();
 }
 
 function toggleLevel(level) {
   if (activeLevels.has(level)) activeLevels.delete(level);
   else activeLevels.add(level);
-  renderBrowse();
+  renderAll();
 }
 
 function clearLevelFilters() {
   activeLevels.clear();
-  renderBrowse();
+  renderAll();
 }
 
 document.getElementById('level-chips').addEventListener('click', (e) => {
