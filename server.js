@@ -3,6 +3,7 @@ const express  = require('express');
 const { chromium } = require('playwright');
 const cron     = require('node-cron');
 const path     = require('path');
+const fs       = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -16,6 +17,9 @@ const CHECK_MINS      = parseInt(process.env.CHECK_EVERY_MINS || '5', 10);
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
 const SCRAPE_WEEKS_AHEAD = parseInt(process.env.SCRAPE_WEEKS_AHEAD || '4', 10);
+const DATA_DIR           = process.env.DATA_DIR || path.join(__dirname, 'data');
+const SNAPSHOT_PATH      = path.join(DATA_DIR, 'snapshot.json');
+const PERSISTENT_CACHE   = !!process.env.DATA_DIR;
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const SCRAPE_OPTS = { excludedLevels: EXCLUDED_LEVELS, excludedWaves: EXCLUDED_WAVES };
@@ -36,11 +40,99 @@ let slotCache     = {};   // {key: {slots, available, lastCheckedCycle}}
 let slotCheckDeferrals = new Set();
 let checkCycle    = 0;
 let lastCheck     = null;
+let lastSuccessfulScrape = null;
+let lastScrapeAttempt  = null;
+let lastScrapeError    = null;
+let scrapeInProgress   = false;
+let hasFreshScrapeThisBoot = false;
 let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let scrapeLock = Promise.resolve();
+
+function logPersistentCacheWarning() {
+  if (PERSISTENT_CACHE) {
+    console.log(`Persistent cache: DATA_DIR=${DATA_DIR}`);
+    return;
+  }
+  console.warn('WARNING: DATA_DIR not set — snapshot cache is stored locally and will be lost on redeploy/restart.');
+  console.warn('         Mount a Railway Volume at /data and set DATA_DIR=/data for persistent stale-while-revalidate cache.');
+}
+
+function getStatusFields() {
+  const dataAgeMinutes = lastSuccessfulScrape
+    ? Math.max(0, Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000))
+    : null;
+  return {
+    sessionsCount: sessions.length,
+    isUsingCachedData: sessions.length > 0 && !hasFreshScrapeThisBoot,
+    lastSuccessfulScrape,
+    lastScrapeAttempt,
+    lastScrapeError,
+    dataAgeMinutes,
+    scrapeInProgress,
+  };
+}
+
+async function loadSnapshot() {
+  try {
+    const raw = await fs.promises.readFile(SNAPSHOT_PATH, 'utf8');
+    const snap = JSON.parse(raw);
+
+    if (Array.isArray(snap.sessions) && snap.sessions.length) {
+      sessionsByKey.clear();
+      for (const s of snap.sessions) sessionsByKey.set(s.key, s);
+      rebuildSessionsArray();
+    }
+
+    const meta = snap.scrapeMeta || {};
+    if (meta.weeksAvailableOnSite != null) weeksAvailableOnSite = meta.weeksAvailableOnSite;
+    if (meta.effectiveWeeksAhead != null) effectiveWeeksAhead = meta.effectiveWeeksAhead;
+    if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
+
+    if (snap.slotCache && typeof snap.slotCache === 'object') slotCache = snap.slotCache;
+
+    lastSuccessfulScrape = snap.lastSuccessfulScrape || snap.savedAt || null;
+    lastCheck = lastSuccessfulScrape;
+
+    const age = lastSuccessfulScrape
+      ? Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000)
+      : '?';
+    console.log(`  loaded snapshot: ${sessions.length} sessions (saved ${age}m ago) from ${SNAPSHOT_PATH}`);
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      console.log('  no snapshot found — dashboard will populate after first successful scrape');
+    } else {
+      console.error('  snapshot load failed:', e.message);
+    }
+  }
+}
+
+async function saveSnapshot() {
+  try {
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    const payload = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      lastSuccessfulScrape,
+      sessions,
+      slotCache,
+      scrapeMeta: {
+        weeksAvailableOnSite,
+        effectiveWeeksAhead,
+        scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
+        lastTierRun: { ...lastTierRun },
+      },
+    };
+    const tmp = `${SNAPSHOT_PATH}.tmp`;
+    await fs.promises.writeFile(tmp, JSON.stringify(payload), 'utf8');
+    await fs.promises.rename(tmp, SNAPSHOT_PATH);
+    console.log(`  snapshot saved (${sessions.length} sessions) → ${SNAPSHOT_PATH}`);
+  } catch (e) {
+    console.error('  snapshot save failed:', e.message);
+  }
+}
 
 function withScrapeLock(fn) {
   const run = scrapeLock.then(fn, fn);
@@ -640,6 +732,9 @@ async function runTierScrape(tier) {
 
     console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, weeks ${cfg.weekStart + 1}–${weekEnd + 1})`);
 
+    scrapeInProgress = true;
+    lastScrapeAttempt = new Date().toISOString();
+
     if (tier === 1) {
       checkCycle++;
       slotChecksThisCycle = 0;
@@ -678,11 +773,17 @@ async function runTierScrape(tier) {
       await processNotifications(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
       lastTierRun[tier] = new Date().toISOString();
-      lastCheck = lastTierRun[tier];
+      lastSuccessfulScrape = new Date().toISOString();
+      lastCheck = lastSuccessfulScrape;
+      lastScrapeError = null;
+      hasFreshScrapeThisBoot = true;
+      await saveSnapshot();
 
     } catch (e) {
+      lastScrapeError = e.message;
       console.error(`tier ${tier} scrape failed:`, e.message);
     } finally {
+      scrapeInProgress = false;
       if (launched?.browser) await launched.browser.close();
     }
   });
@@ -705,20 +806,31 @@ async function detectWeeksOnStartup() {
 }
 
 // ── REST API ─────────────────────────────────────────────────────────────────
-app.get('/api/status', (_req, res) => {
-  res.json({
+function statusPayload() {
+  return {
     sessions,
     watchList,
     history,
-    lastCheck,
+    lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
     scrapeMeta: {
       weeksAvailableOnSite,
       effectiveWeeksAhead,
       scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
       lastTierRun: { ...lastTierRun },
+      persistentCache: PERSISTENT_CACHE,
+      snapshotPath: SNAPSHOT_PATH,
     },
-  });
+    ...getStatusFields(),
+  };
+}
+
+app.get('/api/status', (_req, res) => {
+  res.json(statusPayload());
+});
+
+app.get('/api/sessions', (_req, res) => {
+  res.json(statusPayload());
 });
 
 app.post('/api/watch', (req, res) => {
@@ -739,12 +851,15 @@ app.delete('/api/watch/:id', (req, res) => {
 });
 
 // ── Boot: tiered cron schedules ───────────────────────────────────────────────
-async function bootstrap() {
-  await detectWeeksOnStartup();
-  await runTierScrape(1);
-  setTimeout(() => runTierScrape(2).catch(console.error), 30_000);
-  setTimeout(() => runTierScrape(3).catch(console.error), 90_000);
-  setTimeout(() => runTierScrape(4).catch(console.error), 180_000);
+function bootstrapInBackground() {
+  detectWeeksOnStartup()
+    .then(() => runTierScrape(1))
+    .then(() => {
+      setTimeout(() => runTierScrape(2).catch(console.error), 30_000);
+      setTimeout(() => runTierScrape(3).catch(console.error), 90_000);
+      setTimeout(() => runTierScrape(4).catch(console.error), 180_000);
+    })
+    .catch(console.error);
 }
 
 cron.schedule(`*/${CHECK_MINS} * * * *`, () => runTierScrape(1).catch(console.error));
@@ -756,14 +871,23 @@ cron.schedule('0 0 * * *', () => {
     .catch(console.error);
 });
 
-bootstrap().catch(console.error);
+async function startServer() {
+  logPersistentCacheWarning();
+  await loadSnapshot();
 
-app.listen(PORT, () => {
-  console.log(`\nAP Session Watcher running on :${PORT}`);
-  console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
-  console.log('Tier 2 (this week):              every 30 min');
-  console.log('Tier 3 (weeks 2–3):              every 6 hours');
-  console.log('Tier 4 (weeks 4+):               daily at midnight');
-  console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
-  console.log(TOPIC ? `Ntfy topic: ${TOPIC}` : 'WARNING: NTFY_TOPIC not set — no notifications will be sent');
-});
+  app.listen(PORT, () => {
+    console.log(`\nAP Session Watcher running on :${PORT}`);
+    console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
+    console.log('Tier 2 (this week):              every 30 min');
+    console.log('Tier 3 (weeks 2–3):              every 6 hours');
+    console.log('Tier 4 (weeks 4+):               daily at midnight');
+    console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
+    console.log(TOPIC ? `Ntfy topic: ${TOPIC}` : 'WARNING: NTFY_TOPIC not set — no notifications will be sent');
+    if (sessions.length) {
+      console.log(`Serving ${sessions.length} cached sessions while background scrape runs…`);
+    }
+    bootstrapInBackground();
+  });
+}
+
+startServer().catch(console.error);

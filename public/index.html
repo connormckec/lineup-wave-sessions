@@ -654,13 +654,41 @@ function renderStatusBar() {
   const open = surfSessions().filter(s => s.available).length;
   dot.className = data.ntfyOk ? 'ok' : '';
 
-  let timeStr = 'not checked yet';
-  if (data.lastCheck) {
-    const diff = Math.round((Date.now() - new Date(data.lastCheck)) / 60000);
-    timeStr = diff < 1 ? 'just now' : `${diff}m ago`;
+  const {
+    scrapeInProgress,
+    isUsingCachedData,
+    dataAgeMinutes,
+    lastScrapeError,
+    sessionsCount,
+    lastSuccessfulScrape,
+  } = data;
+
+  const ageLabel = (mins) => {
+    if (mins == null) return null;
+    if (mins < 1) return 'just now';
+    return `${mins}m ago`;
+  };
+
+  let detail;
+  if (scrapeInProgress) {
+    detail = 'refreshing…';
+  } else if (!sessionsCount && !lastSuccessfulScrape) {
+    detail = 'waiting for first scrape';
+  } else if (lastScrapeError && sessionsCount > 0) {
+    detail = 'showing saved data · refresh failed';
+  } else if (isUsingCachedData) {
+    detail = `showing last data from ${ageLabel(dataAgeMinutes) || 'earlier'}`;
+  } else {
+    detail = `checked ${ageLabel(dataAgeMinutes) || 'just now'}`;
   }
-  txt.innerHTML =
-    `<span class="open-count">${open} open</span><span class="check-time"> · checked ${timeStr}</span>`;
+
+  const openPart = sessionsCount
+    ? `<span class="open-count">${open} open</span>`
+    : '';
+
+  txt.innerHTML = openPart
+    ? `${openPart}<span class="check-time"> · ${detail}</span>`
+    : `<span class="check-time">${detail}</span>`;
 }
 
 function renderBrowse() {
