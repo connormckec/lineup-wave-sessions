@@ -3,7 +3,8 @@ const express  = require('express');
 const { chromium } = require('playwright');
 const cron     = require('node-cron');
 const path     = require('path');
-const fs       = require('fs');
+const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 
 const app = express();
 app.use(express.json());
@@ -17,9 +18,8 @@ const CHECK_MINS      = parseInt(process.env.CHECK_EVERY_MINS || '5', 10);
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
 const SCRAPE_WEEKS_AHEAD = parseInt(process.env.SCRAPE_WEEKS_AHEAD || '4', 10);
-const DATA_DIR           = process.env.DATA_DIR || path.join(__dirname, 'data');
-const SNAPSHOT_PATH      = path.join(DATA_DIR, 'snapshot.json');
-const PERSISTENT_CACHE   = !!process.env.DATA_DIR;
+const SUPABASE_URL              = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
@@ -49,19 +49,74 @@ let lastScrapeAttempt  = null;
 let lastScrapeError    = null;
 let scrapeInProgress   = false;
 let hasFreshScrapeThisBoot = false;
+let dataSource = 'memory';
+let supabaseConfigured = false;
+let supabase = null;
+let supabaseInitError = null;
 let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let scrapeLock = Promise.resolve();
 
-function logPersistentCacheWarning() {
-  if (PERSISTENT_CACHE) {
-    console.log(`Persistent cache: DATA_DIR=${DATA_DIR}`);
-    return;
+function initSupabaseClient() {
+  supabaseInitError = null;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    supabaseConfigured = false;
+    supabase = null;
+    console.log('Supabase persistence disabled');
+    return null;
   }
-  console.warn('WARNING: DATA_DIR not set — snapshot cache is stored locally and will be lost on redeploy/restart.');
-  console.warn('         Mount a Railway Volume at /data and set DATA_DIR=/data for persistent stale-while-revalidate cache.');
+  try {
+    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      },
+      realtime: {
+        transport: WebSocket,
+      },
+    });
+    supabaseConfigured = true;
+    console.log('Supabase persistence enabled');
+    return supabase;
+  } catch (e) {
+    supabaseConfigured = false;
+    supabase = null;
+    supabaseInitError = e.message;
+    console.error('Supabase client init failed:', e.message);
+    return null;
+  }
+}
+
+function buildScrapeMetaPayload() {
+  return {
+    weeksAvailableOnSite,
+    effectiveWeeksAhead,
+    scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
+    lastTierRun: { ...lastTierRun },
+    slotCache,
+    weeksScraped: lastWeeksScraped,
+  };
+}
+
+function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
+  if (Array.isArray(snapSessions) && snapSessions.length) {
+    sessionsByKey.clear();
+    for (const s of snapSessions) sessionsByKey.set(s.key, s);
+    rebuildSessionsArray();
+  }
+  if (meta) {
+    if (meta.weeksAvailableOnSite != null) weeksAvailableOnSite = meta.weeksAvailableOnSite;
+    if (meta.effectiveWeeksAhead != null) effectiveWeeksAhead = meta.effectiveWeeksAhead;
+    if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
+    if (meta.slotCache && typeof meta.slotCache === 'object') slotCache = meta.slotCache;
+    if (meta.weeksScraped != null) lastWeeksScraped = meta.weeksScraped;
+  }
+  if (loadedAt) {
+    lastSuccessfulScrape = loadedAt;
+    lastCheck = loadedAt;
+  }
 }
 
 function getStatusFields() {
@@ -70,6 +125,9 @@ function getStatusFields() {
     : null;
   return {
     sessionsCount: sessions.length,
+    source: dataSource,
+    supabaseConfigured,
+    supabaseInitError,
     isUsingCachedData: sessions.length > 0 && !hasFreshScrapeThisBoot,
     lastSuccessfulScrape,
     lastScrapeAttempt,
@@ -79,62 +137,89 @@ function getStatusFields() {
   };
 }
 
-async function loadSnapshot() {
+async function loadLatestSnapshotFromSupabase() {
+  if (!supabase) return false;
   try {
-    const raw = await fs.promises.readFile(SNAPSHOT_PATH, 'utf8');
-    const snap = JSON.parse(raw);
-
-    if (Array.isArray(snap.sessions) && snap.sessions.length) {
-      sessionsByKey.clear();
-      for (const s of snap.sessions) sessionsByKey.set(s.key, s);
-      rebuildSessionsArray();
+    const { data, error } = await supabase
+      .from('scrape_snapshots')
+      .select('*')
+      .eq('id', 'latest')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data?.sessions?.length) {
+      console.log('  Supabase: no cached snapshot with sessions');
+      return false;
     }
 
-    const meta = snap.scrapeMeta || {};
-    if (meta.weeksAvailableOnSite != null) weeksAvailableOnSite = meta.weeksAvailableOnSite;
-    if (meta.effectiveWeeksAhead != null) effectiveWeeksAhead = meta.effectiveWeeksAhead;
-    if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
-
-    if (snap.slotCache && typeof snap.slotCache === 'object') slotCache = snap.slotCache;
-
-    lastSuccessfulScrape = snap.lastSuccessfulScrape || snap.savedAt || null;
-    lastCheck = lastSuccessfulScrape;
+    applyLoadedSnapshot(data.sessions, data.scrape_meta, data.last_successful_scrape);
+    lastScrapeAttempt = data.last_scrape_attempt || null;
+    lastScrapeError = data.last_scrape_error || null;
+    dataSource = 'supabase-cache';
+    hasFreshScrapeThisBoot = false;
 
     const age = lastSuccessfulScrape
       ? Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000)
       : '?';
-    console.log(`  loaded snapshot: ${sessions.length} sessions (saved ${age}m ago) from ${SNAPSHOT_PATH}`);
+    console.log(`  Supabase: loaded ${sessions.length} cached sessions (saved ${age}m ago)`);
+    return true;
   } catch (e) {
-    if (e.code === 'ENOENT') {
-      console.log('  no snapshot found — dashboard will populate after first successful scrape');
-    } else {
-      console.error('  snapshot load failed:', e.message);
-    }
+    console.error('  Supabase load failed:', e.message);
+    return false;
   }
 }
 
-async function saveSnapshot() {
+async function saveLatestSnapshotToSupabase() {
+  if (!supabase) return;
   try {
-    await fs.promises.mkdir(DATA_DIR, { recursive: true });
-    const payload = {
-      version: 1,
-      savedAt: new Date().toISOString(),
-      lastSuccessfulScrape,
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('scrape_snapshots').upsert({
+      id: 'latest',
       sessions,
-      slotCache,
-      scrapeMeta: {
-        weeksAvailableOnSite,
-        effectiveWeeksAhead,
-        scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
-        lastTierRun: { ...lastTierRun },
-      },
-    };
-    const tmp = `${SNAPSHOT_PATH}.tmp`;
-    await fs.promises.writeFile(tmp, JSON.stringify(payload), 'utf8');
-    await fs.promises.rename(tmp, SNAPSHOT_PATH);
-    console.log(`  snapshot saved (${sessions.length} sessions) → ${SNAPSHOT_PATH}`);
+      scrape_meta: buildScrapeMetaPayload(),
+      last_successful_scrape: lastSuccessfulScrape,
+      last_scrape_attempt: lastScrapeAttempt || lastSuccessfulScrape || now,
+      last_scrape_error: null,
+      updated_at: now,
+    }, { onConflict: 'id' });
+    if (error) throw error;
+    console.log(`  Supabase: saved snapshot (${sessions.length} sessions)`);
   } catch (e) {
-    console.error('  snapshot save failed:', e.message);
+    console.error('  Supabase save failed:', e.message);
+  }
+}
+
+async function saveScrapeErrorToSupabase(errorMessage) {
+  if (!supabase) return;
+  const now = new Date().toISOString();
+  lastScrapeAttempt = now;
+  try {
+    const { data: existing } = await supabase
+      .from('scrape_snapshots')
+      .select('id')
+      .eq('id', 'latest')
+      .maybeSingle();
+
+    if (existing) {
+      const { error } = await supabase.from('scrape_snapshots').update({
+        last_scrape_attempt: now,
+        last_scrape_error: errorMessage,
+        updated_at: now,
+      }).eq('id', 'latest');
+      if (error) throw error;
+    } else {
+      const { error } = await supabase.from('scrape_snapshots').upsert({
+        id: 'latest',
+        sessions: [],
+        scrape_meta: {},
+        last_scrape_attempt: now,
+        last_scrape_error: errorMessage,
+        updated_at: now,
+      }, { onConflict: 'id' });
+      if (error) throw error;
+    }
+    console.log('  Supabase: recorded scrape error');
+  } catch (e) {
+    console.error('  Supabase error save failed:', e.message);
   }
 }
 
@@ -911,11 +996,13 @@ async function runTierScrape(tier) {
       lastCheck = lastSuccessfulScrape;
       lastScrapeError = null;
       hasFreshScrapeThisBoot = true;
-      await saveSnapshot();
+      dataSource = 'memory';
+      await saveLatestSnapshotToSupabase();
 
     } catch (e) {
       lastScrapeError = e.message;
       console.error(`tier ${tier} scrape failed:`, e.message);
+      await saveScrapeErrorToSupabase(e.message);
     } finally {
       scrapeInProgress = false;
       if (launched?.browser) await launched.browser.close();
@@ -954,8 +1041,7 @@ function statusPayload() {
       effectiveWeeksAhead,
       scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
       lastTierRun: { ...lastTierRun },
-      persistentCache: PERSISTENT_CACHE,
-      snapshotPath: SNAPSHOT_PATH,
+      supabaseConfigured,
       ...dateCoverage,
     },
     ...getStatusFields(),
@@ -1008,10 +1094,23 @@ cron.schedule('0 0 * * *', () => {
     .catch(console.error);
 });
 
-async function startServer() {
-  logPersistentCacheWarning();
-  await loadSnapshot();
+async function startBackgroundServices() {
+  initSupabaseClient();
+  if (supabase) {
+    try {
+      await loadLatestSnapshotFromSupabase();
+    } catch (e) {
+      supabaseInitError = supabaseInitError || e.message;
+      console.error('Supabase cache load failed:', e.message);
+    }
+  }
+  if (sessions.length) {
+    console.log(`Serving ${sessions.length} cached sessions (${dataSource}) while background scrape runs…`);
+  }
+  bootstrapInBackground();
+}
 
+function startServer() {
   app.listen(PORT, () => {
     console.log(`\nAP Session Watcher running on :${PORT}`);
     console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
@@ -1020,11 +1119,11 @@ async function startServer() {
     console.log('Tier 4 (weeks 4+):               daily at midnight');
     console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
     console.log(TOPIC ? `Ntfy topic: ${TOPIC}` : 'WARNING: NTFY_TOPIC not set — no notifications will be sent');
-    if (sessions.length) {
-      console.log(`Serving ${sessions.length} cached sessions while background scrape runs…`);
-    }
-    bootstrapInBackground();
+    startBackgroundServices().catch((e) => {
+      console.error('Background startup error:', e.message);
+      bootstrapInBackground();
+    });
   });
 }
 
-startServer().catch(console.error);
+startServer();
