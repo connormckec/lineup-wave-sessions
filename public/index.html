@@ -169,10 +169,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
   margin:5px auto 0;
 }
 .week-day.no-sessions{
-  opacity:.35;cursor:not-allowed;pointer-events:none;
-  border-color:var(--border);background:rgba(14,42,74,.25);
+  opacity:.7;
+  cursor:pointer;
 }
 .week-day.no-sessions .wd-dot{display:none}
+.week-day:not(.has-sessions) .wd-dot{
+  background:var(--muted);opacity:.4;
+}
 .picker-divider{height:1px;background:var(--border);margin:0 0 14px}
 .time-row{display:flex;gap:10px;margin-bottom:16px}
 .time-field{flex:1}
@@ -528,9 +531,8 @@ function dateLabel(dateKey) {
 }
 
 function getPickerDays() {
-  const count = data.scrapeMeta?.effectiveWeeksAhead
-    ? Math.min(14, data.scrapeMeta.effectiveWeeksAhead * 7)
-    : 14;
+  const weeks = data.scrapeMeta?.effectiveWeeksAhead || data.effectiveWeeksAhead || 4;
+  const count = weeks * 7;
   const days = [];
   const start = new Date();
   start.setHours(12, 0, 0, 0);
@@ -540,6 +542,21 @@ function getPickerDays() {
     days.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
   }
   return days;
+}
+
+function checkedDatesSet() {
+  const list = data.datesCheckedDuringScrape
+    || data.scrapeMeta?.datesCheckedDuringScrape
+    || [];
+  return new Set(list);
+}
+
+function isDateChecked(dateKey) {
+  return checkedDatesSet().has(dateKey);
+}
+
+function sessionCountForDate(dateKey) {
+  return surfSessions().filter(s => dateKeyFromSession(s) === dateKey).length;
 }
 
 function daysFromTodayKey(dateKey) {
@@ -721,7 +738,7 @@ function renderBrowse() {
     ...levels.filter(l => LEVELS[l]).map(l => {
       const c  = LEVELS[l];
       const on = activeLevels.has(l);
-      return `<button type="button" class="chip chip-lvl${on ? ' on' : ''}" data-level="${encodeURIComponent(l)}" style="border-color:${on ? c.c : hexAlpha(c.c, .35)};color:${on ? c.c : 'var(--sub)'}">${c.s}${c.pri ? ' ★' : ''}</button>`;
+      return `<button type="button" class="chip chip-lvl${on ? ' on' : ''}" data-level="${encodeURIComponent(l)}" style="border-color:${on ? c.c : hexAlpha(c.c, .35)};color:${on ? c.c : 'var(--sub)'}">${c.s}</button>`;
     }),
   ].join('');
 
@@ -732,7 +749,19 @@ function renderBrowse() {
 
   const listEl = document.getElementById('session-list');
   if (!filtered.length) {
-    listEl.innerHTML = '<div class="empty">No sessions match these filters</div>';
+    const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+    const checked = isDateChecked(activeDayKey);
+    let msg;
+    if (!checked && data.scrapeInProgress) {
+      msg = 'Still checking this date…';
+    } else if (!checked) {
+      msg = 'Not checked yet';
+    } else if (!daySessions.length) {
+      msg = 'No sessions found for this date';
+    } else {
+      msg = 'No sessions match these filters';
+    }
+    listEl.innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
 
@@ -891,10 +920,10 @@ function renderPickerWeek() {
     const num = d.getDate();
     const on = pickerDraft.dayKey === k;
     const has = sessionDays.has(k);
-    return `<button type="button" class="week-day${on ? ' on' : ''}${has ? ' has-sessions' : ' no-sessions'}" data-pick-day="${k}"${has ? '' : ' disabled'}>
+    return `<button type="button" class="week-day${on ? ' on' : ''}${has ? ' has-sessions' : ' no-sessions'}" data-pick-day="${k}">
       <div class="wd-abbr">${abbr}</div>
       <div class="wd-num">${num}</div>
-      ${has ? '<div class="wd-dot" aria-hidden="true"></div>' : ''}
+      ${has ? '<div class="wd-dot" aria-hidden="true"></div>' : '<div class="wd-dot" aria-hidden="true"></div>'}
     </button>`;
   }).join('');
 }
@@ -910,16 +939,11 @@ function scrollPickerToDay(dayKey) {
 }
 
 function openPicker() {
-  const sessionDays = sessionDaysSet();
-  let dayKey = activeDayKey;
-  if (!sessionDays.has(dayKey)) {
-    dayKey = getPickerDays().find(k => sessionDays.has(k)) || todayKey();
-  }
-  pickerDraft = { dayKey, fromH: filterFromH, toH: filterToH };
+  pickerDraft = { dayKey: activeDayKey, fromH: filterFromH, toH: filterToH };
   document.getElementById('picker-from').value = filterFromH ?? '';
   document.getElementById('picker-to').value = filterToH ?? '';
   renderPickerWeek();
-  scrollPickerToDay(dayKey);
+  scrollPickerToDay(pickerDraft.dayKey);
   document.getElementById('picker-backdrop').classList.add('open');
   document.getElementById('picker-sheet').classList.add('open');
   document.getElementById('picker-sheet').setAttribute('aria-hidden', 'false');
@@ -976,7 +1000,7 @@ document.getElementById('picker-apply').addEventListener('click', applyPicker);
 
 document.getElementById('picker-week').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-pick-day]');
-  if (!btn || btn.disabled || btn.classList.contains('no-sessions')) return;
+  if (!btn) return;
   pickerDraft.dayKey = btn.dataset.pickDay;
   renderPickerWeek();
   scrollPickerToDay(pickerDraft.dayKey);

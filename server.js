@@ -57,6 +57,7 @@ let supabaseInitError = null;
 let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
+const datesCheckedDuringScrape = new Set();
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let scrapeLock = Promise.resolve();
 
@@ -98,6 +99,7 @@ function buildScrapeMetaPayload() {
     lastTierRun: { ...lastTierRun },
     slotCache,
     weeksScraped: lastWeeksScraped,
+    datesCheckedDuringScrape: [...datesCheckedDuringScrape],
   };
 }
 
@@ -113,6 +115,10 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
     if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
     if (meta.slotCache && typeof meta.slotCache === 'object') slotCache = meta.slotCache;
     if (meta.weeksScraped != null) lastWeeksScraped = meta.weeksScraped;
+    if (Array.isArray(meta.datesCheckedDuringScrape)) {
+      datesCheckedDuringScrape.clear();
+      for (const d of meta.datesCheckedDuringScrape) datesCheckedDuringScrape.add(d);
+    }
   }
   if (loadedAt) {
     lastSuccessfulScrape = loadedAt;
@@ -602,8 +608,9 @@ async function advanceCalendarWeek(page) {
   return true;
 }
 
-async function scrapePaginatedWeeks(page, startWeek, endWeek) {
+async function scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates = null } = {}) {
   const allByKey = new Map();
+  const datesSeen = new Set();
   let rawTilesTotal = 0;
   let duplicateSkipsTotal = 0;
   let weeksScraped = 0;
@@ -613,35 +620,39 @@ async function scrapePaginatedWeeks(page, startWeek, endWeek) {
   for (let w = 0; w < startWeek; w++) {
     if (!await advanceCalendarWeek(page)) {
       console.log(`  failed to reach week offset ${startWeek} (stopped at ${w})`);
-      return { sessions: [], weeksScraped: 0, rawTilesTotal, duplicateSkipsTotal };
+      return { sessions: [], weeksScraped: 0, rawTilesTotal, duplicateSkipsTotal, datesSeen };
     }
   }
 
+  const seenSigs = new Set();
   for (let weekOffset = startWeek; weekOffset <= endWeek; weekOffset++) {
     const fp = await getCalendarFingerprint(page);
-    const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
-    const pageSessions = asSessionArray(result?.sessions);
-    rawTilesTotal += result?.rawCount || 0;
-    duplicateSkipsTotal += result?.duplicateSkips || 0;
-
-    let newKeys = 0;
-    for (const s of pageSessions) {
-      if (!allByKey.has(s.key)) {
-        allByKey.set(s.key, s);
-        newKeys++;
-      }
+    if (seenSigs.has(fp.sig) && fp.count > 0) {
+      console.log(`  [week offset ${weekOffset}] repeated calendar fingerprint — stopping pagination`);
+      break;
     }
+    seenSigs.add(fp.sig);
 
-    const dateRange = pageSessions.length
-      ? `${pageSessions.map(s => s.isoDate).sort()[0]} → ${pageSessions.map(s => s.isoDate).sort().slice(-1)[0]}`
+    const { pageSessions, visible, rawCount, added } =
+      await absorbVisibleSessions(page, allByKey, datesSeen, weekOffset);
+    rawTilesTotal += rawCount;
+    duplicateSkipsTotal += Math.max(0, rawCount - pageSessions.length);
+
+    const dateRange = visible.length
+      ? `${visible[0]} → ${visible[visible.length - 1]}`
       : 'none';
 
     console.log(
       `  [week offset ${weekOffset}] label="${fp.label || 'n/a'}" ` +
-      `tiles=${result?.rawCount || 0} parsed=${pageSessions.length} new=${newKeys} ` +
+      `tiles=${rawCount} parsed=${pageSessions.length} new=${added} ` +
       `cumulative=${allByKey.size} dates=${dateRange}`
     );
     weeksScraped++;
+
+    if (requiredDates?.length && requiredDates.every(d => datesSeen.has(d))) {
+      console.log('  all required tier dates seen on calendar');
+      break;
+    }
 
     if (weekOffset < endWeek) {
       const hasNext = await canAdvanceCalendar(page);
@@ -654,18 +665,21 @@ async function scrapePaginatedWeeks(page, startWeek, endWeek) {
     }
   }
 
+  if (requiredDates?.length) {
+    const stillMissing = requiredDates.filter(d => !datesSeen.has(d));
+    if (stillMissing.length) {
+      await fillMissingDates(page, stillMissing, allByKey, datesSeen);
+    }
+  }
+
   lastWeeksScraped = Math.max(lastWeeksScraped, weeksScraped);
   return {
     sessions: [...allByKey.values()],
     weeksScraped,
     rawTilesTotal,
     duplicateSkipsTotal,
+    datesSeen,
   };
-}
-
-function todayDateKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function slotCheckDecision(s, prevSession, watchKeys) {
@@ -794,11 +808,204 @@ function dedupeBatch(batch) {
 }
 
 function daysFromToday(dateKey) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const d = new Date(dateKey + 'T12:00:00');
-  d.setHours(0, 0, 0, 0);
+  const today = parseDateKey(todayDateKey());
+  const d = parseDateKey(dateKey);
   return Math.round((d - today) / 86_400_000);
+}
+
+function dateKeyFromDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function todayDateKey() {
+  return dateKeyInBookingTz(new Date());
+}
+
+function dateKeyInBookingTz(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(date);
+}
+
+function parseDateKey(dateKey) {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  return new Date(y, m - 1, d, 12, 0, 0, 0);
+}
+
+function enumerateDateKeys(fromKey, toKey) {
+  const out = [];
+  const cur = parseDateKey(fromKey);
+  const end = parseDateKey(toKey);
+  while (cur <= end) {
+    out.push(dateKeyFromDate(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+function expectedDatesInScrapeWindow() {
+  const dates = [];
+  const start = parseDateKey(todayDateKey());
+  const count = effectiveWeeksAhead * 7;
+  for (let i = 0; i < count; i++) {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    dates.push(dateKeyFromDate(d));
+  }
+  return dates;
+}
+
+function expectedDatesForTier(tier) {
+  return expectedDatesInScrapeWindow().filter((dateKey) => {
+    const days = daysFromToday(dateKey);
+    return days >= TIER_CONFIG[tier].minDay && days <= tierMaxDay(tier);
+  });
+}
+
+function markCalendarSpanChecked(datesSeen, fromKey, toKey) {
+  for (const d of enumerateDateKeys(fromKey, toKey)) {
+    datesSeen.add(d);
+    datesCheckedDuringScrape.add(d);
+  }
+}
+
+async function getVisibleDateKeysFromPage(page) {
+  return page.evaluate(() => {
+    const keys = new Set();
+    document.querySelectorAll('div.dynamic-cal-booking-ts').forEach(el => {
+      const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
+      if (m) {
+        const d = new Date(+m[1] * 1000);
+        keys.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+      }
+    });
+    document.querySelectorAll('[data-date]').forEach(el => {
+      const attr = el.getAttribute('data-date');
+      if (attr && /^\d{4}-\d{2}-\d{2}$/.test(attr)) keys.add(attr);
+    });
+    return [...keys].sort();
+  });
+}
+
+async function absorbVisibleSessions(page, allByKey, datesSeen, weekOffset = 0) {
+  const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
+  const pageSessions = asSessionArray(result?.sessions);
+  const visible = await getVisibleDateKeysFromPage(page);
+  if (visible.length) markCalendarSpanChecked(datesSeen, visible[0], visible[visible.length - 1]);
+  let added = 0;
+  for (const s of pageSessions) {
+    if (!allByKey.has(s.key)) {
+      allByKey.set(s.key, s);
+      added++;
+    }
+  }
+  return { pageSessions, visible, rawCount: result?.rawCount || 0, added };
+}
+
+async function retreatCalendarWeek(page) {
+  const before = await getCalendarFingerprint(page);
+  const chevron = page.locator('.glyphicon-chevron-left').first();
+  if (!await chevron.count()) return false;
+  const clickable = await chevron.evaluate(el =>
+    !el.classList.contains('disabled') &&
+    !el.closest('.disabled') &&
+    window.getComputedStyle(el).visibility !== 'hidden' &&
+    window.getComputedStyle(el).display !== 'none'
+  ).catch(() => false);
+  if (!clickable) return false;
+
+  await chevron.click();
+  await page.waitForTimeout(2000);
+  try {
+    await page.waitForFunction(
+      (prevSig) => {
+        const timestamps = [];
+        document.querySelectorAll('div.dynamic-cal-booking-ts').forEach(el => {
+          const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
+          if (m) timestamps.push(+m[1]);
+        });
+        timestamps.sort((a, b) => a - b);
+        return timestamps.slice(0, 8).join(',') !== prevSig || timestamps.length === 0;
+      },
+      before.sig,
+      { timeout: 12_000 }
+    );
+  } catch {
+    return false;
+  }
+  const after = await getCalendarFingerprint(page);
+  if (after.sig === before.sig && after.firstTs === before.firstTs && after.count > 0) return false;
+  console.log(`  calendar retreated → "${after.label || 'n/a'}", ${after.count} tiles`);
+  return true;
+}
+
+async function navigateToWeekOffset(page, weekOffset) {
+  await openBookingPage(page);
+  for (let w = 0; w < weekOffset; w++) {
+    if (!await advanceCalendarWeek(page)) return false;
+  }
+  return true;
+}
+
+async function fillMissingDates(page, missingDates, allByKey, datesSeen) {
+  if (!missingDates.length) return;
+  console.log(`  filling ${missingDates.length} missing date(s): ${missingDates.join(', ')}`);
+
+  for (const dateKey of missingDates) {
+    if (datesSeen.has(dateKey)) continue;
+
+    const baseWeek = Math.max(0, Math.floor(daysFromToday(dateKey) / 7));
+    const offsetsToTry = [...new Set([
+      baseWeek, baseWeek - 1, baseWeek + 1, baseWeek + 2, baseWeek - 2,
+      0, 1, 2, 3, effectiveWeeksAhead - 1,
+    ].filter(w => w >= 0 && w < effectiveWeeksAhead))];
+
+    let found = false;
+    for (const weekOffset of offsetsToTry) {
+      if (datesSeen.has(dateKey)) break;
+      if (!await navigateToWeekOffset(page, weekOffset)) continue;
+      const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, weekOffset);
+      if (visible.includes(dateKey)) {
+        console.log(`  ✓ ${dateKey} found at week offset ${weekOffset}`);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      await openBookingPage(page);
+      const seenSigs = new Set();
+      for (let step = 0; step < effectiveWeeksAhead + 2; step++) {
+        const fp = await getCalendarFingerprint(page);
+        if (seenSigs.has(fp.sig) && fp.count > 0) break;
+        seenSigs.add(fp.sig);
+        const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, step);
+        if (visible.includes(dateKey)) {
+          console.log(`  ✓ ${dateKey} found during forward sweep step ${step}`);
+          found = true;
+          break;
+        }
+        if (!await advanceCalendarWeek(page)) break;
+      }
+    }
+
+    if (!found) {
+      await navigateToWeekOffset(page, Math.max(0, effectiveWeeksAhead - 1));
+      for (let step = 0; step < effectiveWeeksAhead + 2; step++) {
+        const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, step);
+        if (visible.includes(dateKey)) {
+          console.log(`  ✓ ${dateKey} found during backward sweep step ${step}`);
+          found = true;
+          break;
+        }
+        if (!await retreatCalendarWeek(page)) break;
+      }
+    }
+
+    if (!found) {
+      console.log(`  ⚠ ${dateKey} not found on calendar after fill attempts (0 sessions)`);
+    }
+    datesSeen.add(dateKey);
+    datesCheckedDuringScrape.add(dateKey);
+  }
 }
 
 function tierMaxDay(tier) {
@@ -816,22 +1023,48 @@ function sessionInTier(s, tier) {
 function weeksForTier(tier) {
   const cfg = TIER_CONFIG[tier];
   const startWeek = Math.floor(cfg.minDay / 7);
-  const endWeek = Math.min(Math.floor(tierMaxDay(tier) / 7), effectiveWeeksAhead - 1);
+  let endWeek = Math.min(Math.floor(tierMaxDay(tier) / 7), effectiveWeeksAhead - 1);
+  endWeek = Math.min(endWeek + 1, effectiveWeeksAhead - 1);
   return { startWeek, endWeek: Math.max(startWeek, endWeek) };
 }
 
 function computeDateCoverage() {
+  const expected = expectedDatesInScrapeWindow();
   const dateKeys = [...new Set(sessions.map(s => s.dateKey).filter(Boolean))].sort();
   const sessionsByDate = {};
+  const sessionsByDateAndSide = {};
   for (const s of sessions) {
     if (!s.dateKey) continue;
     sessionsByDate[s.dateKey] = (sessionsByDate[s.dateKey] || 0) + 1;
+    const side = s.waveSide || `Wave ${s.wave}`;
+    if (!sessionsByDateAndSide[s.dateKey]) sessionsByDateAndSide[s.dateKey] = {};
+    sessionsByDateAndSide[s.dateKey][side] = (sessionsByDateAndSide[s.dateKey][side] || 0) + 1;
   }
+  const checkedDates = expected.filter(d => datesCheckedDuringScrape.has(d));
+  const missingDatesInScrapeWindow = expected.filter(d => !datesCheckedDuringScrape.has(d));
+  const datesWithSessions = expected.filter(d => (sessionsByDate[d] || 0) > 0);
+  const expectedDatesCount = expected.length;
+  const coveredDatesCount = checkedDates.length;
+  const coveragePercent = expectedDatesCount
+    ? Math.round((coveredDatesCount / expectedDatesCount) * 100)
+    : 0;
+
+  if (missingDatesInScrapeWindow.length) {
+    console.log(`  ⚠ missingDatesInScrapeWindow (${missingDatesInScrapeWindow.length}): ${missingDatesInScrapeWindow.join(', ')}`);
+  }
+
   return {
     earliestSessionDate: dateKeys[0] || null,
     latestSessionDate: dateKeys[dateKeys.length - 1] || null,
     uniqueDatesCount: dateKeys.length,
     sessionsByDate,
+    sessionsByDateAndSide,
+    expectedDatesCount,
+    coveredDatesCount,
+    coveragePercent,
+    missingDatesInScrapeWindow,
+    datesCheckedDuringScrape: [...datesCheckedDuringScrape].sort(),
+    datesWithSessionsCount: datesWithSessions.length,
     weeksScraped: lastWeeksScraped,
   };
 }
@@ -978,8 +1211,13 @@ async function runTierScrape(tier) {
       const { page } = launched;
       await openBookingPage(page);
 
-      const { sessions: rawBatch, rawTilesTotal, weeksScraped } =
-        await scrapePaginatedWeeks(page, startWeek, endWeek);
+      const tierRequiredDates = expectedDatesForTier(tier);
+      const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
+        await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
+
+      if (datesSeen) {
+        for (const d of datesSeen) datesCheckedDuringScrape.add(d);
+      }
 
       const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
       const byKey = new Map(batch.map(s => [s.key, s]));
@@ -1000,7 +1238,7 @@ async function runTierScrape(tier) {
 
       console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
       const coverage = computeDateCoverage();
-      console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days)`);
+      console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days, ${coverage.coveragePercent}% dates checked)`);
       await processNotifications(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
       lastTierRun[tier] = new Date().toISOString();
@@ -1069,6 +1307,7 @@ app.get('/api/sessions', (_req, res) => {
 });
 
 app.get('/api/debug/scrape', (_req, res) => {
+  const coverage = computeDateCoverage();
   res.json({
     scrapeInProgress,
     sessionsCount: sessions.length,
@@ -1081,6 +1320,7 @@ app.get('/api/debug/scrape', (_req, res) => {
     effectiveWeeksAhead,
     lastTierRun: { ...lastTierRun },
     lastWeeksScraped,
+    ...coverage,
   });
 });
 
