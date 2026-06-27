@@ -22,6 +22,10 @@ const SNAPSHOT_PATH      = path.join(DATA_DIR, 'snapshot.json');
 const PERSISTENT_CACHE   = !!process.env.DATA_DIR;
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
+const BOOKING_TZ = 'America/New_York';
+
+let lastWeeksScraped = 0;
+
 const SCRAPE_OPTS = { excludedLevels: EXCLUDED_LEVELS, excludedWaves: EXCLUDED_WAVES };
 
 const TIER_CONFIG = {
@@ -372,7 +376,11 @@ async function getSlotCount(page, ts, wave) {
 }
 
 // Parse session tiles currently visible in the agenda DOM.
-function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [] } = {}) {
+// Dates derive from the tile unix timestamp (Atlantic Park local time via browser TZ).
+function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOffset = 0 } = {}) {
+  const WAVE_SIDES = {
+    1: 'Right Wave', 2: 'Left Wave', 3: 'Right Lesson', 4: 'Left Lesson',
+  };
   const seen = new Set(), out = [];
   const allEls = document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
   const rawCount = allEls.length;
@@ -387,39 +395,176 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [] } = {})
     if (excludedLevels.includes(level)) return;
     if (excludedWaves.includes(wave)) return;
     const ts = +wm[1], key = `${ts}_${wave}`;
-    if (seen.has(key)) return; seen.add(key);
+    if (seen.has(key)) return;
+    seen.add(key);
     const fm = t.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
     const d  = new Date(ts * 1000);
     const today = new Date(), tom = new Date(today);
     tom.setDate(tom.getDate() + 1);
+    const isoDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const displayDate = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const weekday = d.toLocaleDateString('en-US', { weekday: 'long' });
     let dayLabel;
     if (d.toDateString() === today.toDateString())     dayLabel = 'Today';
     else if (d.toDateString() === tom.toDateString())  dayLabel = 'Tomorrow';
-    else dayLabel = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-    const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    else dayLabel = displayDate;
     out.push({
       key, ts, wave, level,
       available : !cls.includes('expired_timeslot'),
       time      : fm ? fm[1].trim() : '?',
-      date      : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      date      : displayDate,
       dayLabel,
-      dateKey,
+      dateKey   : isoDate,
+      isoDate,
+      displayDate,
+      weekday,
+      waveSide  : WAVE_SIDES[wave] || `Wave ${wave}`,
+      sessionType: level,
+      weekOffset,
     });
   });
   return { sessions: out, rawCount, duplicateSkips: rawCount - out.length };
 }
 
-// Calendar week nav: .glyphicon-chevron-right advances one week forward.
-// Each click replaces the visible week (does not accumulate in the DOM).
-async function advanceCalendarWeek(page) {
+async function getCalendarFingerprint(page) {
+  return page.evaluate(() => {
+    const timestamps = [];
+    document.querySelectorAll('div.dynamic-cal-booking-ts').forEach(el => {
+      const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
+      if (m) timestamps.push(+m[1]);
+    });
+    timestamps.sort((a, b) => a - b);
+    const labelEl = document.querySelector(
+      '.dynamic-cal-booking-date, .booking-agenda-date, [class*="calendar-title"], [class*="agenda-title"], .panel-heading h4, .panel-title'
+    );
+    const label = labelEl?.textContent?.replace(/\s+/g, ' ').trim() || '';
+    return {
+      label,
+      count: timestamps.length,
+      firstTs: timestamps[0] || null,
+      lastTs: timestamps[timestamps.length - 1] || null,
+      sig: timestamps.slice(0, 8).join(','),
+    };
+  });
+}
+
+async function canAdvanceCalendar(page) {
   const chevron = page.locator('.glyphicon-chevron-right').first();
   if (!await chevron.count()) return false;
+  return chevron.evaluate(el =>
+    !el.classList.contains('disabled') &&
+    !el.closest('.disabled') &&
+    window.getComputedStyle(el).visibility !== 'hidden' &&
+    window.getComputedStyle(el).display !== 'none'
+  ).catch(() => false);
+}
+
+// Click the booking calendar next-week chevron and verify the DOM updated.
+async function advanceCalendarWeek(page) {
+  const before = await getCalendarFingerprint(page);
+  const chevron = page.locator('.glyphicon-chevron-right').first();
+  if (!await chevron.count()) {
+    console.log('  next-week arrow not found');
+    return false;
+  }
+  const clickable = await canAdvanceCalendar(page);
+  if (!clickable) {
+    console.log('  next-week arrow present but not clickable');
+    return false;
+  }
+
+  console.log(`  clicking next-week arrow (currently: "${before.label || 'n/a'}", ${before.count} tiles)`);
   await chevron.click();
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
+
   try {
-    await page.waitForSelector('.dynamic-cal-booking-ts', { timeout: 10_000 });
-  } catch {}
+    await page.waitForFunction(
+      (prevSig) => {
+        const timestamps = [];
+        document.querySelectorAll('div.dynamic-cal-booking-ts').forEach(el => {
+          const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
+          if (m) timestamps.push(+m[1]);
+        });
+        timestamps.sort((a, b) => a - b);
+        const sig = timestamps.slice(0, 8).join(',');
+        return sig !== prevSig || timestamps.length === 0;
+      },
+      before.sig,
+      { timeout: 12_000 }
+    );
+  } catch {
+    console.log('  calendar tiles did not change within timeout after next-week click');
+    return false;
+  }
+
+  const after = await getCalendarFingerprint(page);
+  if (after.sig === before.sig && after.firstTs === before.firstTs && after.count > 0) {
+    console.log('  calendar unchanged after next-week click — pagination stopped');
+    return false;
+  }
+
+  console.log(`  calendar advanced → "${after.label || 'n/a'}", ${after.count} tiles`);
   return true;
+}
+
+async function scrapePaginatedWeeks(page, startWeek, endWeek) {
+  const allByKey = new Map();
+  let rawTilesTotal = 0;
+  let duplicateSkipsTotal = 0;
+  let weeksScraped = 0;
+
+  console.log(`  paginating weeks ${startWeek}–${endWeek} (0 = initial visible week)`);
+
+  for (let w = 0; w < startWeek; w++) {
+    if (!await advanceCalendarWeek(page)) {
+      console.log(`  failed to reach week offset ${startWeek} (stopped at ${w})`);
+      return { sessions: [], weeksScraped: 0, rawTilesTotal, duplicateSkipsTotal };
+    }
+  }
+
+  for (let weekOffset = startWeek; weekOffset <= endWeek; weekOffset++) {
+    const fp = await getCalendarFingerprint(page);
+    const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
+    rawTilesTotal += result.rawCount;
+    duplicateSkipsTotal += result.duplicateSkips;
+
+    let newKeys = 0;
+    for (const s of result.sessions) {
+      if (!allByKey.has(s.key)) {
+        allByKey.set(s.key, s);
+        newKeys++;
+      }
+    }
+
+    const dateRange = result.sessions.length
+      ? `${result.sessions.map(s => s.isoDate).sort()[0]} → ${result.sessions.map(s => s.isoDate).sort().slice(-1)[0]}`
+      : 'none';
+
+    console.log(
+      `  [week offset ${weekOffset}] label="${fp.label || 'n/a'}" ` +
+      `tiles=${result.rawCount} parsed=${result.sessions.length} new=${newKeys} ` +
+      `cumulative=${allByKey.size} dates=${dateRange}`
+    );
+    weeksScraped++;
+
+    if (weekOffset < endWeek) {
+      const hasNext = await canAdvanceCalendar(page);
+      if (!hasNext) {
+        console.log(`  [week offset ${weekOffset}] no next-week arrow — end of calendar`);
+        break;
+      }
+      const advanced = await advanceCalendarWeek(page);
+      if (!advanced) break;
+    }
+  }
+
+  lastWeeksScraped = Math.max(lastWeeksScraped, weeksScraped);
+  return {
+    sessions: [...allByKey.values()],
+    weeksScraped,
+    rawTilesTotal,
+    duplicateSkipsTotal,
+  };
 }
 
 function todayDateKey() {
@@ -572,6 +717,29 @@ function sessionInTier(s, tier) {
   return days >= cfg.minDay && days <= tierMaxDay(tier);
 }
 
+function weeksForTier(tier) {
+  const cfg = TIER_CONFIG[tier];
+  const startWeek = Math.floor(cfg.minDay / 7);
+  const endWeek = Math.min(Math.floor(tierMaxDay(tier) / 7), effectiveWeeksAhead - 1);
+  return { startWeek, endWeek: Math.max(startWeek, endWeek) };
+}
+
+function computeDateCoverage() {
+  const dateKeys = [...new Set(sessions.map(s => s.dateKey).filter(Boolean))].sort();
+  const sessionsByDate = {};
+  for (const s of sessions) {
+    if (!s.dateKey) continue;
+    sessionsByDate[s.dateKey] = (sessionsByDate[s.dateKey] || 0) + 1;
+  }
+  return {
+    earliestSessionDate: dateKeys[0] || null,
+    latestSessionDate: dateKeys[dateKeys.length - 1] || null,
+    uniqueDatesCount: dateKeys.length,
+    sessionsByDate,
+    weeksScraped: lastWeeksScraped,
+  };
+}
+
 function filterBatchForTier(batch, tier) {
   return batch.filter(s => sessionInTier(s, tier));
 }
@@ -617,6 +785,7 @@ async function launchBrowser() {
   });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+    timezoneId: BOOKING_TZ,
   });
   const page = await context.newPage();
   return { browser, page };
@@ -632,8 +801,8 @@ async function detectAvailableWeeks(page) {
   let weeks = 1;
   const seenKeys = new Set();
 
-  async function absorbWeek() {
-    const { sessions: batch } = await page.evaluate(scrapeVisibleSessions, SCRAPE_OPTS);
+  async function absorbWeek(weekOffset) {
+    const { sessions: batch } = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
     let added = 0;
     for (const s of batch) {
       if (!seenKeys.has(s.key)) { seenKeys.add(s.key); added++; }
@@ -641,21 +810,13 @@ async function detectAvailableWeeks(page) {
     return added;
   }
 
-  await absorbWeek();
+  await absorbWeek(0);
 
-  while (weeks < 12) {
-    const chevron = page.locator('.glyphicon-chevron-right').first();
-    if (!await chevron.count()) break;
-    const disabled = await chevron.evaluate(el =>
-      el.classList.contains('disabled') ||
-      !!el.closest('[disabled]') ||
-      window.getComputedStyle(el).opacity === '0.3'
-    ).catch(() => false);
-    if (disabled) break;
-
+  while (weeks < SCRAPE_WEEKS_AHEAD + 1) {
+    if (!await canAdvanceCalendar(page)) break;
     if (!await advanceCalendarWeek(page)) break;
     weeks++;
-    const added = await absorbWeek();
+    const added = await absorbWeek(weeks - 1);
     if (added === 0) break;
   }
 
@@ -670,34 +831,6 @@ function updateEffectiveWeeksCap(detectedWeeks) {
   if (effectiveWeeksAhead < SCRAPE_WEEKS_AHEAD) {
     console.log(`  capped SCRAPE_WEEKS_AHEAD at ${effectiveWeeksAhead} — site does not expose further weeks`);
   }
-}
-
-async function navigateToWeek(page, weekIndex) {
-  for (let i = 0; i < weekIndex; i++) {
-    if (!await advanceCalendarWeek(page)) return false;
-  }
-  return true;
-}
-
-async function scrapeWeekRange(page, weekStart, weekEnd) {
-  const collected = [];
-  let rawTilesTotal = 0;
-  let duplicateSkipsTotal = 0;
-
-  if (!await navigateToWeek(page, weekStart)) {
-    return { batch: collected, rawTilesTotal, duplicateSkipsTotal };
-  }
-
-  for (let week = weekStart; week <= weekEnd; week++) {
-    const { sessions: batch, rawCount, duplicateSkips } = await page.evaluate(scrapeVisibleSessions, SCRAPE_OPTS);
-    rawTilesTotal += rawCount;
-    duplicateSkipsTotal += duplicateSkips;
-    collected.push(...batch);
-    console.log(`    week ${week + 1}: ${batch.length} sessions (${rawCount} tiles)`);
-    if (week < weekEnd && !(await advanceCalendarWeek(page))) break;
-  }
-
-  return { batch: collected, rawTilesTotal, duplicateSkipsTotal };
 }
 
 async function processNotifications(updatedKeys, { slotsAlerts = false } = {}) {
@@ -723,14 +856,13 @@ async function processNotifications(updatedKeys, { slotsAlerts = false } = {}) {
 async function runTierScrape(tier) {
   return withScrapeLock(async () => {
     const cfg = TIER_CONFIG[tier];
-    const configuredEnd = cfg.weekEnd == null ? effectiveWeeksAhead - 1 : cfg.weekEnd;
-    const weekEnd = Math.min(configuredEnd, effectiveWeeksAhead - 1);
-    if (weekEnd < cfg.weekStart) {
-      console.log(`[tier ${tier}] skipped — no weeks in range (weeks ${cfg.weekStart}–${weekEnd})`);
+    const { startWeek, endWeek } = weeksForTier(tier);
+    if (endWeek < startWeek || startWeek >= effectiveWeeksAhead) {
+      console.log(`[tier ${tier}] skipped — no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`);
       return;
     }
 
-    console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, weeks ${cfg.weekStart + 1}–${weekEnd + 1})`);
+    console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek})`);
 
     scrapeInProgress = true;
     lastScrapeAttempt = new Date().toISOString();
@@ -749,8 +881,8 @@ async function runTierScrape(tier) {
       const { page } = launched;
       await openBookingPage(page);
 
-      const { batch: rawBatch, rawTilesTotal } =
-        await scrapeWeekRange(page, cfg.weekStart, weekEnd);
+      const { batch: rawBatch, rawTilesTotal, weeksScraped } =
+        await scrapePaginatedWeeks(page, startWeek, endWeek);
 
       const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
       const byKey = new Map(batch.map(s => [s.key, s]));
@@ -769,7 +901,9 @@ async function runTierScrape(tier) {
         console.log(`  slot counts: ${slotStats.cached} from cache, ${slotStats.rechecked} re-checked${reasonParts.length ? ` (${reasonParts.join(', ')})` : ''}`);
       }
 
-      console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${batch.length} in range, ${updatedKeys.length} updated`);
+      console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
+      const coverage = computeDateCoverage();
+      console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days)`);
       await processNotifications(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
       lastTierRun[tier] = new Date().toISOString();
@@ -807,12 +941,14 @@ async function detectWeeksOnStartup() {
 
 // ── REST API ─────────────────────────────────────────────────────────────────
 function statusPayload() {
+  const dateCoverage = computeDateCoverage();
   return {
     sessions,
     watchList,
     history,
     lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
+    ...dateCoverage,
     scrapeMeta: {
       weeksAvailableOnSite,
       effectiveWeeksAhead,
@@ -820,6 +956,7 @@ function statusPayload() {
       lastTierRun: { ...lastTierRun },
       persistentCache: PERSISTENT_CACHE,
       snapshotPath: SNAPSHOT_PATH,
+      ...dateCoverage,
     },
     ...getStatusFields(),
   };
@@ -856,8 +993,8 @@ function bootstrapInBackground() {
     .then(() => runTierScrape(1))
     .then(() => {
       setTimeout(() => runTierScrape(2).catch(console.error), 30_000);
-      setTimeout(() => runTierScrape(3).catch(console.error), 90_000);
-      setTimeout(() => runTierScrape(4).catch(console.error), 180_000);
+      setTimeout(() => runTierScrape(3).catch(console.error), 45_000);
+      setTimeout(() => runTierScrape(4).catch(console.error), 120_000);
     })
     .catch(console.error);
 }
