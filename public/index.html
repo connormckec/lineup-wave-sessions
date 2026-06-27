@@ -3,154 +3,376 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0a0f1e">
-<title>AP Sessions</title>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Lineup">
+<meta name="theme-color" content="#020c1b">
+<title>Lineup</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{
-  --bg:#080d1a;--card:#101824;--card2:#0c1422;--border:#1a2744;--border2:#243350;
-  --text:#e2e8f0;--sub:#64748b;--muted:#2a3a55;
-  --blue:#3b82f6;--green:#22c55e;--orange:#f59e0b;--red:#ef4444;
-  --nav-h:62px;
+  --bg:#020c1b;
+  --card:#061a35;
+  --card-hover:#051528;
+  --border:#0e2a4a;
+  --text:#e8f4f8;
+  --sub:#5d8aa8;
+  --muted:#1a3a55;
+  --accent:#00c9a7;
+  --alert:#ff6b35;
+  --closed:#1f3a55;
+  --nav-h:64px;
+  --font-display:'Barlow Condensed',sans-serif;
+  --font-body:'Barlow',sans-serif;
+  --track:.04em;
 }
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-body);overflow:hidden}
 #app{display:flex;flex-direction:column;height:100dvh;max-width:480px;margin:0 auto}
 
-/* ── Status bar ── */
-#status-bar{padding:12px 16px 10px;background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0;display:flex;justify-content:space-between;align-items:center}
-#status-bar h1{font-size:17px;font-weight:700;letter-spacing:-.3px}
-#status-meta{font-size:11px;color:var(--sub);margin-top:2px;display:flex;align-items:center;gap:5px}
-#ntfy-dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
-#ntfy-dot.ok{background:var(--green)}
-#refresh-btn{width:34px;height:34px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+/* ── Header ── */
+#header{padding:18px 16px 0;background:var(--bg);flex-shrink:0}
+.header-row{display:flex;justify-content:space-between;align-items:flex-start}
+#app-title{font-family:var(--font-display);font-size:28px;font-weight:800;letter-spacing:.08em;color:#fff;text-transform:uppercase;line-height:1}
+.wave-divider{margin:10px -16px 0;height:14px;overflow:hidden;position:relative}
+.wave-divider svg{display:block;width:200%;height:14px;animation:wave-drift 6s linear infinite}
+.wave-divider path{fill:none;stroke:var(--border);stroke-width:1.5;stroke-linecap:round}
+@keyframes wave-drift{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+#status-meta{padding:10px 0 12px;font-size:13px;font-family:var(--font-body);display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border)}
+#status-meta .open-count{color:var(--accent);font-weight:600}
+#status-meta .check-time{color:var(--sub)}
+#ntfy-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+#ntfy-dot.ok{background:var(--accent);box-shadow:0 0 6px rgba(0,201,167,.5)}
+#refresh-btn{width:36px;height:36px;border:1px solid var(--border);border-radius:8px;background:rgba(6,26,53,.6);color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,border-color .15s}
+#refresh-btn:active{background:var(--card-hover)}
 #refresh-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 #refresh-btn.spinning svg{animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* ── Content & tabs ── */
+/* ── Content ── */
 #content{flex:1;overflow:hidden;position:relative}
-.pane{position:absolute;inset:0;overflow-y:auto;padding:12px 12px calc(var(--nav-h)+4px);display:none}
+.pane{position:absolute;inset:0;overflow-y:auto;padding:14px 14px calc(var(--nav-h)+8px);display:none;-webkit-overflow-scrolling:touch}
 .pane.active{display:block}
+.pane-header{font-family:var(--font-display);font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--sub);margin-bottom:14px}
 
 /* ── Bottom nav ── */
-#nav{height:var(--nav-h);background:var(--card);border-top:1px solid var(--border);display:flex;flex-shrink:0}
-.nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border:none;background:none;color:var(--sub);font-size:10px;font-family:inherit;cursor:pointer}
-.nav-btn.on{color:var(--blue)}
+#nav{
+  height:var(--nav-h);
+  background:rgba(6,26,53,.9);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  border-top:1px solid var(--border);
+  display:flex;flex-shrink:0;
+}
+.nav-btn{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  border:none;background:none;color:var(--sub);font-size:10px;font-family:var(--font-body);
+  font-weight:500;letter-spacing:var(--track);cursor:pointer;position:relative;padding-bottom:4px;
+}
+.nav-btn.on{color:var(--accent)}
+.nav-btn.on::after{
+  content:'';position:absolute;bottom:6px;left:50%;transform:translateX(-50%);
+  width:28px;height:2px;background:var(--accent);border-radius:1px;
+}
 .nav-btn svg{width:21px;height:21px;stroke-width:1.8;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
-.wbadge{min-width:18px;height:18px;background:var(--blue);color:#fff;border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center}
+.wbadge{min-width:18px;height:18px;background:var(--accent);color:var(--bg);border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;font-family:var(--font-display)}
 
-/* ── Day chips ── */
-.chips{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:10px}
+/* ── Chips ── */
+.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding-bottom:12px}
 .chips::-webkit-scrollbar{display:none}
-.chip{flex-shrink:0;padding:6px 14px;border-radius:20px;border:1px solid var(--border2);background:transparent;color:var(--sub);font-size:13px;font-family:inherit;cursor:pointer;white-space:nowrap}
-.chip.on{background:rgba(59,130,246,.15);border-color:var(--blue);color:var(--blue);font-weight:600}
+.chip{
+  flex-shrink:0;padding:7px 16px;border-radius:999px;
+  border:1px solid var(--border);
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  background:rgba(14,42,74,.7);
+  color:var(--sub);font-size:13px;font-family:var(--font-body);font-weight:500;
+  cursor:pointer;white-space:nowrap;transition:all .15s;
+}
+.chip.on{border-color:var(--accent);color:var(--accent);background:rgba(0,201,167,.1)}
+.chip-lvl.on{font-weight:600}
+.chips-sm{padding-bottom:8px}
+.chip-sm{font-size:12px;padding:6px 14px}
+.lessons-toggle-row{padding:0 0 10px;margin-top:-2px}
+.lessons-link{
+  background:none;border:none;padding:0;
+  font-size:11px;color:var(--sub);cursor:pointer;
+  text-decoration:underline;text-underline-offset:2px;
+  font-family:var(--font-body);
+}
+.lessons-link.on{color:var(--accent)}
+
+/* ── Date bar ── */
+.date-bar{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;padding:4px 0;
+}
+#date-label{
+  font-family:var(--font-display);font-size:20px;font-weight:700;
+  color:#fff;letter-spacing:.03em;line-height:1.2;
+}
+#cal-btn{
+  width:40px;height:40px;border-radius:10px;
+  border:1px solid var(--border);background:rgba(14,42,74,.6);
+  color:var(--sub);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .15s;flex-shrink:0;
+}
+#cal-btn:active{background:var(--card-hover);color:var(--accent);border-color:var(--accent)}
+
+/* ── Date picker bottom sheet ── */
+.picker-backdrop{
+  position:fixed;inset:0;background:rgba(2,12,27,.65);
+  z-index:200;opacity:0;pointer-events:none;transition:opacity .25s;
+}
+.picker-backdrop.open{opacity:1;pointer-events:auto}
+.picker-sheet{
+  position:fixed;left:50%;bottom:0;transform:translate(-50%,100%);
+  width:100%;max-width:480px;
+  background:var(--card);border:1px solid var(--border);
+  border-radius:16px 16px 0 0;
+  padding:12px 16px calc(16px + env(safe-area-inset-bottom));
+  z-index:201;transition:transform .3s cubic-bezier(.32,.72,0,1);
+  touch-action:none;
+}
+.picker-sheet.open{transform:translate(-50%,0)}
+.picker-handle{
+  width:36px;height:4px;border-radius:2px;background:var(--muted);
+  margin:0 auto 14px;
+}
+.picker-title{
+  font-family:var(--font-display);font-size:13px;font-weight:700;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--sub);
+  margin-bottom:12px;
+}
+.week-row{
+  display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;
+  padding:0 4px 4px;margin-bottom:16px;
+  scroll-behavior:smooth;-webkit-overflow-scrolling:touch;
+  touch-action:pan-x;
+}
+.week-row::-webkit-scrollbar{display:none}
+.week-day{
+  flex:0 0 auto;min-width:48px;padding:10px 8px;border-radius:12px;
+  border:1px solid var(--border);background:rgba(14,42,74,.5);
+  color:var(--sub);cursor:pointer;text-align:center;
+  font-family:var(--font-body);transition:all .15s;
+}
+.week-day.on{border-color:var(--accent);background:rgba(0,201,167,.12);color:var(--accent)}
+.week-day.has-sessions .wd-dot{background:var(--accent)}
+.week-day.on .wd-dot{background:var(--accent)}
+.week-day .wd-abbr{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.week-day .wd-num{font-family:var(--font-display);font-size:18px;font-weight:700;margin-top:4px;line-height:1}
+.week-day .wd-dot{
+  width:5px;height:5px;border-radius:50%;background:var(--muted);
+  margin:5px auto 0;
+}
+.week-day.no-sessions{
+  opacity:.35;cursor:not-allowed;pointer-events:none;
+  border-color:var(--border);background:rgba(14,42,74,.25);
+}
+.week-day.no-sessions .wd-dot{display:none}
+.picker-divider{height:1px;background:var(--border);margin:0 0 14px}
+.time-row{display:flex;gap:10px;margin-bottom:16px}
+.time-field{flex:1}
+.time-field label{
+  display:block;font-size:10px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--sub);margin-bottom:6px;
+}
+.time-field select{
+  width:100%;background:var(--card-hover);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px;
+  font-family:var(--font-body);outline:none;appearance:none;
+}
+.time-field select:focus{border-color:var(--accent)}
+.btn-show{
+  width:100%;padding:13px;border-radius:10px;border:none;
+  background:var(--accent);color:var(--bg);
+  font-family:var(--font-display);font-size:15px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;cursor:pointer;
+}
+.btn-show:active{opacity:.85}
 
 /* ── Session cards ── */
-.sc{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;margin-bottom:7px;cursor:pointer}
-.sc.watching{border-color:var(--blue);background:rgba(59,130,246,.04)}
-.sc:active{background:var(--card2)}
-.sc-bar{width:4px;height:40px;border-radius:2px;flex-shrink:0}
-.sc-main{flex:1;min-width:0}
-.sc-time{font-size:15px;font-weight:600;line-height:1.2}
-.sc-level{font-size:12px;margin-top:2px}
-.sc-wave{font-size:11px;color:var(--sub);margin-top:1px}
-.sc-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.status-pill{display:flex;align-items:center;gap:5px;font-size:12px;font-weight:600}
-.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.dot-open{background:var(--green)}
-.dot-full{background:#374151}
-.dot-low{background:var(--orange)}
-.slot-tag{font-size:11px;font-weight:700;color:var(--orange);background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.25);border-radius:6px;padding:2px 6px;white-space:nowrap}
-.bell-btn{width:36px;height:36px;border-radius:50%;border:1.5px solid var(--border2);background:transparent;color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .12s}
-.bell-btn.on{border-color:var(--blue);background:rgba(59,130,246,.15);color:var(--blue)}
+.sc{
+  display:flex;align-items:center;gap:12px;
+  min-height:72px;
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 14px 14px 0;
+  margin-bottom:8px;cursor:pointer;
+  transition:background .15s,border-color .15s;
+  overflow:hidden;
+}
+.sc.watching{border-color:rgba(0,201,167,.4);box-shadow:0 0 0 1px rgba(0,201,167,.15)}
+.sc:active{background:var(--card-hover)}
+.sc-accent{width:6px;align-self:stretch;flex-shrink:0;border-radius:10px 0 0 10px;margin-right:2px}
+.sc-body{flex:1;min-width:0;padding-left:12px}
+.sc-time{
+  font-family:var(--font-display);font-size:22px;font-weight:700;
+  letter-spacing:.04em;text-transform:uppercase;line-height:1.1;
+}
+.sc-level{
+  font-family:var(--font-display);font-size:15px;font-weight:700;
+  margin-top:3px;letter-spacing:.02em;
+}
+.slot-bar{display:flex;gap:3px;margin-top:5px;align-items:center}
+.slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sc-wave{font-size:12px;color:var(--sub);margin-top:4px;font-family:var(--font-body);font-weight:500}
+.sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
+.sc-right{display:flex;align-items:center;gap:10px;flex-shrink:0;padding-right:4px}
+.cond-badge{
+  font-family:var(--font-display);font-size:11px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;
+  white-space:nowrap;text-align:right;line-height:1.3;
+}
+.bell-btn{
+  width:38px;height:38px;border-radius:50%;
+  border:1.5px solid var(--border);background:rgba(14,42,74,.5);
+  color:var(--sub);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:all .15s;
+}
+.bell-btn.on{border-color:var(--accent);background:rgba(0,201,167,.12);color:var(--accent)}
 .bell-btn svg{width:17px;height:17px;stroke-width:2;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
 .bell-btn.on svg{fill:currentColor}
 
 /* ── Watch tab ── */
-.wc{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:13px 14px;margin-bottom:8px}
-.wc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
-.wc-title{font-size:14px;font-weight:600}
-.wc-meta{font-size:12px;color:var(--sub);margin-top:2px}
-.wc-status{font-size:13px;font-weight:600;display:flex;align-items:center;gap:5px;margin-top:4px}
-.rm-btn{background:transparent;border:1px solid var(--border2);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;flex-shrink:0}
-.empty{text-align:center;padding:48px 20px;color:var(--sub);line-height:1.8;font-size:14px}
+.wc{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:10px;padding:14px 16px;margin-bottom:8px;
+  border-left:4px solid var(--wc-accent, var(--accent));
+}
+.wc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.wc-title{font-family:var(--font-display);font-size:16px;font-weight:700;letter-spacing:.03em}
+.wc-meta{font-size:12px;color:var(--sub);margin-top:3px;font-weight:500}
+.wc-status{
+  font-family:var(--font-display);font-size:13px;font-weight:700;
+  letter-spacing:.05em;text-transform:uppercase;margin-top:2px;
+}
+.rm-btn{
+  background:transparent;border:1px solid var(--border);color:var(--sub);
+  border-radius:8px;padding:5px 12px;font-size:11px;cursor:pointer;
+  font-family:var(--font-body);font-weight:500;letter-spacing:var(--track);
+  text-transform:uppercase;transition:all .15s;
+}
+.rm-btn:active{background:var(--card-hover)}
+.empty{text-align:center;padding:52px 24px;color:var(--sub);line-height:1.8;font-size:14px;font-weight:400}
 
 /* ── Setup tab ── */
-.setup-block{margin-bottom:22px}
-.setup-block h3{font-size:14px;font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:7px}
-.setup-block p{font-size:13px;color:var(--sub);line-height:1.6;margin-bottom:10px}
-.step{display:flex;gap:10px;margin-bottom:9px;align-items:flex-start}
-.step-n{width:22px;height:22px;border-radius:50%;background:var(--muted);color:var(--sub);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
-.step p{font-size:13px;color:var(--sub);line-height:1.5;margin:0}
-.mono-box{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:monospace;font-size:13px;color:#7dd3fc;word-break:break-all;margin-bottom:8px}
+.setup-block{margin-bottom:24px}
+.setup-block h3{
+  font-family:var(--font-display);font-size:15px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;
+  display:flex;align-items:center;gap:8px;
+}
+.setup-block p{font-size:13px;color:var(--sub);line-height:1.65;margin-bottom:10px}
+.step{display:flex;gap:10px;margin-bottom:10px;align-items:flex-start}
+.step-n{
+  width:22px;height:22px;border-radius:50%;background:var(--muted);
+  color:var(--sub);font-size:11px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;
+  font-family:var(--font-display);
+}
+.step p{font-size:13px;color:var(--sub);line-height:1.55;margin:0}
+.mono-box{
+  background:var(--card-hover);border:1px solid var(--border);
+  border-radius:8px;padding:10px 12px;font-family:monospace;font-size:12px;
+  color:var(--accent);word-break:break-all;margin-bottom:8px;
+}
 .pill-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
-.carrier{padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--sub);font-size:12px;cursor:pointer;font-family:inherit}
-.carrier.on{border-color:var(--blue);background:rgba(59,130,246,.12);color:var(--blue)}
-input.field{width:100%;background:var(--card2);border:1px solid var(--border2);border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px;font-family:inherit;outline:none;margin-bottom:8px}
-input.field:focus{border-color:var(--blue)}
-.btn{padding:10px 18px;border-radius:10px;border:none;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
-.btn-blue{background:var(--blue);color:#fff}
-.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--sub)}
-.divider{height:1px;background:var(--border);margin:16px 0}
-.lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:7px}
+.carrier{
+  padding:7px 12px;border-radius:999px;border:1px solid var(--border);
+  background:rgba(14,42,74,.5);color:var(--sub);font-size:12px;
+  cursor:pointer;font-family:var(--font-body);transition:all .15s;
+}
+.carrier.on{border-color:var(--accent);background:rgba(0,201,167,.1);color:var(--accent)}
+input.field{
+  width:100%;background:var(--card-hover);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px;
+  font-family:var(--font-body);outline:none;margin-bottom:8px;
+}
+input.field:focus{border-color:var(--accent)}
+.btn{
+  padding:10px 18px;border-radius:8px;border:none;font-size:13px;
+  font-weight:600;cursor:pointer;font-family:var(--font-body);letter-spacing:var(--track);
+}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--sub)}
+.divider{height:1px;background:var(--border);margin:18px 0}
+.lbl{
+  font-size:10px;color:var(--sub);text-transform:uppercase;
+  letter-spacing:.1em;margin-bottom:7px;font-weight:600;
+}
 </style>
 </head>
 <body>
 <div id="app">
 
-  <div id="status-bar">
-    <div>
-      <div id="title-row" style="display:flex;align-items:center;gap:8px">
-        <h1>🏄 AP Sessions</h1>
-      </div>
-      <div id="status-meta">
-        <div id="ntfy-dot"></div>
-        <span id="status-text">Loading...</span>
-      </div>
+  <header id="header">
+    <div class="header-row">
+      <h1 id="app-title">AP Sessions</h1>
+      <button id="refresh-btn" onclick="refresh()" aria-label="Refresh sessions">
+        <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
     </div>
-    <button id="refresh-btn" onclick="refresh()" aria-label="Refresh sessions">
-      <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-    </button>
-  </div>
+    <div class="wave-divider" aria-hidden="true">
+      <svg viewBox="0 0 800 14" preserveAspectRatio="none">
+        <path d="M0,7 C40,2 80,12 120,7 S200,2 240,7 S320,12 360,7 S440,2 480,7 S560,12 600,7 S680,2 720,7 S760,12 800,7"/>
+        <path d="M0,7 C40,12 80,2 120,7 S200,12 240,7 S320,2 360,7 S440,12 480,7 S560,2 600,7 S680,12 720,7 S760,2 800,7" opacity=".5"/>
+      </svg>
+    </div>
+    <div id="status-meta">
+      <div id="ntfy-dot"></div>
+      <span id="status-text">Loading...</span>
+    </div>
+  </header>
 
   <div id="content">
 
-    <!-- BROWSE TAB -->
     <div class="pane active" id="pane-browse">
-      <div class="chips" id="day-chips"></div>
+      <div class="date-bar">
+        <div id="date-label">Today</div>
+        <button type="button" id="cal-btn" aria-label="Pick date and time">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+          </svg>
+        </button>
+      </div>
+      <div class="chips chips-sm" id="wave-chips"></div>
+      <div class="lessons-toggle-row" id="lessons-toggle-row"></div>
       <div class="chips" id="level-chips"></div>
       <div id="session-list"></div>
     </div>
 
-    <!-- WATCHING TAB -->
     <div class="pane" id="pane-watching">
+      <div class="pane-header">Your Lineup</div>
       <div id="watch-list"></div>
     </div>
 
-    <!-- SETUP TAB -->
     <div class="pane" id="pane-setup">
       <div class="setup-block">
-        <h3>📱 Push notifications</h3>
+        <h3>Push Notifications</h3>
         <p>Install the free <strong>Ntfy</strong> app (App Store or Google Play). Then subscribe to your topic:</p>
-        <div class="lbl">Your Ntfy topic (from Railway env var)</div>
+        <div class="lbl">Your Ntfy topic</div>
         <div class="mono-box" id="ntfy-topic-box">Set NTFY_TOPIC in Railway → Variables</div>
         <div id="ntfy-status-msg" style="font-size:12px;color:var(--sub);margin-bottom:10px"></div>
         <div class="step"><div class="step-n">1</div><p>Install Ntfy from the App Store or Google Play (it's free)</p></div>
         <div class="step"><div class="step-n">2</div><p>Open Ntfy → tap <strong>+</strong> → subscribe to the topic above</p></div>
-        <div class="step"><div class="step-n">3</div><p>That's it — notifications will come through instantly like texts</p></div>
+        <div class="step"><div class="step-n">3</div><p>Notifications arrive instantly — like a surf report text</p></div>
       </div>
 
       <div class="divider"></div>
 
       <div class="setup-block">
-        <h3>💬 Or: real SMS texts (free, no account)</h3>
-        <p>Every US carrier has an email-to-SMS gateway. Add your number + carrier as a Railway env var called <code style="font-size:12px;background:var(--card2);padding:2px 5px;border-radius:4px">SMS_ADDRESS</code>.</p>
+        <h3>SMS Alerts</h3>
+        <p>Every US carrier has an email-to-SMS gateway. Add your number + carrier as a Railway env var called <code style="font-size:12px;background:var(--card-hover);padding:2px 6px;border-radius:4px;color:var(--accent)">SMS_ADDRESS</code>.</p>
         <div class="lbl">Pick your carrier</div>
         <div class="pill-row" id="carrier-pills"></div>
         <div class="lbl">Your 10-digit number</div>
         <input class="field" type="tel" id="phone-input" placeholder="7575551234" maxlength="10" oninput="updateSms()">
-        <div class="lbl">Set this as SMS_ADDRESS in Railway → Variables</div>
+        <div class="lbl">Set as SMS_ADDRESS in Railway</div>
         <div class="mono-box" id="sms-address">Select carrier + enter number</div>
         <button class="btn btn-outline" onclick="copySms()">Copy address</button>
       </div>
@@ -158,13 +380,15 @@ input.field:focus{border-color:var(--blue)}
       <div class="divider"></div>
 
       <div class="setup-block">
-        <h3>⚙️ Watcher settings</h3>
-        <p>These are Railway env vars you can set in the Variables tab to tune the watcher.</p>
-        <div style="font-size:12px;color:var(--sub);line-height:2">
-          <code style="color:#7dd3fc">NTFY_TOPIC</code> — your push notification topic<br>
-          <code style="color:#7dd3fc">LOW_SLOTS_THRESHOLD</code> — alert when slots ≤ this (default: 2)<br>
-          <code style="color:#7dd3fc">CHECK_EVERY_MINS</code> — how often to check (default: 5)<br>
-          <code style="color:#7dd3fc">SMS_ADDRESS</code> — your carrier SMS email address
+        <h3>Watcher Settings</h3>
+        <p>Configure these in Railway → Variables.</p>
+        <div style="font-size:12px;color:var(--sub);line-height:2.2">
+          <code style="color:var(--accent)">NTFY_TOPIC</code> — push notification topic<br>
+          <code style="color:var(--accent)">LOW_SLOTS_THRESHOLD</code> — alert when slots ≤ this (default: 2)<br>
+          <code style="color:var(--accent)">CHECK_EVERY_MINS</code> — check interval (default: 5)<br>
+          <code style="color:var(--accent)">MAX_SLOT_CHECKS</code> — slot counts per cycle (default: 50)<br>
+          <code style="color:var(--accent)">SCRAPE_WEEKS_AHEAD</code> — calendar lookahead in weeks (default: 4)<br>
+          <code style="color:var(--accent)">SMS_ADDRESS</code> — carrier SMS email address
         </div>
       </div>
     </div>
@@ -178,7 +402,7 @@ input.field:focus{border-color:var(--blue)}
     </button>
     <button class="nav-btn" onclick="showTab('watching',this)" id="nav-watching">
       <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-      <span id="watch-badge">Watching</span>
+      <span id="watch-badge">Lineup</span>
     </button>
     <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -186,55 +410,237 @@ input.field:focus{border-color:var(--blue)}
     </button>
   </nav>
 
+  <div id="picker-backdrop" class="picker-backdrop"></div>
+  <div id="picker-sheet" class="picker-sheet" aria-hidden="true">
+    <div class="picker-handle" id="picker-handle"></div>
+    <div class="picker-title">Select date & time</div>
+    <div class="week-row" id="picker-week"></div>
+    <div class="picker-divider"></div>
+    <div class="time-row">
+      <div class="time-field">
+        <label for="picker-from">From</label>
+        <select id="picker-from"></select>
+      </div>
+      <div class="time-field">
+        <label for="picker-to">To</label>
+        <select id="picker-to"></select>
+      </div>
+    </div>
+    <button type="button" class="btn-show" id="picker-apply">Show sessions</button>
+  </div>
+
 </div>
 
 <script>
-// ── Config ────────────────────────────────────────────────────────────────────
 const LEVELS = {
-  'Intermediate':    {s:'INT', c:'#3b82f6', pri:true},
-  'Progressive':     {s:'PRG', c:'#22c55e', pri:true},
-  'Advanced Turns':  {s:'AT',  c:'#8b5cf6', pri:true},
-  'Advanced Barrels':{s:'AB',  c:'#ec4899', pri:true},
-  'Expert Turns':    {s:'ET',  c:'#f97316', pri:false},
-  'Expert Barrels':  {s:'EB',  c:'#ef4444', pri:false},
-  'Pro Turns':       {s:'PT',  c:'#eab308', pri:false},
-  'Boogie Nitez':    {s:'BOG', c:'#a855f7', pri:false},
+  'Intermediate':     { s:'INT', c:'#00b4d8', pri:true },
+  'Progressive':      { s:'PRG', c:'#48cae4', pri:true },
+  'Advanced Turns':   { s:'AT',  c:'#7b2fff', pri:true },
+  'Advanced Barrels': { s:'AB',  c:'#c77dff', pri:true },
+  'Expert Turns':     { s:'ET',  c:'#ff6b35', pri:false },
+  'Expert Barrels':   { s:'EB',  c:'#ff4444', pri:false },
+  'Pro Turns':        { s:'PT',  c:'#ffd166', pri:false },
+  'Boogie Nitez':     { s:'BOG', c:'#f72585', pri:false },
 };
 
 const CARRIERS = {
-  'AT&T':       '@txt.att.net',
-  'Verizon':    '@vtext.com',
-  'T-Mobile':   '@tmomail.net',
-  'Sprint':     '@messaging.sprintpcs.com',
-  'Cricket':    '@mms.cricketwireless.net',
-  'Metro PCS':  '@mymetropcs.com',
-  'Boost':      '@sms.myboostmobile.com',
-  'US Cellular':'@email.uscc.net',
+  'AT&T':        '@txt.att.net',
+  'Verizon':     '@vtext.com',
+  'T-Mobile':    '@tmomail.net',
+  'Sprint':      '@messaging.sprintpcs.com',
+  'Cricket':     '@mms.cricketwireless.net',
+  'Metro PCS':   '@mymetropcs.com',
+  'Boost':       '@sms.myboostmobile.com',
+  'US Cellular': '@email.uscc.net',
 };
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let data       = { sessions: [], watchList: [], history: {}, lastCheck: null, ntfyOk: false };
-let activeDay  = null;
-let carrier    = localStorage.getItem('carrier') || '';
+const WAVE_NAMES = {
+  1: 'Right Wave',
+  2: 'Left Wave',
+  3: 'Right Lesson',
+  4: 'Left Lesson',
+};
 
-// ── Fetch from server ─────────────────────────────────────────────────────────
+const WAVE_FILTERS = [
+  { wave: null, label: 'All' },
+  { wave: 1, label: 'Right Wave' },
+  { wave: 2, label: 'Left Wave' },
+];
+const LESSON_WAVES = [3, 4];
+
+const EXCLUDED_LEVELS = ['Cabanas', 'Beach Pass'];
+const EXCLUDED_WAVES  = [5, 6];
+
+function isSurfSession(s) {
+  return !EXCLUDED_LEVELS.includes(s.level) && !EXCLUDED_WAVES.includes(s.wave);
+}
+
+function surfSessions(list) {
+  return (list || data.sessions).filter(isSurfSession);
+}
+
+function isLessonSession(s) {
+  return LESSON_WAVES.includes(s.wave);
+}
+
+function matchesWaveFilter(s) {
+  if (activeWave != null) return s.wave === activeWave;
+  if (!showLessons && isLessonSession(s)) return false;
+  return true;
+}
+
+function sessionCapacity(level) {
+  if (level === 'Progressive') return 18;
+  if (level === 'Pro Turns') return 10;
+  return 12;
+}
+
+const HOUR_OPTIONS = [];
+for (let h = 6; h <= 22; h++) {
+  const ampm = h < 12 ? 'am' : 'pm';
+  const hr = h % 12 || 12;
+  HOUR_OPTIONS.push({ value: h, label: `${hr}:00 ${ampm}` });
+}
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function dateKeyFromSession(s) {
+  if (s.dateKey) return s.dateKey;
+  const d = new Date(s.ts * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function dateLabel(dateKey) {
+  const d = new Date(dateKey + 'T12:00:00');
+  const today = new Date(); today.setHours(12, 0, 0, 0);
+  const tom = new Date(today); tom.setDate(tom.getDate() + 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === tom.toDateString()) return 'Tomorrow';
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function getPickerDays() {
+  const count = data.scrapeMeta?.effectiveWeeksAhead
+    ? Math.min(14, data.scrapeMeta.effectiveWeeksAhead * 7)
+    : 14;
+  const days = [];
+  const start = new Date();
+  start.setHours(12, 0, 0, 0);
+  for (let i = 0; i < count; i++) {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    days.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+  }
+  return days;
+}
+
+function daysFromTodayKey(dateKey) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const d = new Date(dateKey + 'T12:00:00');
+  d.setHours(0, 0, 0, 0);
+  return Math.round((d - today) / 86_400_000);
+}
+
+function freshnessLabel(s) {
+  if (!s.lastScraped) return '';
+  if (daysFromTodayKey(s.dateKey) <= 1) return '';
+  const mins = Math.round((Date.now() - new Date(s.lastScraped)) / 60_000);
+  if (mins < 60) return `Updated ${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `Updated ${hrs}h ago`;
+  return `Updated ${Math.round(hrs / 24)}d ago`;
+}
+
+function sessionDaysSet() {
+  return new Set(surfSessions().map(dateKeyFromSession));
+}
+
+function sessionHour(s) {
+  return new Date(s.ts * 1000).getHours();
+}
+
+function matchesTimeRange(s, fromH, toH) {
+  if (fromH == null && toH == null) return true;
+  const h = sessionHour(s);
+  if (fromH != null && h < fromH) return false;
+  if (toH != null && h > toH) return false;
+  return true;
+}
+
+function waveLabel(wave) {
+  return WAVE_NAMES[wave] || `Wave ${wave}`;
+}
+
+function hexAlpha(hex, a) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function surfCondition(s, hist) {
+  const slots = s.slots ?? hist.slots;
+  const suffix = slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '';
+
+  if (!s.available) {
+    return { text: 'PACKED', color: '#5d8aa8', slots };
+  }
+  if (slots == null) {
+    return { text: 'OPEN', color: '#00c9a7', slots: null };
+  }
+  if (slots >= 10) return { text: `FIRING 🔥${suffix}`, color: '#00c9a7', slots };
+  if (slots >= 5)  return { text: `OPEN${suffix}`, color: '#00c9a7', slots };
+  if (slots >= 3)  return { text: `GETTING CROWDED${suffix}`, color: '#ffd166', slots };
+  return { text: `CLOSING OUT ⚡${suffix}`, color: '#ff6b35', slots };
+}
+
+
+function slotBarHtml(slots, level, levelColor, dimmed) {
+  if (slots == null) return '';
+  const capacity = sessionCapacity(level);
+  const open  = Math.min(Math.max(0, slots), capacity);
+  const taken = capacity - open;
+  const openColor  = dimmed ? '#1a3a55' : levelColor;
+  const takenColor = '#1f3a55';
+  let dots = '';
+  for (let i = 0; i < taken; i++) dots += `<span class="slot-dot" style="background:${takenColor}"></span>`;
+  for (let i = 0; i < open; i++)  dots += `<span class="slot-dot" style="background:${openColor}"></span>`;
+  return `<div class="slot-bar">${dots}</div>`;
+}
+
+let data          = { sessions: [], watchList: [], history: {}, lastCheck: null, ntfyOk: false, scrapeMeta: {} };
+let activeDayKey  = todayKey();
+let activeWave    = null;
+let showLessons   = false;
+let filterFromH   = null;
+let filterToH     = null;
+let activeLevels  = new Set();
+let carrier       = localStorage.getItem('carrier') || '';
+let pickerDraft   = { dayKey: todayKey(), fromH: null, toH: null };
+let pickerOpen    = false;
+
 async function refresh() {
   const btn = document.getElementById('refresh-btn');
   btn.classList.add('spinning');
   try {
-    const res  = await fetch('/api/status');
+    const res = await fetch('/api/status');
     data = await res.json();
-    const days = [...new Set(data.sessions.map(s => s.dayLabel))];
-    if (!activeDay || !days.includes(activeDay)) activeDay = days[0] || null;
+    const withSlots = data.sessions.filter(s => s.slots != null).length;
+    console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
+    if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
-  } catch (e) {
-    document.getElementById('status-text').textContent = 'Connection error';
+  } catch {
+    document.getElementById('status-text').innerHTML =
+      '<span class="check-time">Connection error</span>';
   } finally {
     btn.classList.remove('spinning');
   }
 }
 
-// ── Render everything ─────────────────────────────────────────────────────────
 function renderAll() {
   renderStatusBar();
   renderBrowse();
@@ -245,7 +651,7 @@ function renderAll() {
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
-  const open = data.sessions.filter(s => s.available).length;
+  const open = surfSessions().filter(s => s.available).length;
   dot.className = data.ntfyOk ? 'ok' : '';
 
   let timeStr = 'not checked yet';
@@ -253,105 +659,117 @@ function renderStatusBar() {
     const diff = Math.round((Date.now() - new Date(data.lastCheck)) / 60000);
     timeStr = diff < 1 ? 'just now' : `${diff}m ago`;
   }
-  txt.textContent = `${open} open · checked ${timeStr}`;
+  txt.innerHTML =
+    `<span class="open-count">${open} open</span><span class="check-time"> · checked ${timeStr}</span>`;
 }
 
 function renderBrowse() {
-  const days    = [...new Set(data.sessions.map(s => s.dayLabel))];
-  const dayEl   = document.getElementById('day-chips');
-  dayEl.innerHTML = days.map(d =>
-    `<button class="chip${d===activeDay?' on':''}" onclick="setDay('${d}')">${d}</button>`
+  document.getElementById('date-label').textContent = dateLabel(activeDayKey);
+
+  document.getElementById('wave-chips').innerHTML = WAVE_FILTERS.map(f =>
+    `<button type="button" class="chip chip-sm${activeWave === f.wave ? ' on' : ''}" data-wave="${f.wave ?? ''}">${f.label}</button>`
   ).join('');
 
-  const daySessions = data.sessions.filter(s => s.dayLabel === activeDay);
-  const levels      = [...new Set(daySessions.map(s => s.level))];
-  const lvlEl       = document.getElementById('level-chips');
-  const filtered    = LEVELS;  // show all that exist in data
-  lvlEl.innerHTML   = levels.filter(l => LEVELS[l]).map(l => {
-    const c = LEVELS[l];
-    return `<button class="chip" style="border-color:${c.c}33;color:${c.c}">${c.s}${c.pri?' ★':''}</button>`;
-  }).join('');
+  document.getElementById('lessons-toggle-row').innerHTML =
+    `<button type="button" class="lessons-link${showLessons ? ' on' : ''}" id="lessons-toggle">${showLessons ? 'Hide lessons' : 'Show lessons'}</button>`;
+
+  let levelScope = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+  levelScope = levelScope.filter(matchesWaveFilter);
+  const levels = [...new Set(levelScope.map(s => s.level))];
+
+  document.getElementById('level-chips').innerHTML = [
+    `<button type="button" class="chip chip-lvl${activeLevels.size === 0 ? ' on' : ''}" data-level="__all__">All</button>`,
+    ...levels.filter(l => LEVELS[l]).map(l => {
+      const c  = LEVELS[l];
+      const on = activeLevels.has(l);
+      return `<button type="button" class="chip chip-lvl${on ? ' on' : ''}" data-level="${encodeURIComponent(l)}" style="border-color:${on ? c.c : hexAlpha(c.c, .35)};color:${on ? c.c : 'var(--sub)'}">${c.s}${c.pri ? ' ★' : ''}</button>`;
+    }),
+  ].join('');
+
+  let filtered = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+  filtered = filtered.filter(matchesWaveFilter);
+  if (activeLevels.size) filtered = filtered.filter(s => activeLevels.has(s.level));
+  filtered = filtered.filter(s => matchesTimeRange(s, filterFromH, filterToH));
 
   const listEl = document.getElementById('session-list');
-  listEl.innerHTML = daySessions.map(s => {
-    const cfg     = LEVELS[s.level] || {s:'?',c:'#888'};
-    const watched = data.watchList.some(w => w.key === s.key);
-    const hist    = data.history[s.key] || {};
-    const slots   = s.slots ?? hist.slots;
-    const isLow   = s.available && slots != null && slots <= 2;
+  if (!filtered.length) {
+    listEl.innerHTML = '<div class="empty">No sessions match these filters</div>';
+    return;
+  }
 
-    let dotClass = s.available ? 'dot-open' : 'dot-full';
-    let statusTxt = s.available ? 'Open' : 'Full';
-    if (isLow) { dotClass = 'dot-low'; statusTxt = 'Low'; }
+  filtered.sort((a, b) => a.ts - b.ts);
+  listEl.innerHTML = filtered.map(sessionCardHtml).join('');
+}
 
-    const slotTag = isLow && slots != null
-      ? `<span class="slot-tag">⚡ ${slots} left</span>` : '';
+function sessionCardHtml(s) {
+  const cfg     = LEVELS[s.level] || { s:'?', c:'#5d8aa8' };
+  const watched = data.watchList.some(w => w.key === s.key);
+  const hist    = data.history[s.key] || {};
+  const slots   = s.slots ?? hist.slots;
+  const cond    = surfCondition(s, hist);
+  const dimmed  = !s.available;
+  const tint    = hexAlpha(cfg.c, dimmed ? .04 : .12);
+  const accent  = dimmed ? '#1f3a55' : cfg.c;
 
-    const sJson = encodeURIComponent(JSON.stringify({
-      key: s.key, ts: s.ts, wave: s.wave, level: s.level,
-      time: s.time, date: s.date, dayLabel: s.dayLabel
-    }));
+  const sJson = encodeURIComponent(JSON.stringify({
+    key: s.key, ts: s.ts, wave: s.wave, level: s.level,
+    time: s.time, date: s.date, dayLabel: s.dayLabel,
+  }));
 
-    return `<div class="sc${watched?' watching':''}" onclick="toggleWatch('${sJson}')">
-      <div class="sc-bar" style="background:${s.available?cfg.c:'#1e293b'}"></div>
-      <div class="sc-main">
-        <div class="sc-time" style="color:${s.available?'#fff':'#475569'}">${s.time}</div>
-        <div class="sc-level" style="color:${s.available?cfg.c:'#334155'}">${s.level}</div>
-        <div class="sc-wave">Wave ${s.wave}</div>
-      </div>
-      <div class="sc-right">
-        ${slotTag}
-        <div class="status-pill" style="color:${s.available?'#e2e8f0':'#475569'}">
-          <div class="dot ${dotClass}"></div>${statusTxt}
-        </div>
-        <button class="bell-btn${watched?' on':''}"
-          onclick="event.stopPropagation();toggleWatch('${sJson}')"
-          aria-label="${watched?'Stop watching':'Watch'} this session">
-          <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('') || '<div class="empty">No sessions for this day yet</div>';
+  const fresh = freshnessLabel(s);
+
+  return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)" onclick="toggleWatch('${sJson}')">
+    <div class="sc-accent" style="background:${accent}"></div>
+    <div class="sc-body">
+      <div class="sc-time" style="color:${dimmed ? '#5d8aa8' : '#e8f4f8'}">${s.time.toUpperCase()}</div>
+      <div class="sc-level" style="color:${dimmed ? '#1a3a55' : cfg.c}">${s.level}</div>
+      ${slotBarHtml(slots, s.level, cfg.c, dimmed)}
+      <div class="sc-wave">${waveLabel(s.wave)}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
+    </div>
+    <div class="sc-right">
+      <div class="cond-badge" style="color:${cond.color}">${cond.text}</div>
+      <button class="bell-btn${watched ? ' on' : ''}"
+        onclick="event.stopPropagation();toggleWatch('${sJson}')"
+        aria-label="${watched ? 'Stop watching' : 'Watch'} this session">
+        <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      </button>
+    </div>
+  </div>`;
 }
 
 function renderWatching() {
   const el = document.getElementById('watch-list');
   const wb = document.getElementById('watch-badge');
   const n  = data.watchList.length;
-  wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Watching';
+  wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Lineup';
 
   if (!n) {
-    el.innerHTML = '<div class="empty">Tap the 🔔 on any session to watch it.<br>You\'ll be notified when it opens up<br>or when slots are running low.</div>';
+    el.innerHTML = '<div class="empty">Add sessions to your lineup with the 🔔 button.<br>Get alerted when conditions change<br>or spots open up.</div>';
     return;
   }
 
   el.innerHTML = data.watchList.map(w => {
-    const cfg  = LEVELS[w.level] || {s:'?',c:'#888'};
+    const cfg  = LEVELS[w.level] || { s:'?', c:'#5d8aa8' };
     const live = data.sessions.find(s => s.key === w.key);
     const hist = data.history[w.key] || {};
-    let statusHtml = '<div class="wc-status" style="color:var(--sub)">⏳ Waiting for next check...</div>';
+    let statusHtml = '<div class="wc-status" style="color:var(--sub)">AWAITING CHECK...</div>';
 
     if (live) {
-      const slots = live.slots ?? hist.slots;
+      const cond = surfCondition(live, hist);
       if (live.available) {
-        if (slots != null && slots <= 2) {
-          statusHtml = `<div class="wc-status" style="color:var(--orange)"><div class="dot dot-low"></div>⚡ Only ${slots} slot${slots===1?'':'s'} left!</div>`;
-        } else {
-          const slotStr = slots != null ? ` · ${slots} slots` : '';
-          statusHtml = `<div class="wc-status" style="color:var(--green)"><div class="dot dot-open"></div>Open${slotStr}</div>`;
-        }
+        statusHtml = `<div class="wc-status" style="color:${cond.color}">${cond.text}</div>`;
       } else {
-        statusHtml = '<div class="wc-status" style="color:var(--sub)"><div class="dot dot-full"></div>Full — watching for cancellations</div>';
+        statusHtml = '<div class="wc-status" style="color:#5d8aa8">PACKED — ON WATCH</div>';
       }
     }
 
-    return `<div class="wc">
+    return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
         <div>
           <div class="wc-title" style="color:${cfg.c}">${w.level}</div>
-          <div class="wc-meta">${w.dayLabel} · ${w.time} · Wave ${w.wave}</div>
+          <div class="wc-meta">${w.dayLabel} · ${w.time.toUpperCase()} · ${waveLabel(w.wave)}</div>
         </div>
-        <button class="rm-btn" onclick="removeWatch('${w.id}')">Remove</button>
+        <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>
       ${statusHtml}
     </div>`;
@@ -362,26 +780,24 @@ function renderSetup() {
   const topicEl = document.getElementById('ntfy-topic-box');
   const msgEl   = document.getElementById('ntfy-status-msg');
   if (data.ntfyOk) {
-    topicEl.textContent = 'Topic configured ✓ (see Railway → Variables → NTFY_TOPIC)';
-    topicEl.style.color = '#22c55e';
-    msgEl.textContent   = '✓ Notifications are active';
-    msgEl.style.color   = '#22c55e';
+    topicEl.textContent = 'Topic configured ✓ (Railway → Variables → NTFY_TOPIC)';
+    topicEl.style.color = '#00c9a7';
+    msgEl.textContent   = '✓ Notifications active';
+    msgEl.style.color   = '#00c9a7';
   } else {
     topicEl.textContent = 'NTFY_TOPIC not set in Railway Variables';
-    topicEl.style.color = '#f59e0b';
-    msgEl.textContent   = '⚠  Add NTFY_TOPIC in Railway → your project → Variables';
-    msgEl.style.color   = '#f59e0b';
+    topicEl.style.color = '#ff6b35';
+    msgEl.textContent   = '⚠  Add NTFY_TOPIC in Railway → Variables';
+    msgEl.style.color   = '#ff6b35';
   }
 
-  const cp = document.getElementById('carrier-pills');
-  cp.innerHTML = Object.keys(CARRIERS).map(name =>
-    `<button class="carrier${carrier===name?' on':''}" onclick="setCarrier('${name}')">${name}</button>`
+  document.getElementById('carrier-pills').innerHTML = Object.keys(CARRIERS).map(name =>
+    `<button class="carrier${carrier === name ? ' on' : ''}" onclick="setCarrier('${name}')">${name}</button>`
   ).join('');
 
   updateSms();
 }
 
-// ── Watch list management ─────────────────────────────────────────────────────
 async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
   const existing = data.watchList.find(w => w.key === s.key);
@@ -402,7 +818,6 @@ async function removeWatch(id) {
   await refresh();
 }
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
 function showTab(name, btn) {
   document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('on'));
@@ -410,7 +825,142 @@ function showTab(name, btn) {
   btn.classList.add('on');
 }
 
-function setDay(d) { activeDay = d; renderBrowse(); }
+function setWave(wave) {
+  activeWave = wave;
+  renderBrowse();
+}
+
+function toggleLessons() {
+  showLessons = !showLessons;
+  renderBrowse();
+}
+
+function initTimeSelects() {
+  const opts = '<option value="">All day</option>' +
+    HOUR_OPTIONS.map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+  document.getElementById('picker-from').innerHTML = opts;
+  document.getElementById('picker-to').innerHTML = opts;
+}
+
+function renderPickerWeek() {
+  const sessionDays = sessionDaysSet();
+  const days = getPickerDays();
+  const today = todayKey();
+  document.getElementById('picker-week').innerHTML = days.map(k => {
+    const d = new Date(k + 'T12:00:00');
+    const abbr = k === today ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short' });
+    const num = d.getDate();
+    const on = pickerDraft.dayKey === k;
+    const has = sessionDays.has(k);
+    return `<button type="button" class="week-day${on ? ' on' : ''}${has ? ' has-sessions' : ' no-sessions'}" data-pick-day="${k}"${has ? '' : ' disabled'}>
+      <div class="wd-abbr">${abbr}</div>
+      <div class="wd-num">${num}</div>
+      ${has ? '<div class="wd-dot" aria-hidden="true"></div>' : ''}
+    </button>`;
+  }).join('');
+}
+
+function scrollPickerToDay(dayKey) {
+  requestAnimationFrame(() => {
+    const row = document.getElementById('picker-week');
+    const btn = row.querySelector(`[data-pick-day="${CSS.escape(dayKey)}"]`);
+    if (!btn) return;
+    const target = btn.offsetLeft - row.clientWidth / 2 + btn.offsetWidth / 2;
+    row.scrollLeft = Math.max(0, target);
+  });
+}
+
+function openPicker() {
+  const sessionDays = sessionDaysSet();
+  let dayKey = activeDayKey;
+  if (!sessionDays.has(dayKey)) {
+    dayKey = getPickerDays().find(k => sessionDays.has(k)) || todayKey();
+  }
+  pickerDraft = { dayKey, fromH: filterFromH, toH: filterToH };
+  document.getElementById('picker-from').value = filterFromH ?? '';
+  document.getElementById('picker-to').value = filterToH ?? '';
+  renderPickerWeek();
+  scrollPickerToDay(dayKey);
+  document.getElementById('picker-backdrop').classList.add('open');
+  document.getElementById('picker-sheet').classList.add('open');
+  document.getElementById('picker-sheet').setAttribute('aria-hidden', 'false');
+  pickerOpen = true;
+}
+
+function closePicker() {
+  document.getElementById('picker-backdrop').classList.remove('open');
+  document.getElementById('picker-sheet').classList.remove('open');
+  document.getElementById('picker-sheet').setAttribute('aria-hidden', 'true');
+  pickerOpen = false;
+}
+
+function applyPicker() {
+  activeDayKey = pickerDraft.dayKey;
+  filterFromH = pickerDraft.fromH;
+  filterToH = pickerDraft.toH;
+  closePicker();
+  renderBrowse();
+}
+
+function toggleLevel(level) {
+  if (activeLevels.has(level)) activeLevels.delete(level);
+  else activeLevels.add(level);
+  renderBrowse();
+}
+
+function clearLevelFilters() {
+  activeLevels.clear();
+  renderBrowse();
+}
+
+document.getElementById('level-chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-level]');
+  if (!btn) return;
+  if (btn.dataset.level === '__all__') clearLevelFilters();
+  else toggleLevel(decodeURIComponent(btn.dataset.level));
+});
+
+document.getElementById('wave-chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-wave]');
+  if (!btn) return;
+  const v = btn.dataset.wave;
+  setWave(v === '' ? null : +v);
+});
+
+document.getElementById('lessons-toggle-row').addEventListener('click', (e) => {
+  if (e.target.closest('#lessons-toggle')) toggleLessons();
+});
+
+document.getElementById('cal-btn').addEventListener('click', openPicker);
+document.getElementById('picker-backdrop').addEventListener('click', closePicker);
+document.getElementById('picker-apply').addEventListener('click', applyPicker);
+
+document.getElementById('picker-week').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-pick-day]');
+  if (!btn || btn.disabled || btn.classList.contains('no-sessions')) return;
+  pickerDraft.dayKey = btn.dataset.pickDay;
+  renderPickerWeek();
+  scrollPickerToDay(pickerDraft.dayKey);
+});
+
+document.getElementById('picker-from').addEventListener('change', (e) => {
+  pickerDraft.fromH = e.target.value === '' ? null : +e.target.value;
+});
+document.getElementById('picker-to').addEventListener('change', (e) => {
+  pickerDraft.toH = e.target.value === '' ? null : +e.target.value;
+});
+
+(function initPickerSwipe() {
+  const sheet = document.getElementById('picker-sheet');
+  let startY = 0;
+  sheet.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; }, { passive: true });
+  sheet.addEventListener('touchend', (e) => {
+    const dy = e.changedTouches[0].clientY - startY;
+    if (dy > 60) closePicker();
+  }, { passive: true });
+})();
+
+initTimeSelects();
 
 function setCarrier(c) {
   carrier = c;
@@ -419,7 +969,7 @@ function setCarrier(c) {
 }
 
 function updateSms() {
-  const phone = (document.getElementById('phone-input').value || '').replace(/\D/g,'');
+  const phone = (document.getElementById('phone-input').value || '').replace(/\D/g, '');
   const el    = document.getElementById('sms-address');
   el.textContent = phone.length === 10 && carrier
     ? phone + CARRIERS[carrier]
@@ -428,12 +978,21 @@ function updateSms() {
 
 function copySms() {
   const addr = document.getElementById('sms-address').textContent;
-  if (addr.includes('@')) navigator.clipboard.writeText(addr).then(() => alert('Copied! Paste as SMS_ADDRESS in Railway → Variables'));
+  if (addr.includes('@')) {
+    navigator.clipboard.writeText(addr).then(() =>
+      alert('Copied! Paste as SMS_ADDRESS in Railway → Variables')
+    );
+  }
 }
 
-// ── Auto-refresh every 2 minutes ──────────────────────────────────────────────
 refresh();
 setInterval(refresh, 120_000);
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(err => {
+    console.warn('[sw] registration failed:', err);
+  });
+}
 </script>
 </body>
 </html>
