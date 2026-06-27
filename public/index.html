@@ -471,12 +471,17 @@ const LESSON_WAVES = [3, 4];
 const EXCLUDED_LEVELS = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES  = [5, 6];
 
+function asSessionArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function isSurfSession(s) {
   return !EXCLUDED_LEVELS.includes(s.level) && !EXCLUDED_WAVES.includes(s.wave);
 }
 
 function surfSessions(list) {
-  return (list || data.sessions).filter(isSurfSession);
+  const src = list != null ? list : data.sessions;
+  return asSessionArray(src).filter(isSurfSession);
 }
 
 function isLessonSession(s) {
@@ -628,7 +633,13 @@ async function refresh() {
   btn.classList.add('spinning');
   try {
     const res = await fetch('/api/status');
-    data = await res.json();
+    const payload = await res.json();
+    data = {
+      ...payload,
+      sessions: asSessionArray(payload.sessions),
+      watchList: asSessionArray(payload.watchList),
+      history: payload.history && typeof payload.history === 'object' ? payload.history : {},
+    };
     const withSlots = data.sessions.filter(s => s.slots != null).length;
     console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
     if (!activeDayKey) activeDayKey = todayKey();

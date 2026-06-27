@@ -47,6 +47,7 @@ let lastCheck     = null;
 let lastSuccessfulScrape = null;
 let lastScrapeAttempt  = null;
 let lastScrapeError    = null;
+let lastScrapeErrorStack = null;
 let scrapeInProgress   = false;
 let hasFreshScrapeThisBoot = false;
 let dataSource = 'memory';
@@ -119,6 +120,22 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
   }
 }
 
+function asSessionArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function stackPreview(stack, maxLines = 6) {
+  if (!stack) return null;
+  return stack.split('\n').slice(0, maxLines).join('\n');
+}
+
+function recordScrapeError(e, context = 'scrape') {
+  lastScrapeError = e?.message || String(e);
+  lastScrapeErrorStack = e?.stack || null;
+  console.error(`${context} failed:`, lastScrapeError);
+  if (lastScrapeErrorStack) console.error(lastScrapeErrorStack);
+}
+
 function getStatusFields() {
   const dataAgeMinutes = lastSuccessfulScrape
     ? Math.max(0, Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000))
@@ -132,6 +149,7 @@ function getStatusFields() {
     lastSuccessfulScrape,
     lastScrapeAttempt,
     lastScrapeError,
+    lastScrapeErrorStackPreview: stackPreview(lastScrapeErrorStack),
     dataAgeMinutes,
     scrapeInProgress,
   };
@@ -206,18 +224,10 @@ async function saveScrapeErrorToSupabase(errorMessage) {
         updated_at: now,
       }).eq('id', 'latest');
       if (error) throw error;
+      console.log('  Supabase: recorded scrape error');
     } else {
-      const { error } = await supabase.from('scrape_snapshots').upsert({
-        id: 'latest',
-        sessions: [],
-        scrape_meta: {},
-        last_scrape_attempt: now,
-        last_scrape_error: errorMessage,
-        updated_at: now,
-      }, { onConflict: 'id' });
-      if (error) throw error;
+      console.log('  Supabase: scrape error logged locally (no snapshot row to update yet)');
     }
-    console.log('  Supabase: recorded scrape error');
   } catch (e) {
     console.error('  Supabase error save failed:', e.message);
   }
@@ -610,24 +620,25 @@ async function scrapePaginatedWeeks(page, startWeek, endWeek) {
   for (let weekOffset = startWeek; weekOffset <= endWeek; weekOffset++) {
     const fp = await getCalendarFingerprint(page);
     const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
-    rawTilesTotal += result.rawCount;
-    duplicateSkipsTotal += result.duplicateSkips;
+    const pageSessions = asSessionArray(result?.sessions);
+    rawTilesTotal += result?.rawCount || 0;
+    duplicateSkipsTotal += result?.duplicateSkips || 0;
 
     let newKeys = 0;
-    for (const s of result.sessions) {
+    for (const s of pageSessions) {
       if (!allByKey.has(s.key)) {
         allByKey.set(s.key, s);
         newKeys++;
       }
     }
 
-    const dateRange = result.sessions.length
-      ? `${result.sessions.map(s => s.isoDate).sort()[0]} → ${result.sessions.map(s => s.isoDate).sort().slice(-1)[0]}`
+    const dateRange = pageSessions.length
+      ? `${pageSessions.map(s => s.isoDate).sort()[0]} → ${pageSessions.map(s => s.isoDate).sort().slice(-1)[0]}`
       : 'none';
 
     console.log(
       `  [week offset ${weekOffset}] label="${fp.label || 'n/a'}" ` +
-      `tiles=${result.rawCount} parsed=${result.sessions.length} new=${newKeys} ` +
+      `tiles=${result?.rawCount || 0} parsed=${pageSessions.length} new=${newKeys} ` +
       `cumulative=${allByKey.size} dates=${dateRange}`
     );
     weeksScraped++;
@@ -775,7 +786,7 @@ function syncSlotCacheAvailability(fresh) {
 
 function dedupeBatch(batch) {
   const byKey = new Map();
-  for (const s of batch) {
+  for (const s of asSessionArray(batch)) {
     if (!byKey.has(s.key)) byKey.set(s.key, { ...s });
     else byKey.get(s.key).available = s.available;
   }
@@ -826,12 +837,12 @@ function computeDateCoverage() {
 }
 
 function filterBatchForTier(batch, tier) {
-  return batch.filter(s => sessionInTier(s, tier));
+  return asSessionArray(batch).filter(s => sessionInTier(s, tier));
 }
 
 function rebuildSessionsArray() {
   const maxDay = effectiveWeeksAhead * 7;
-  sessions = [...sessionsByKey.values()]
+  sessions = asSessionArray([...sessionsByKey.values()])
     .filter(s => {
       const days = daysFromToday(s.dateKey);
       return days >= 0 && days < maxDay;
@@ -843,7 +854,7 @@ function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
   const now = new Date().toISOString();
   const updatedKeys = [];
 
-  for (const raw of batch) {
+  for (const raw of asSessionArray(batch)) {
     if (!sessionInTier(raw, tier)) continue;
     const existing = sessionsByKey.get(raw.key);
     const merged = {
@@ -887,7 +898,8 @@ async function detectAvailableWeeks(page) {
   const seenKeys = new Set();
 
   async function absorbWeek(weekOffset) {
-    const { sessions: batch } = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
+    const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
+    const batch = asSessionArray(result?.sessions);
     let added = 0;
     for (const s of batch) {
       if (!seenKeys.has(s.key)) { seenKeys.add(s.key); added++; }
@@ -966,7 +978,7 @@ async function runTierScrape(tier) {
       const { page } = launched;
       await openBookingPage(page);
 
-      const { batch: rawBatch, rawTilesTotal, weeksScraped } =
+      const { sessions: rawBatch, rawTilesTotal, weeksScraped } =
         await scrapePaginatedWeeks(page, startWeek, endWeek);
 
       const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
@@ -995,14 +1007,14 @@ async function runTierScrape(tier) {
       lastSuccessfulScrape = new Date().toISOString();
       lastCheck = lastSuccessfulScrape;
       lastScrapeError = null;
+      lastScrapeErrorStack = null;
       hasFreshScrapeThisBoot = true;
       dataSource = 'memory';
       await saveLatestSnapshotToSupabase();
 
     } catch (e) {
-      lastScrapeError = e.message;
-      console.error(`tier ${tier} scrape failed:`, e.message);
-      await saveScrapeErrorToSupabase(e.message);
+      recordScrapeError(e, `tier ${tier} scrape`);
+      await saveScrapeErrorToSupabase(lastScrapeError);
     } finally {
       scrapeInProgress = false;
       if (launched?.browser) await launched.browser.close();
@@ -1030,9 +1042,9 @@ async function detectWeeksOnStartup() {
 function statusPayload() {
   const dateCoverage = computeDateCoverage();
   return {
-    sessions,
-    watchList,
-    history,
+    sessions: asSessionArray(sessions),
+    watchList: asSessionArray(watchList),
+    history: history || {},
     lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
     ...dateCoverage,
@@ -1054,6 +1066,22 @@ app.get('/api/status', (_req, res) => {
 
 app.get('/api/sessions', (_req, res) => {
   res.json(statusPayload());
+});
+
+app.get('/api/debug/scrape', (_req, res) => {
+  res.json({
+    scrapeInProgress,
+    sessionsCount: sessions.length,
+    lastScrapeAttempt,
+    lastScrapeError,
+    lastScrapeErrorStackPreview: stackPreview(lastScrapeErrorStack),
+    lastSuccessfulScrape,
+    dataSource,
+    supabaseConfigured,
+    effectiveWeeksAhead,
+    lastTierRun: { ...lastTierRun },
+    lastWeeksScraped,
+  });
 });
 
 app.post('/api/watch', (req, res) => {
