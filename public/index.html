@@ -84,11 +84,21 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
   background:var(--accent);margin-left:4px;vertical-align:top;
   box-shadow:0 0 6px rgba(0,201,167,.55);
 }
-.ntfy-beta-hint{
-  font-size:12px;color:var(--accent);margin:0 0 10px;line-height:1.45;
-  padding:10px 12px;border-radius:8px;background:rgba(0,201,167,.08);
-  border:1px solid rgba(0,201,167,.25);
+/* ── Demo alerts (internal beta only) ── */
+.demo-intro{
+  font-size:13px;color:var(--sub);line-height:1.5;margin:0 0 12px;
 }
+.demo-subscribe{
+  font-size:12px;color:var(--accent);line-height:1.45;margin:0 0 14px;
+  padding:10px 12px;border-radius:8px;background:rgba(0,201,167,.08);
+  border:1px solid rgba(0,201,167,.22);
+}
+.demo-subscribe strong{font-family:var(--font-display);letter-spacing:.02em}
+.setup-block h3{font-family:var(--font-display);font-size:18px;margin:0 0 10px}
+.setup-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.bell-btn.bell-soon{opacity:.45;cursor:not-allowed}
+.bell-btn.bell-soon.on{opacity:.55}
+.nav-btn[hidden]{display:none}
 .wbadge{min-width:18px;height:18px;background:var(--accent);color:var(--bg);border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;font-family:var(--font-display)}
 
 /* ── Chips ── */
@@ -370,56 +380,17 @@ input.field:focus{border-color:var(--accent)}
     </div>
 
     <div class="pane" id="pane-setup">
-      <div class="setup-block">
-        <h3>Push Notifications</h3>
-        <p>Install the free <strong>Ntfy</strong> app, subscribe to your own private topic, then save it here.</p>
-        <p id="ntfy-beta-hint" class="ntfy-beta-hint" hidden></p>
-        <div class="lbl">Your ntfy topic</div>
-        <input class="field" type="text" id="ntfy-topic-input" placeholder="my-secret-ap-topic" autocomplete="off">
-        <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:8px 0 0"></p>
+      <div class="setup-block" id="demo-alerts-block">
+        <h3>Demo Alerts</h3>
+        <p class="demo-intro">Internal demo only. For now, alerts use ntfy so we can test the watchlist logic before building native push.</p>
+        <p class="demo-subscribe" id="ntfy-subscribe-hint">Subscribe to this exact topic in ntfy: <strong id="ntfy-default-topic">ap-surf-connor-2026</strong></p>
+        <div class="lbl">Topic</div>
+        <input class="field" type="text" id="ntfy-topic-input" placeholder="ap-surf-connor-2026" autocomplete="off">
         <div class="setup-actions">
-          <button type="button" class="btn btn-outline" onclick="saveNtfyTopic()">Save topic</button>
+          <button type="button" class="btn btn-outline" onclick="saveNtfyTopic()">Save</button>
           <button type="button" class="btn btn-outline" onclick="sendTestNotification()">Send test notification</button>
         </div>
-        <div class="step" style="margin-top:14px"><div class="step-n">1</div><p>Install Ntfy from the App Store or Google Play</p></div>
-        <div class="step"><div class="step-n">2</div><p>Open Ntfy → tap <strong>+</strong> → subscribe to your topic</p></div>
-        <div class="step"><div class="step-n">3</div><p>Save the same topic here, then tap 🔔 on sessions to watch</p></div>
-      </div>
-
-      <div class="divider"></div>
-
-      <div class="setup-block">
-        <h3>SMS Alerts</h3>
-        <p>Every US carrier has an email-to-SMS gateway. Add your number + carrier as a Railway env var called <code style="font-size:12px;background:var(--card-hover);padding:2px 6px;border-radius:4px;color:var(--accent)">SMS_ADDRESS</code>.</p>
-        <div class="lbl">Pick your carrier</div>
-        <div class="pill-row" id="carrier-pills"></div>
-        <div class="lbl">Your 10-digit number</div>
-        <input class="field" type="tel" id="phone-input" placeholder="7575551234" maxlength="10" oninput="updateSms()">
-        <div class="lbl">Set as SMS_ADDRESS in Railway</div>
-        <div class="mono-box" id="sms-address">Select carrier + enter number</div>
-        <button class="btn btn-outline" onclick="copySms()">Copy address</button>
-      </div>
-
-      <div class="divider"></div>
-
-      <div class="setup-block">
-        <h3>Data</h3>
-        <p id="tracking-meta" style="font-size:13px;color:var(--sub);margin:0">—</p>
-      </div>
-
-      <div class="divider"></div>
-
-      <div class="setup-block">
-        <h3>Watcher Settings</h3>
-        <p>Configure these in Railway → Variables.</p>
-        <div style="font-size:12px;color:var(--sub);line-height:2.2">
-          <code style="color:var(--accent)">NTFY_TOPIC</code> — optional server fallback for personal testing only<br>
-          <code style="color:var(--accent)">LOW_SLOTS_THRESHOLD</code> — alert when slots ≤ this (default: 2)<br>
-          <code style="color:var(--accent)">CHECK_EVERY_MINS</code> — check interval (default: 5)<br>
-          <code style="color:var(--accent)">MAX_SLOT_CHECKS</code> — slot counts per cycle (default: 50)<br>
-          <code style="color:var(--accent)">SCRAPE_WEEKS_AHEAD</code> — calendar lookahead in weeks (default: 4)<br>
-          <code style="color:var(--accent)">SMS_ADDRESS</code> — carrier SMS email address
-        </div>
+        <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
       </div>
     </div>
 
@@ -434,9 +405,9 @@ input.field:focus{border-color:var(--accent)}
       <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
       <span id="watch-badge">Lineup</span>
     </button>
-    <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup">
+    <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup" hidden>
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      Alerts<span class="nav-beta-dot" aria-hidden="true"></span>
+      <span id="nav-setup-label">Demo Alerts</span><span class="nav-beta-dot" aria-hidden="true"></span>
     </button>
   </nav>
 
@@ -564,10 +535,14 @@ function saveNtfyTopic() {
 }
 
 async function sendTestNotification() {
+  if (!alertsEnabled()) return;
   const topic = getNtfyTopic();
   const msgEl = document.getElementById('ntfy-topic-msg');
-  if (!topic && !data.internalBetaNotifications) {
-    alert('Enter and save your ntfy topic first.');
+  if (!topic) {
+    if (msgEl) {
+      msgEl.textContent = 'Enter the demo topic first.';
+      msgEl.style.color = '#ff6b35';
+    }
     return;
   }
   try {
@@ -599,17 +574,6 @@ const LEVELS = {
   'Expert Barrels':   { s:'EB',  c:'#ff4444', pri:false },
   'Pro Turns':        { s:'PT',  c:'#ffd166', pri:false },
   'Boogie Nitez':     { s:'BOG', c:'#f72585', pri:false },
-};
-
-const CARRIERS = {
-  'AT&T':        '@txt.att.net',
-  'Verizon':     '@vtext.com',
-  'T-Mobile':    '@tmomail.net',
-  'Sprint':      '@messaging.sprintpcs.com',
-  'Cricket':     '@mms.cricketwireless.net',
-  'Metro PCS':   '@mymetropcs.com',
-  'Boost':       '@sms.myboostmobile.com',
-  'US Cellular': '@email.uscc.net',
 };
 
 const WAVE_NAMES = {
@@ -845,7 +809,6 @@ let showLessons   = false;
 let filterFromH   = null;
 let filterToH     = null;
 let activeLevels  = new Set();
-let carrier       = localStorage.getItem('carrier') || '';
 let pickerDraft   = { dayKey: todayKey(), fromH: null, toH: null };
 let pickerOpen    = false;
 let refreshPollTimer = null;
@@ -893,14 +856,40 @@ function renderAll() {
 
 function applyInternalBetaNav() {
   const nav = document.getElementById('nav-setup');
+  const pane = document.getElementById('pane-setup');
+  const demoBlock = document.getElementById('demo-alerts-block');
   if (!nav) return;
-  nav.classList.toggle('nav-beta', !!data.internalBetaNotifications);
+
+  const beta = !!data.internalBetaNotifications;
+  nav.hidden = !beta;
+  nav.classList.toggle('nav-beta', beta);
+  if (pane) pane.hidden = !beta;
+  if (demoBlock) demoBlock.hidden = !beta;
+
+  if (!beta && pane?.classList.contains('active')) {
+    showTab('browse', document.getElementById('nav-browse'));
+  }
+}
+
+function alertsEnabled() {
+  return !!data.internalBetaNotifications;
+}
+
+function onBellClick(sJson) {
+  const s = JSON.parse(decodeURIComponent(sJson));
+  const existing = localWatchlist.some(w => (w.session_key || w.key) === s.key);
+  if (!alertsEnabled()) {
+    if (existing) return toggleWatch(sJson);
+    alert('Alerts coming soon.');
+    return;
+  }
+  return toggleWatch(sJson);
 }
 
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
-  dot.className = (getNtfyTopic() || data.ntfyFallbackConfigured) ? 'ok' : '';
+  dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
 
   const {
     scrapeInProgress,
@@ -1024,9 +1013,10 @@ function sessionCardHtml(s) {
     </div>
     <div class="sc-right">
       <div class="cond-badge" style="color:${cond.color}">${cond.text}</div>
-      <button class="bell-btn${watched ? ' on' : ''}"
-        onclick="toggleWatch('${sJson}')"
-        aria-label="${watched ? 'Stop watching' : 'Watch'} this session">
+      <button class="bell-btn${watched ? ' on' : ''}${alertsEnabled() ? '' : ' bell-soon'}"
+        onclick="onBellClick('${sJson}')"
+        aria-label="${alertsEnabled() ? (watched ? 'Stop watching' : 'Watch') + ' this session' : 'Alerts coming soon'}"
+        title="${alertsEnabled() ? '' : 'Alerts coming soon'}">
         <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
       </button>
     </div>
@@ -1041,7 +1031,9 @@ function renderWatching() {
   wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Lineup';
 
   if (!n) {
-    el.innerHTML = '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Get ntfy alerts when spots open or slots run low.</div>';
+    el.innerHTML = alertsEnabled()
+      ? '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Demo ntfy alerts fire when spots open or slots run low.</div>'
+      : '<div class="empty">Push alerts coming soon.<br>Browse sessions to see live availability.</div>';
     return;
   }
 
@@ -1082,16 +1074,15 @@ function renderWatching() {
 function renderSetup() {
   const input = document.getElementById('ntfy-topic-input');
   const msgEl = document.getElementById('ntfy-topic-msg');
-  const betaHint = document.getElementById('ntfy-beta-hint');
+  const subscribeHint = document.getElementById('ntfy-subscribe-hint');
+  const defaultTopicEl = document.getElementById('ntfy-default-topic');
   const defaultTopic = data.internalDefaultNtfyTopic || 'ap-surf-connor-2026';
 
-  if (betaHint) {
-    if (data.internalBetaNotifications) {
-      betaHint.hidden = false;
-      betaHint.textContent = `In the ntfy app, subscribe to this exact topic: ${defaultTopic}`;
-    } else {
-      betaHint.hidden = true;
-    }
+  if (!alertsEnabled()) return;
+
+  if (defaultTopicEl) defaultTopicEl.textContent = defaultTopic;
+  if (subscribeHint) {
+    subscribeHint.innerHTML = `Subscribe to this exact topic in ntfy: <strong id="ntfy-default-topic">${defaultTopic}</strong>`;
   }
 
   if (input && document.activeElement !== input) {
@@ -1099,40 +1090,22 @@ function renderSetup() {
   }
   if (msgEl) {
     if (hasSavedNtfyTopic()) {
-      msgEl.textContent = 'Topic saved on this device. Subscribe to the same topic in ntfy.';
+      msgEl.textContent = 'Topic saved on this device.';
       msgEl.style.color = '#00c9a7';
-    } else if (data.internalBetaNotifications && getNtfyTopic()) {
-      msgEl.textContent = 'Using internal beta default — tap Save topic to persist a custom value.';
-      msgEl.style.color = 'var(--sub)';
     } else if (getNtfyTopic()) {
-      msgEl.textContent = 'Topic ready — tap Save topic to persist on this device.';
+      msgEl.textContent = 'Using demo default — tap Save to persist a custom topic.';
       msgEl.style.color = 'var(--sub)';
     } else {
-      msgEl.textContent = 'Enter your private ntfy topic and tap Save.';
+      msgEl.textContent = 'Enter the demo topic and tap Save.';
       msgEl.style.color = 'var(--sub)';
     }
   }
-
-  const total = data.totalSessionsTracked ?? data.sessionsCount ?? data.sessions?.length ?? 0;
-  const dates = data.uniqueDatesCount ?? 0;
-  const trackingEl = document.getElementById('tracking-meta');
-  if (trackingEl) {
-    trackingEl.textContent = total
-      ? `Tracking ${total} sessions across ${dates} date${dates === 1 ? '' : 's'}`
-      : 'Waiting for first scrape…';
-  }
-
-  document.getElementById('carrier-pills').innerHTML = Object.keys(CARRIERS).map(name =>
-    `<button class="carrier${carrier === name ? ' on' : ''}" onclick="setCarrier('${name}')">${name}</button>`
-  ).join('');
-
-  updateSms();
 }
 
 async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
   const userKey = getUserKey();
-  const topic = getNtfyTopic();
+  const topic = alertsEnabled() ? getNtfyTopic() : null;
   const existing = localWatchlist.find(w => (w.session_key || w.key) === s.key);
 
   if (existing) {
@@ -1321,29 +1294,6 @@ document.getElementById('picker-to').addEventListener('change', (e) => {
 })();
 
 initTimeSelects();
-
-function setCarrier(c) {
-  carrier = c;
-  localStorage.setItem('carrier', c);
-  renderSetup();
-}
-
-function updateSms() {
-  const phone = (document.getElementById('phone-input').value || '').replace(/\D/g, '');
-  const el    = document.getElementById('sms-address');
-  el.textContent = phone.length === 10 && carrier
-    ? phone + CARRIERS[carrier]
-    : 'Select carrier + enter number';
-}
-
-function copySms() {
-  const addr = document.getElementById('sms-address').textContent;
-  if (addr.includes('@')) {
-    navigator.clipboard.writeText(addr).then(() =>
-      alert('Copied! Paste as SMS_ADDRESS in Railway → Variables')
-    );
-  }
-}
 
 getUserKey();
 refresh().then(() => syncWatchlistToServer());

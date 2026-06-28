@@ -14,6 +14,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';
 const INTERNAL_BETA = process.env.INTERNAL_BETA_NOTIFICATIONS === 'true';
+// ntfy is internal demo infrastructure only — public MVP should use native push, web push, SMS, or email after login.
 const INTERNAL_DEFAULT_NTFY_TOPIC = 'ap-surf-connor-2026';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';

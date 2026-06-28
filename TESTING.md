@@ -68,9 +68,11 @@ curl -s -X POST http://localhost:3000/api/notify/test -H 'Content-Type: applicat
 
 ---
 
-## Internal founder testing (notifications)
+## Internal founder demo (ntfy only)
 
-### Enable internal beta notifications
+ntfy is **not** the public onboarding flow. It is temporary demo infrastructure for testing watchlist alert logic before native push / web push / SMS / email after login.
+
+### Enable demo alerts
 
 Set in Railway (or `.env` locally):
 
@@ -81,20 +83,26 @@ NTFY_TOPIC=ap-surf-connor-2026   # optional server fallback
 
 When enabled:
 
-- The **Alerts** tab is highlighted in the bottom nav.
+- The **Demo Alerts** nav tab appears (hidden for normal users).
+- Copy explains this is internal demo only.
 - The ntfy topic field prefills with `ap-surf-connor-2026` until you save a different topic in localStorage.
-- Helper text reminds you to subscribe to that exact topic in the ntfy app.
+- Subscribe to that exact topic in the ntfy app.
+
+When **not** enabled:
+
+- The Demo Alerts tab and ntfy setup UI are hidden.
+- Bell buttons show “Alerts coming soon” and do not add watches.
 
 ### Quick test checklist
 
 1. Install [ntfy](https://ntfy.sh) and subscribe to `ap-surf-connor-2026`.
-2. Open the app → **Alerts** tab → confirm the topic is prefilled.
+2. Open the app → **Demo Alerts** tab → confirm the topic is prefilled.
 3. Tap **Send test notification** — you should receive “AP Session Alert”.
 4. Browse a session → tap 🔔 → confirm it appears on **Lineup**.
 5. Wait for a scrape cycle and verify alerts on open/low-slot/selling-fast changes.
 
 ### Notes
 
-- Each user’s topic is stored in **localStorage** on the device; watches sync to Supabase with `user_key`.
+- Demo user topics are stored in **localStorage** on the device; watches sync to Supabase with `user_key`.
 - `NTFY_TOPIC` is only used as a **server fallback** when `INTERNAL_BETA_NOTIFICATIONS=true` and a watch has no topic saved.
 - Do not expose `SUPABASE_SERVICE_ROLE_KEY` in the frontend — it stays server-side only.

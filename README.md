@@ -47,7 +47,7 @@ On startup the server loads saved sessions from `current_sessions` before accept
 | `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase service role key (server only) |
 | `CHECK_EVERY_MINS` | `5` | Tier 1 scrape interval |
 | `HISTORY_SNAPSHOTS` | `true` | Set `false` to disable `availability_snapshots` inserts |
-| `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder testing (prefills topic, highlights Alerts tab) |
+| `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder demo only — shows **Demo Alerts** tab and enables ntfy testing |
 | `NTFY_TOPIC` | — | Optional server fallback when internal beta is on |
 | `LOW_SLOTS_THRESHOLD` | `2` | Notify when watched sessions drop to this many slots or fewer |
 | `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead |
@@ -85,9 +85,12 @@ Check collector health via `/api/status`:
 
 ## Push notifications
 
-1. Install the [ntfy app](https://ntfy.sh) on your phone.
-2. Open the app → **Alerts** tab → enter your private topic → **Save topic**.
-3. Subscribe to the same topic in the ntfy app.
-4. Tap 🔔 on sessions to watch; alerts go to **your** topic (not a shared global topic).
+**ntfy is internal demo infrastructure only.** It lets founders test watchlist alert logic before a real public notification channel exists. Do not expose ntfy setup to normal users.
 
-For internal testing, set `INTERNAL_BETA_NOTIFICATIONS=true` — the default topic `ap-surf-connor-2026` is prefilled until you save your own.
+For founder/demo testing (`INTERNAL_BETA_NOTIFICATIONS=true`):
+
+1. Install the [ntfy app](https://ntfy.sh) and subscribe to `ap-surf-connor-2026`.
+2. Open the app → **Demo Alerts** tab → confirm the topic is prefilled → **Save**.
+3. Tap 🔔 on sessions to watch; demo alerts go to that shared topic.
+
+**Future public MVP** should use native push, web push, SMS, or email after login — not ntfy topic configuration in the UI.
