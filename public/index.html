@@ -1333,6 +1333,7 @@ function formatDetailStatusLine(s) {
   if (status === 'checking') return 'details pending';
   if (isDetailFailedStatus(status)) return 'details unavailable';
   if (status === 'checked_no_slots_visible') return 'details unavailable';
+  if (status === 'checked_open_no_slots_visible') return 'details unavailable';
   if (status === 'pending' || !status) return 'details pending';
   return 'details pending';
 }
@@ -1744,7 +1745,7 @@ function freshnessLabel(s) {
 
   if (basicAt) {
     const rel = formatRelativeTime(basicAt);
-    if (detailStatus === 'checked_no_slots_visible') {
+    if (detailStatus === 'checked_no_slots_visible' || detailStatus === 'checked_open_no_slots_visible') {
       return rel ? `schedule updated ${rel} · details unavailable` : 'details unavailable';
     }
     if (detailStatus === 'checking' || detailStatus === 'pending' || !detailStatus) {

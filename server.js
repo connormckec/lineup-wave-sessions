@@ -1189,23 +1189,29 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
   const withSlots = list.filter(s => s.slots != null);
   const withCapacity = list.filter(s => s.capacity != null);
   const withBooked = list.filter(s => s.estimatedBooked != null);
-  const failedDetails = list.filter(s => isDetailFailureStatus(s.detailStatus || s.detail_status));
-  const checkedNoSlotsVisible = list.filter(s => {
-    const st = s.detailStatus || s.detail_status;
-    return st === 'checked_no_slots_visible' && s.available && s.slots == null;
+  const failedDetails = list.filter(s => {
+    const st = effectiveDetailStatus(s);
+    return isDetailFailureStatus(st);
+  });
+  const unknownDetails = list.filter(s => isDetailUnknownStatus(s.detailStatus || s.detail_status)
+    && !isDetailFailureStatus(effectiveDetailStatus(s)));
+  const checkedOpenNoSlots = list.filter(s => {
+    const st = effectiveDetailStatus(s);
+    return st === 'checked_open_no_slots_visible' && s.available && s.slots == null;
   });
   const unavailable = available.filter(s => {
-    const status = s.detailStatus || s.detail_status;
+    const status = effectiveDetailStatus(s);
     return !sessionHasDetailedData(s) && (isDetailFailureStatus(status) || s.detailError || s.detail_error);
   });
   const pending = available.filter(s => {
-    const st = s.detailStatus || s.detail_status;
-    return !sessionHasDetailedData(s) && !isDetailFailureStatus(st) && st !== 'checked_no_slots_visible';
+    const st = effectiveDetailStatus(s);
+    return !sessionHasDetailedData(s) && !isDetailFailureStatus(st)
+      && st !== 'checked_open_no_slots_visible' && st !== 'unknown';
   });
   const checkTimes = dateCheckTimestamps(list);
   const detailStatusSummary = {};
   for (const s of list) {
-    const st = s.detailStatus || s.detail_status || 'unknown';
+    const st = effectiveDetailStatus(s);
     detailStatusSummary[st] = (detailStatusSummary[st] || 0) + 1;
   }
 
@@ -1224,36 +1230,19 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     ? Math.round((Date.now() - new Date(lastTierRun[1]).getTime()) / 60_000)
     : null;
 
-  const failedDetailsSample = failedDetails.slice(0, 12).map(s => ({
-    session_key: s.key,
-    iso_date: s.isoDate || s.dateKey,
-    start_time: s.time,
-    session_type: s.level,
-    wave_side: s.waveSide,
-    detail_error: s.detailError || s.detail_error,
-    raw_tile_text: s.detailRawTileText || s.raw?.tileText || s.tileText || null,
-    last_detailed_check_at: s.lastDetailedCheckAt || s.last_detailed_check_at,
-  }));
+  const failedDetailsSample = failedDetails.slice(0, 12).map(sessionDetailDiagnosticsFields);
+  const unknownDetailsSample = unknownDetails.slice(0, 12).map(sessionDetailDiagnosticsFields);
 
   const checkedButNoSlotsSample = [
-    ...checkedNoSlotsVisible,
+    ...checkedOpenNoSlots,
     ...available.filter(s => {
-      const st = s.detailStatus || s.detail_status;
-      return (st === 'checked' || st === 'checked_no_slots_visible') && s.slots == null && s.capacity == null;
+      const st = effectiveDetailStatus(s);
+      return (st === 'checked' || st === 'checked_open_no_slots_visible') && s.slots == null && s.capacity == null;
     }),
   ]
     .filter((s, i, arr) => arr.findIndex(x => x.key === s.key) === i)
     .slice(0, 12)
-    .map(s => ({
-      session_key: s.key,
-      session_type: s.level,
-      wave_side: s.waveSide,
-      availability: s.available ? 'OPEN' : 'PACKED',
-      raw_detail_text: s.detailRawText || s.raw?.detailRawText || null,
-      raw_modal_or_tile_text: s.detailRawText || s.detailRawTileText || s.raw?.tileText || s.tileText || null,
-      reason_slots_not_parsed: s.detailParseReason || s.detailError || s.detail_error
-        || (s.detailStatus === 'checked_no_slots_visible' ? 'open_without_visible_slot_count' : 'no_slot_count_in_detail'),
-    }));
+    .map(sessionDetailDiagnosticsFields);
 
   return {
     sessionsCount: list.length,
@@ -1263,7 +1252,9 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     sessionsWithDetailsUnavailableCount: unavailable.length,
     sessionsDetailsPendingCount: pending.length,
     failedDetailsCount: failedDetails.length,
+    unknownDetailsCount: unknownDetails.length,
     failedDetailsSample,
+    unknownDetailsSample,
     checkedButNoSlotsCount: checkedButNoSlotsSample.length,
     checkedButNoSlotsSample,
     lastBasicCheckAt: checkTimes.lastBasicCheckAt,
@@ -1370,39 +1361,53 @@ async function buildSessionDebugPayload(sessionKey) {
     recentSnapshots = snaps || [];
   }
 
-  const detailStatus = row.detailStatus || row.detail_status;
-  const parseResult = {
-    detailStatus,
-    detailError: row.detailError || row.detail_error,
-    parseReason: row.detailParseReason || row.raw?.detailParseReason || null,
-    slots: row.slots,
-    capacity: row.capacity,
-    estimatedBooked: row.estimatedBooked,
-    fillRate: row.fillRate,
-    priceText: row.priceText,
-    available: row.available,
-  };
+  const detailStatus = effectiveDetailStatus(row);
+  const parseSource = row.detailRawText || row.raw?.detailRawText || row.detailRawTileText || row.raw?.tileText || row.tileText || '';
+  const parserOutput = row.detailParseOutput || row.raw?.detailParseOutput || buildParserOutputFromText(parseSource);
 
-  const recentDetailErrors = isDetailFailureStatus(detailStatus)
-    ? [{
-      at: row.lastDetailedCheckAt || row.last_detailed_check_at,
+  const recentDetailAttempts = [];
+  const attemptAt = row.lastDetailedCheckAt || row.last_detailed_check_at;
+  if (attemptAt) {
+    recentDetailAttempts.push({
+      at: attemptAt,
       detail_status: detailStatus,
       detail_error: row.detailError || row.detail_error,
-    }]
-    : [];
+      failed_selector: row.detailFailedSelector || row.raw?.detailFailedSelector || null,
+    });
+  }
+  if (isDetailFailureStatus(detailStatus) || detailStatus === 'unknown') {
+    recentDetailAttempts.push(...recentDetailAttempts);
+  }
 
   return {
     sessionKey,
     found: true,
     currentSession: row,
     recentAvailabilitySnapshots: recentSnapshots,
-    recentDetailErrors,
+    recentDetailErrors: isDetailFailureStatus(detailStatus)
+      ? recentDetailAttempts
+      : [],
+    recentDetailAttempts,
     latestDetailAttempt: {
       rawText: truncateDetailText(row.detailRawText || row.raw?.detailRawText || null, 1500),
       rawTileText: truncateDetailText(row.detailRawTileText || row.raw?.tileText || row.tileText || null, 800),
-      capturedAt: row.lastDetailedCheckAt || row.last_detailed_check_at,
+      capturedAt: attemptAt,
+      failedSelector: row.detailFailedSelector || row.raw?.detailFailedSelector || null,
     },
-    parseResult,
+    parserOutput,
+    parseResult: {
+      detailStatus,
+      detailError: row.detailError || row.detail_error,
+      parseReason: row.detailParseReason || row.raw?.detailParseReason || parserOutput.parse_reason,
+      slots: row.slots,
+      capacity: row.capacity,
+      estimatedBooked: row.estimatedBooked,
+      fillRate: row.fillRate,
+      priceText: row.priceText,
+      available: row.available,
+      ...parserOutput,
+    },
+    reasonForDetailStatus: reasonForDetailStatus(row),
   };
 }
 
@@ -1483,6 +1488,8 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       detailRawText: s.detailRawText ?? null,
       detailRawTileText: s.detailRawTileText ?? null,
       detailParseReason: s.detailParseReason ?? null,
+      detailParseOutput: s.detailParseOutput ?? null,
+      detailFailedSelector: s.detailFailedSelector ?? null,
       tileText: s.tileText ?? s.detailRawTileText ?? null,
     },
     last_seen_at: now,
@@ -1951,9 +1958,15 @@ function parseDetailAvailabilityFromText(text) {
   const low = t.toLowerCase();
 
   if (/\bsold\s*out\b/i.test(t) || /\bpacked\b/i.test(low)
+    || /\bunavailable\b/i.test(low)
     || /\bno\s+spots?\s+(left|available|remaining)\b/i.test(t)
     || /\bfull(?:y)?\s+booked\b/i.test(t)) {
     return { packed: true, slots: 0, parseReason: 'text_packed_or_sold_out' };
+  }
+
+  const onlyLeft = t.match(/\bonly\s+(\d+)\s+left\b/i);
+  if (onlyLeft) {
+    return { slots: parseInt(onlyLeft[1], 10), parseReason: 'text_only_n_left' };
   }
 
   const spotsLeft = t.match(/(\d+)\s+spots?\s+left\b/i);
@@ -1964,6 +1977,10 @@ function parseDetailAvailabilityFromText(text) {
   const spotLeft = t.match(/(\d+)\s+spot\s+left\b/i);
   if (spotLeft) {
     return { slots: parseInt(spotLeft[1], 10), parseReason: 'text_spot_left' };
+  }
+
+  if (/\bspots?\s+left\b/i.test(t) && !/\d+\s+spots?\s+left/i.test(t)) {
+    return { openNoCount: true, parseReason: 'text_spots_left_no_number' };
   }
 
   const nLeft = t.match(/\b(\d+)\s+left\b/i);
@@ -2023,10 +2040,11 @@ function inferDetailStatusFromPayload(details) {
   if (!details) return 'failed_parse';
   if (details.detailStatus) return details.detailStatus;
   if (details.failureType) return details.failureType;
-  if (details.packed || details.slots === 0) return 'checked_packed_no_slots';
-  if (details.openNoCount) return 'checked_no_slots_visible';
+  if (details.packed || details.slots === 0) return 'checked_packed';
+  if (details.openNoCount) return 'checked_open_no_slots_visible';
   if (details.slots != null || details.capacity != null || details.price_text) return 'checked_with_slots';
-  return 'failed_parse';
+  if (details.rawModalText && String(details.rawModalText).trim().length > 8) return 'failed_parse';
+  return 'unknown';
 }
 
 function preservePriorDetailFields(entry, prior) {
@@ -2208,8 +2226,17 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
   if (details.rawModalText) entry.detailRawText = truncateDetailText(details.rawModalText);
   if (details.rawTileText) entry.detailRawTileText = truncateDetailText(details.rawTileText);
   if (details.parseReason) entry.detailParseReason = details.parseReason;
+  if (details.failedSelector) entry.detailFailedSelector = details.failedSelector;
+  entry.detailParseOutput = buildParserOutputFromText(details.rawModalText || details.rawTileText || '');
 
   entry.lastDetailedCheckAt = now;
+
+  if (status === 'unknown') {
+    entry.detailStatus = 'unknown';
+    entry.detailError = details.detailError || details.parseReason || 'insufficient_detail_signal';
+    preservePriorDetailFields(entry, priorSnapshot);
+    return { ok: false, category: 'unknown', status };
+  }
 
   if (isDetailFailureStatus(status)) {
     entry.detailStatus = status;
@@ -2218,7 +2245,7 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
     return { ok: false, category: 'failed', status };
   }
 
-  if (details.available === false || status === 'checked_packed_no_slots' || details.packed || details.slots === 0) {
+  if (details.available === false || status === 'checked_packed' || details.packed || details.slots === 0) {
     entry.available = false;
     entry.slots = 0;
     if (details.capacity != null) entry.capacity = details.capacity;
@@ -2234,15 +2261,15 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
       entry.priceMax = details.price_max ?? entry.priceMax;
       entry.currency = details.currency || entry.currency || 'USD';
     }
-    entry.detailStatus = 'checked_packed_no_slots';
+    entry.detailStatus = 'checked_packed';
     entry.detailError = null;
     return { ok: true, category: 'packed' };
   }
 
-  if (status === 'checked_no_slots_visible' || details.openNoCount) {
+  if (status === 'checked_open_no_slots_visible' || details.openNoCount) {
     entry.available = true;
     if (priorSnapshot.slots == null) entry.slots = null;
-    entry.detailStatus = 'checked_no_slots_visible';
+    entry.detailStatus = 'checked_open_no_slots_visible';
     entry.detailError = details.parseReason || null;
     if (details.price_text || details.price_min != null) {
       entry.priceText = details.price_text ?? entry.priceText;
@@ -2250,7 +2277,7 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
       entry.priceMax = details.price_max ?? entry.priceMax;
       entry.currency = details.currency || entry.currency || 'USD';
     }
-    return { ok: true, category: 'no_slots_visible' };
+    return { ok: true, category: 'open_no_slots_visible' };
   }
 
   if (details.slots != null) entry.slots = details.slots;
@@ -2263,11 +2290,11 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
   }
   entry.detailStatus = entry.slots != null || entry.capacity != null
     ? 'checked_with_slots'
-    : 'checked_no_slots_visible';
+    : 'checked_open_no_slots_visible';
   entry.detailError = entry.detailWarning || null;
   return {
     ok: sessionHasDetailedData(entry),
-    category: entry.slots != null ? 'with_slots' : 'no_slots_visible',
+    category: entry.slots != null ? 'with_slots' : 'open_no_slots_visible',
   };
 }
 
@@ -2281,17 +2308,50 @@ function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
   entry.detailError = failure?.detailError || status;
   if (failure?.rawModalText) entry.detailRawText = truncateDetailText(failure.rawModalText);
   if (failure?.rawTileText) entry.detailRawTileText = truncateDetailText(failure.rawTileText);
+  if (failure?.failedSelector) entry.detailFailedSelector = failure.failedSelector;
   preservePriorDetailFields(entry, priorSnapshot);
-  return { ok: false, category: 'failed', status };
+  return { ok: false, category: 'failed', status: normalizeDetailStatus(status) || status };
+}
+
+function incrementDetailFailureStats(stats, status) {
+  const st = normalizeDetailStatus(status) || status;
+  if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
+  else if (st === 'failed_selector') stats.sessionsFailedSelector = (stats.sessionsFailedSelector || 0) + 1;
+  else if (st === 'failed_timeout') stats.sessionsTimedOut = (stats.sessionsTimedOut || 0) + 1;
+  else stats.sessionsFailed = (stats.sessionsFailed || 0) + 1;
+}
+
+function sessionQualifiesForFailedFirstEnrich(s) {
+  const st = effectiveDetailStatus(s);
+  if (['failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout', 'unknown'].includes(st)) return true;
+  if (s.available !== false && !sessionHasDetailedData(s)) return true;
+  return false;
+}
+
+function sortSessionsForFailedFirstEnrich(sessions) {
+  const score = (s) => {
+    const st = effectiveDetailStatus(s);
+    if (st === 'failed_selector') return 0;
+    if (st === 'failed_parse') return 1;
+    if (st === 'failed_timeout' || st === 'failed_modal_open') return 2;
+    if (st === 'unknown') return 3;
+    if (!sessionHasDetailedData(s)) return 4;
+    return 5;
+  };
+  return [...asSessionArray(sessions)].sort((a, b) => {
+    const diff = score(a) - score(b);
+    if (diff) return diff;
+    return (a.ts || 0) - (b.ts || 0);
+  });
 }
 
 function sortSessionsForDetailRetry(sessions) {
   const score = (s) => {
-    const st = s.detailStatus || s.detail_status;
+    const st = effectiveDetailStatus(s);
     if (isDetailFailureStatus(st)) return 0;
     if (s.available !== false && !sessionHasDetailedData(s)) return 1;
-    if (st === 'pending' || !st) return 2;
-    if (st === 'checked_no_slots_visible') return 3;
+    if (st === 'pending' || st === 'unknown') return 2;
+    if (st === 'checked_open_no_slots_visible') return 3;
     return 4;
   };
   return [...asSessionArray(sessions)].sort((a, b) => {
@@ -2301,25 +2361,96 @@ function sortSessionsForDetailRetry(sessions) {
   });
 }
 
+function normalizeDetailStatus(status) {
+  if (!status) return null;
+  if (status === 'checked_packed_no_slots') return 'checked_packed';
+  if (status === 'checked_no_slots_visible') return 'checked_open_no_slots_visible';
+  return status;
+}
+
+function effectiveDetailStatus(s) {
+  const raw = normalizeDetailStatus(s?.detailStatus || s?.detail_status);
+  if (raw) return raw;
+  if (!s?.lastDetailedCheckAt && !s?.last_detailed_check_at) return 'unknown';
+  return 'unknown';
+}
+
+function isDetailUnknownStatus(status) {
+  const st = normalizeDetailStatus(status);
+  return !st || st === 'unknown';
+}
+
+function reasonForDetailStatus(s) {
+  const st = effectiveDetailStatus(s);
+  const err = s?.detailError || s?.detail_error;
+  switch (st) {
+    case 'unknown':
+      return (s?.lastDetailedCheckAt || s?.last_detailed_check_at)
+        ? 'detail_check_ran_but_status_not_recorded'
+        : 'no_detail_check_yet';
+    case 'checked_with_slots':
+      return 'parsed_slots_available';
+    case 'checked_packed':
+      return 'parsed_sold_out_or_packed';
+    case 'checked_open_no_slots_visible':
+      return err || 'modal_open_session_open_no_slot_count';
+    case 'failed_selector':
+      return err || 'booking_tile_or_modal_selector_missing';
+    case 'failed_modal_open':
+      return err || 'tile_clicked_modal_never_appeared';
+    case 'failed_parse':
+      return err || 'modal_text_present_but_unparsed';
+    case 'failed_timeout':
+      return err || 'playwright_timeout';
+    case 'checking':
+      return 'detail_check_in_progress';
+    case 'pending':
+      return 'detail_check_pending';
+    default:
+      return err || st || 'unknown';
+  }
+}
+
+function buildParserOutputFromText(text) {
+  const parsed = parseDetailAvailabilityFromText(text);
+  const price = parsePriceFromText(text || '');
+  let parsedAvailability = null;
+  if (parsed?.packed) parsedAvailability = false;
+  else if (parsed?.openNoCount) parsedAvailability = true;
+  else if (parsed?.slots != null) parsedAvailability = true;
+  return {
+    parsed_availability: parsedAvailability,
+    parsed_slots_available: parsed?.slots ?? null,
+    parsed_capacity: parsed?.capacity ?? parseCapacityFromDetailText(text),
+    parsed_price_text: price.price_text ?? null,
+    parse_reason: parsed?.parseReason ?? null,
+  };
+}
+
 function sessionDetailDiagnosticsFields(s) {
-  const raw = s.detailRawText || s.detailRawTileText
-    || s.raw?.detailRawText || s.raw?.detailRawTileText
-    || s.raw?.tileText || s.tileText || null;
+  const rawModal = s.detailRawText || s.raw?.detailRawText || null;
+  const rawTile = s.detailRawTileText || s.raw?.tileText || s.tileText || null;
+  const parseSource = rawModal || rawTile || '';
+  const parserOutput = buildParserOutputFromText(parseSource);
+  const st = effectiveDetailStatus(s);
   return {
     session_key: s.key,
     iso_date: s.isoDate || s.dateKey,
     start_time: s.time,
     session_type: s.level,
     wave_side: s.waveSide,
-    detail_status: s.detailStatus || s.detail_status,
+    detail_status: st,
     detail_error: s.detailError || s.detail_error,
-    raw_tile_text: s.detailRawTileText || s.raw?.tileText || s.tileText || null,
-    raw_detail_text: s.detailRawText || s.raw?.detailRawText || null,
+    raw_tile_text: rawTile ? truncateDetailText(rawTile, 800) : null,
+    raw_modal_or_detail_text: rawModal ? truncateDetailText(rawModal, 1500) : null,
+    parsed_availability: parserOutput.parsed_availability ?? s.available,
+    parsed_slots_available: parserOutput.parsed_slots_available ?? s.slots,
+    parsed_capacity: parserOutput.parsed_capacity ?? s.capacity,
+    parsed_price_text: parserOutput.parsed_price_text ?? s.priceText ?? null,
+    parse_reason: s.detailParseReason || s.raw?.detailParseReason || parserOutput.parse_reason,
+    failed_selector: s.detailFailedSelector || s.raw?.detailFailedSelector || null,
     last_detailed_check_at: s.lastDetailedCheckAt || s.last_detailed_check_at,
-    availability: s.available,
-    slots_available: s.slots,
-    parse_reason: s.detailParseReason || s.raw?.detailParseReason || null,
-    raw_modal_or_tile_text: raw,
+    reason: reasonForDetailStatus(s),
   };
 }
 
@@ -2493,8 +2624,8 @@ async function getSessionDetailsWithFallback(page, ts, wave, networkCapture) {
   if (fromNetwork && (fromNetwork.slots != null || fromNetwork.capacity != null || fromNetwork.price_text)) {
     console.log(`  [details ${label}] from network response`);
     fromNetwork.detailStatus = fromNetwork.slots === 0
-      ? 'checked_packed_no_slots'
-      : (fromNetwork.slots != null ? 'checked_with_slots' : 'checked_with_slots');
+      ? 'checked_packed'
+      : 'checked_with_slots';
     fromNetwork.parseReason = 'network_json';
     return fromNetwork;
   }
@@ -2675,8 +2806,12 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     sessionsUpdatedWithCapacity: 0,
     sessionsUpdatedWithPrice: 0,
     sessionsMarkedPacked: 0,
+    sessionsCheckedOpenNoSlotsVisible: 0,
     sessionsCheckedNoSlotsVisible: 0,
     sessionsFailed: 0,
+    sessionsFailedParse: 0,
+    sessionsFailedSelector: 0,
+    sessionsTimedOut: 0,
     errors: [],
   };
 
@@ -2718,15 +2853,15 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
         try {
           const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
-          if (!details || isDetailFailureStatus(details.detailStatus || details.failureType)) {
+          if (!details || isDetailFailureStatus(normalizeDetailStatus(details.detailStatus || details.failureType))) {
             const err = details?.detailError || details?.detailStatus || 'no_details';
-            stats.errors.push({ session_key: s.key, error: err });
+            stats.errors.push({ session_key: s.key, error: err, detail_status: details?.detailStatus || 'failed_parse' });
             applyDetailFailureToSession(entry, details || {
               detailStatus: 'failed_parse',
               detailError: 'no_details',
             }, { prior });
             sessionsByKey.set(s.key, entry);
-            stats.sessionsFailed++;
+            incrementDetailFailureStats(stats, entry.detailStatus);
             await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
             await markQueueItemStatus(s.key, 'pending', { error: err });
             enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), session_key: s.key, error: err });
@@ -2744,8 +2879,11 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
           if (!hadCapacity && entry.capacity != null) stats.sessionsUpdatedWithCapacity++;
           if (!hadPrice && (entry.priceText || entry.priceMin != null)) stats.sessionsUpdatedWithPrice++;
           if (result.category === 'packed') stats.sessionsMarkedPacked++;
-          if (result.category === 'no_slots_visible') stats.sessionsCheckedNoSlotsVisible++;
-          if (result.category === 'failed') stats.sessionsFailed++;
+          if (result.category === 'open_no_slots_visible') {
+            stats.sessionsCheckedOpenNoSlotsVisible++;
+            stats.sessionsCheckedNoSlotsVisible++;
+          }
+          if (result.category === 'failed') incrementDetailFailureStats(stats, entry.detailStatus);
 
           await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
           await saveAvailabilitySnapshotsToSupabase([entry], 0, { snapshotType: 'detailed' });
@@ -2759,7 +2897,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
             detailError: e.message,
           }, { prior });
           sessionsByKey.set(s.key, entry);
-          stats.sessionsFailed++;
+          incrementDetailFailureStats(stats, entry.detailStatus);
           await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
           await markQueueItemStatus(s.key, 'pending', { error: e.message });
           enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), session_key: s.key, error: e.message });
@@ -3742,7 +3880,7 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
       packed: true,
       capacity,
       ...price,
-      detailStatus: 'checked_packed_no_slots',
+      detailStatus: 'checked_packed',
       parseReason: parsed.parseReason,
       rawTileText,
       rawModalText,
@@ -3766,7 +3904,7 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
     return {
       openNoCount: true,
       ...price,
-      detailStatus: 'checked_no_slots_visible',
+      detailStatus: 'checked_open_no_slots_visible',
       parseReason: parsed.parseReason,
       rawTileText,
       rawModalText,
@@ -3794,7 +3932,7 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
         packed: true,
         capacity,
         ...price,
-        detailStatus: 'checked_packed_no_slots',
+        detailStatus: 'checked_packed',
         parseReason: modalParsed.parseReason || 'plus_zero_packed',
         rawTileText,
         rawModalText,
@@ -3804,10 +3942,21 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
       return {
         openNoCount: true,
         ...price,
-        detailStatus: 'checked_no_slots_visible',
+        detailStatus: 'checked_open_no_slots_visible',
         parseReason: modalParsed?.parseReason || 'plus_zero_open_no_count',
         rawTileText,
         rawModalText,
+      };
+    }
+    if (rawModalText && rawModalText.trim().length > 8) {
+      return {
+        detailStatus: 'failed_parse',
+        failureType: 'failed_parse',
+        detailError: 'modal text present but slot count not parsed',
+        parseReason: 'no_matching_patterns',
+        rawTileText,
+        rawModalText,
+        ...buildParserOutputFromText(rawModalText),
       };
     }
   }
@@ -3815,19 +3964,49 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
   return null;
 }
 
+async function findSessionTile(page, ts, wave, label) {
+  const selectors = [
+    `div[class*="booking-agenda-clickable_${ts}_${wave}"]`,
+    `[class*="booking-agenda-clickable_${ts}_${wave}"]`,
+    `div.dynamic-cal-booking-ts[class*="_${ts}_${wave}"]`,
+  ];
+  for (const sel of selectors) {
+    const tile = await page.$(sel);
+    if (tile) return { tile, selector: sel };
+  }
+  try {
+    const handle = await page.evaluateHandle(({ ts: t, wave: w }) => {
+      const re = new RegExp(`booking-agenda-clickable_${t}_${w}(?:\\D|$)`);
+      for (const el of document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
+        if (re.test(el.className)) return el;
+      }
+      return null;
+    }, { ts, wave });
+    const el = handle.asElement();
+    if (el) {
+      console.log(`  [getSessionModalDetails ${label}] tile found via DOM scan`);
+      return { tile: el, selector: 'dom_scan_dynamic_cal' };
+    }
+    await handle.dispose();
+  } catch (e) {
+    console.log(`  [getSessionModalDetails ${label}] DOM scan failed: ${e.message}`);
+  }
+  return { tile: null, selector: selectors[0] };
+}
+
 async function getSessionModalDetails(page, ts, wave) {
   const label = `${ts}_${wave}`;
   console.log(`\n[getSessionModalDetails ${label}] starting`);
 
   try {
-    const tileSel = `div[class*="booking-agenda-clickable_${ts}_${wave}"]`;
-    const tile = await page.$(tileSel);
+    const { tile, selector: tileSel } = await findSessionTile(page, ts, wave, label);
     if (!tile) {
       console.log(`  [getSessionModalDetails ${label}] tile not found (${tileSel})`);
       return {
         detailStatus: 'failed_selector',
         failureType: 'failed_selector',
         detailError: `tile not found (${tileSel})`,
+        failedSelector: tileSel,
         rawTileText: null,
         rawModalText: null,
       };
@@ -3951,13 +4130,17 @@ async function getSessionModalDetails(page, ts, wave) {
     }
 
     console.log(`  [getSessionModalDetails ${label}] could not parse slots from modal`);
+    const failStatus = rawModalText && rawModalText.trim().length > 8 ? 'failed_parse' : 'unknown';
     return {
-      detailStatus: 'failed_parse',
-      failureType: 'failed_parse',
-      detailError: 'modal opened but slot count could not be parsed',
+      detailStatus: failStatus,
+      failureType: failStatus === 'failed_parse' ? 'failed_parse' : undefined,
+      detailError: failStatus === 'failed_parse'
+        ? 'modal opened but slot count could not be parsed'
+        : 'modal opened with insufficient text to classify',
       rawTileText,
       rawModalText: truncateDetailText(rawModalText, 1500),
       parseReason: 'no_matching_patterns',
+      ...buildParserOutputFromText(rawModalText),
     };
 
   } catch (e) {
@@ -4395,12 +4578,20 @@ async function fillSlotCounts(page, batch, byKey, prevByKey, stats, { networkCap
 
     const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
     const prior = { ...entry, ...(prevByKey.get(s.key) || {}) };
-    if (details && !isDetailFailureStatus(details.detailStatus || details.failureType)) {
-      applyDetailPayloadToSession(entry, details, s.level, { prior });
-    } else {
-      applyDetailFailureToSession(entry, details || {
-        detailStatus: 'failed_parse',
-        detailError: 'no_details',
+    try {
+      if (details && !isDetailFailureStatus(normalizeDetailStatus(details.detailStatus || details.failureType))) {
+        applyDetailPayloadToSession(entry, details, s.level, { prior });
+      } else {
+        applyDetailFailureToSession(entry, details || {
+          detailStatus: 'failed_parse',
+          detailError: 'no_details',
+        }, { prior });
+      }
+    } catch (slotErr) {
+      console.error(`  slot check failed ${s.key}: ${slotErr.message}`);
+      applyDetailFailureToSession(entry, {
+        detailStatus: /timeout|timed out/i.test(slotErr.message) ? 'failed_timeout' : 'failed_parse',
+        detailError: slotErr.message,
       }, { prior });
     }
     slotChecksThisCycle++;
@@ -5626,43 +5817,55 @@ app.post('/api/admin/enrich-date', async (req, res) => {
   if (!isoDate) {
     return res.status(400).json({ error: 'isoDate required (YYYY-MM-DD)' });
   }
+  const mode = req.body?.mode || req.query?.mode || 'failed_first';
 
   try {
     await ensureSessionsForStatus();
     const allForDate = sessionsForDate(isoDate);
     const openSessions = allForDate.filter(s => s.available !== false);
-    const retryTargets = sortSessionsForDetailRetry(openSessions.filter(s =>
-      isDetailFailureStatus(s.detailStatus || s.detail_status) || !sessionHasDetailedData(s),
-    ));
+    const failedFirst = mode === 'failed_first';
+    const retryTargets = failedFirst
+      ? sortSessionsForFailedFirstEnrich(openSessions.filter(sessionQualifiesForFailedFirstEnrich))
+      : sortSessionsForDetailRetry(openSessions.filter(s =>
+        isDetailFailureStatus(effectiveDetailStatus(s)) || !sessionHasDetailedData(s),
+      ));
     const toProcess = retryTargets.length ? retryTargets : sortSessionsForDetailRetry(openSessions);
 
     if (!openSessions.length) {
       return res.json({
         isoDate,
+        mode,
         sessionsAttempted: 0,
         sessionsUpdatedWithSlots: 0,
         sessionsUpdatedWithCapacity: 0,
         sessionsUpdatedWithPrice: 0,
         sessionsMarkedPacked: 0,
-        sessionsCheckedNoSlotsVisible: 0,
+        sessionsCheckedOpenNoSlotsVisible: 0,
+        sessionsFailedParse: 0,
+        sessionsFailedSelector: 0,
+        sessionsTimedOut: 0,
         sessionsFailed: 0,
         topErrors: [],
         errors: [{ error: 'no_open_sessions_for_date' }],
       });
     }
 
-    await enqueueDateForEnrichment(isoDate, { priority: 1, reason: 'admin_enrich_date' });
+    await enqueueDateForEnrichment(isoDate, { priority: 1, reason: `admin_enrich_date_${mode}` });
     const waitForResult = req.body?.wait === true || req.query?.wait === 'true';
 
     const enrichResponseFields = (result) => ({
       isoDate,
+      mode,
       sessionsQueued: toProcess.length,
       sessionsAttempted: result.sessionsAttempted ?? toProcess.length,
       sessionsUpdatedWithSlots: result.sessionsUpdatedWithSlots ?? 0,
       sessionsUpdatedWithCapacity: result.sessionsUpdatedWithCapacity ?? 0,
       sessionsUpdatedWithPrice: result.sessionsUpdatedWithPrice ?? 0,
       sessionsMarkedPacked: result.sessionsMarkedPacked ?? 0,
-      sessionsCheckedNoSlotsVisible: result.sessionsCheckedNoSlotsVisible ?? 0,
+      sessionsCheckedOpenNoSlotsVisible: result.sessionsCheckedOpenNoSlotsVisible ?? result.sessionsCheckedNoSlotsVisible ?? 0,
+      sessionsFailedParse: result.sessionsFailedParse ?? 0,
+      sessionsFailedSelector: result.sessionsFailedSelector ?? 0,
+      sessionsTimedOut: result.sessionsTimedOut ?? 0,
       sessionsFailed: result.sessionsFailed ?? 0,
       topErrors: buildTopDetailErrors(result.errors),
       errors: result.errors ?? [],

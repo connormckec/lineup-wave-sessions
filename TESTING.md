@@ -109,7 +109,7 @@ curl -s "http://localhost:3000/api/debug/date/$TODAY" | jq '{sessionsCount,curre
 ## Today/tomorrow detail reliability
 
 ```bash
-curl -s http://localhost:3000/api/debug/date/$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso) | jq '{sessionsCount,sessionsWithSlotsCount,failedDetailsCount,failedDetailsSample,checkedButNoSlotsSample,detailStatusSummary,tier1HasRunRecently}'
+curl -s http://localhost:3000/api/debug/date/$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso) | jq '{sessionsCount,sessionsWithSlotsCount,failedDetailsCount,unknownDetailsCount,failedDetailsSample,unknownDetailsSample,checkedButNoSlotsSample,detailStatusSummary,tier1HasRunRecently}'
 curl -s http://localhost:3000/api/debug/collector | jq '{minutesSinceLastTier1,lastTier1DurationMs,likelySleepingOrRestarted,lastApiSessionsDurationMs}'
 ```
 
@@ -126,7 +126,7 @@ curl -s http://localhost:3000/api/debug/collector | jq '{minutesSinceLastTier1,l
 
 ```bash
 TODAY=$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso)
-curl -s "http://localhost:3000/api/debug/date/$TODAY" | jq '{failedDetailsCount,failedDetailsSample,checkedButNoSlotsSample,detailStatusSummary}'
+curl -s "http://localhost:3000/api/debug/date/$TODAY" | jq '{failedDetailsCount,unknownDetailsCount,failedDetailsSample,unknownDetailsSample,checkedButNoSlotsSample,detailStatusSummary}'
 ```
 
 2. **Single session debug:**
@@ -140,12 +140,12 @@ curl -s http://localhost:3000/api/debug/session/<session_key> | jq '{parseResult
 ```bash
 curl -s -X POST http://localhost:3000/api/admin/enrich-date \
   -H 'Content-Type: application/json' \
-  -d '{"isoDate":"2026-06-29","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedNoSlotsVisible,sessionsFailed,topErrors}'
+  -d '{"isoDate":"2026-06-29","mode":"failed_first","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedOpenNoSlotsVisible,sessionsFailedParse,sessionsFailedSelector,sessionsTimedOut,topErrors}'
 ```
 
-4. Confirm `failedDetailsSample` explains tile/modal/selector failures.
-5. Confirm `sessionsWithSlotsCount` increases after parser fixes when re-running enrich-date.
-6. Confirm packed sessions get `slots_available = 0` and `detail_status = checked_packed_no_slots`.
+4. Confirm `failedDetailsSample` and `unknownDetailsSample` explain tile/modal/selector failures with parsed fields.
+5. Confirm `sessionsWithSlotsCount` increases after parser fixes when re-running enrich-date with `mode: failed_first`.
+6. Confirm packed sessions get `slots_available = 0` and `detail_status = checked_packed`.
 7. Confirm a failed retry does not wipe previously known slot counts.
 8. Confirm cards show booked line (`8/12 booked · 4 spots left`), `Packed`, or `Open · details pending/unavailable`.
 
