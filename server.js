@@ -381,8 +381,39 @@ function watchlistForUser(userKey) {
     .map(watchItemToClient);
 }
 
+function watchAlertDefaults(row = {}) {
+  return {
+    alert_when_opens: row.alert_when_opens !== false,
+    alert_when_low_slots: row.alert_when_low_slots !== false,
+    low_slots_threshold: row.low_slots_threshold ?? THRESH,
+    alert_when_selling_fast: row.alert_when_selling_fast !== false,
+    fast_drop_threshold: row.fast_drop_threshold ?? 3,
+    alert_last_call: row.alert_last_call !== false,
+    last_call_minutes_before: row.last_call_minutes_before ?? 120,
+  };
+}
+
+function enrichWatchBaseline(row, { reset = false } = {}) {
+  const s = sessionsByKey.get(row.session_key);
+  const now = new Date().toISOString();
+  Object.assign(row, watchAlertDefaults(row));
+  if (reset || row.watched_at == null) {
+    row.watched_at = now;
+    row.initial_available = s?.available ?? false;
+    row.initial_slots_available = s?.slots ?? null;
+    row.last_seen_available = s?.available ?? false;
+    row.last_seen_slots_available = s?.slots ?? null;
+    row.last_seen_at = now;
+  }
+  return row;
+}
+
 function alertDedupeKey(userKey, sessionKey, eventType) {
   return `${userKey}:${sessionKey}:${eventType}`;
+}
+
+function clearOpenedAlertState(watch) {
+  lastAlertState.delete(alertDedupeKey(watch.user_key, watch.session_key, 'opened'));
 }
 
 function sessionAlertWhen(s) {
@@ -392,22 +423,54 @@ function sessionAlertWhen(s) {
   return { day, time, side, label: `${s.level} ${side}` };
 }
 
-function buildAlertMessage(s, eventType) {
-  const { day, time, side, label } = sessionAlertWhen(s);
-  const when = `${day} at ${time}`.replace(/\s+/g, ' ').trim();
+function formatWhenClause(s) {
+  const { day, time } = sessionAlertWhen(s);
+  return `${day} at ${time}`.replace(/\s+/g, ' ').trim();
+}
+
+function formatSlotsSuffix(n) {
+  if (n == null) return '';
+  return ` · ${n} spot${n === 1 ? '' : 's'}`;
+}
+
+function buildAlertMessage(s, eventType, meta = {}) {
+  const { side } = sessionAlertWhen(s);
+  const when = formatWhenClause(s);
   if (eventType === 'opened') {
-    return `${s.level} ${side} opened: ${when}`;
+    return `${s.level} ${side} opened · ${when}${formatSlotsSuffix(s.slots)}`;
   }
   if (eventType === 'low_slots') {
+    const dayWord = (s.dayLabel || '').toLowerCase() === 'today' ? 'today' : when;
     const n = s.slots;
-    const slotWord = n === 1 ? 'slot' : 'slots';
-    const dayWord = day.toLowerCase() === 'today' ? 'today' : when;
-    return `${s.level} ${side} is closing out: ${n} ${slotWord} left ${dayWord} at ${time}`;
+    return `${s.level} ${side} is closing out · ${n} spot${n === 1 ? '' : 's'} left ${dayWord} at ${s.time || ''}`.replace(/\s+/g, ' ').trim();
   }
-  if (eventType === 'slots_changed') {
-    return `${label} slot update: ${s.slots} open ${when}`;
+  if (eventType === 'selling_fast') {
+    const from = meta.fromSlots ?? '?';
+    const to = s.slots ?? '?';
+    return `${s.level} ${side} is filling fast · ${from} → ${to} spots`;
   }
-  return `${label} update: ${when}`;
+  if (eventType === 'last_call') {
+    const mins = meta.minutesUntil ?? '?';
+    return `Last call: ${s.level} ${side} · ${s.slots} spot${s.slots === 1 ? '' : 's'} · starts in ${mins} min`;
+  }
+  return `${s.level} ${side} update · ${when}`;
+}
+
+function shouldSkipAlert(dedupeKey, eventType, session, meta = {}) {
+  const prev = lastAlertState.get(dedupeKey);
+  if (eventType === 'opened') {
+    return !!prev?.sent;
+  }
+  if (eventType === 'low_slots') {
+    return prev?.slots === session.slots;
+  }
+  if (eventType === 'selling_fast') {
+    return prev?.from === meta.fromSlots && prev?.to === session.slots;
+  }
+  if (eventType === 'last_call') {
+    return !!prev?.sent;
+  }
+  return false;
 }
 
 async function recordNotificationEvent(watch, session, eventType, message, result) {
@@ -427,6 +490,183 @@ async function recordNotificationEvent(watch, session, eventType, message, resul
   }
 }
 
+function markAlertSent(dedupeKey, eventType, session, meta = {}) {
+  const payload = { at: Date.now(), slots: session.slots ?? null, available: session.available };
+  if (eventType === 'opened' || eventType === 'last_call') payload.sent = true;
+  if (eventType === 'selling_fast') {
+    payload.from = meta.fromSlots;
+    payload.to = session.slots;
+  }
+  lastAlertState.set(dedupeKey, payload);
+}
+
+async function maybeSendWatchAlert(watch, session, eventType, { urgent = false, meta = {} } = {}) {
+  const topic = resolveNtfyTopicForWatch(watch);
+  if (!topic) {
+    console.log(`  [alert skip] no ntfy topic for ${watch.session_key} (${eventType})`);
+    return false;
+  }
+  if (!watch.ntfy_topic?.trim() && INTERNAL_BETA) {
+    console.log(`  [alert] internal beta fallback topic for ${watch.user_key.slice(0, 8)}…`);
+  }
+
+  const dedupeKey = alertDedupeKey(watch.user_key, watch.session_key, eventType);
+  if (shouldSkipAlert(dedupeKey, eventType, session, meta)) return false;
+
+  const message = buildAlertMessage(session, eventType, meta);
+  const result = await sendNtfy(topic, 'AP Session Alert', message, { urgent, clickUrl: APP_URL });
+  await recordNotificationEvent(watch, session, eventType, message, result);
+  if (result.ok) {
+    console.log(`  📲 AP Session Alert → ${topic} (${eventType})`);
+    markAlertSent(dedupeKey, eventType, session, meta);
+    return true;
+  }
+  console.error(`  ntfy failed (${eventType}):`, result.error);
+  return false;
+}
+
+async function persistWatchItemState(watch) {
+  const idx = watchItems.findIndex(w => w.id === watch.id);
+  if (idx >= 0) watchItems[idx] = { ...watchItems[idx], ...watch };
+  if (!supabase || !watch.id) return;
+  try {
+    const { error } = await supabase.from('watchlist_items').update({
+      last_seen_available: watch.last_seen_available,
+      last_seen_slots_available: watch.last_seen_slots_available,
+      last_seen_at: watch.last_seen_at,
+      initial_available: watch.initial_available,
+      initial_slots_available: watch.initial_slots_available,
+      watched_at: watch.watched_at,
+    }).eq('id', watch.id);
+    if (error) throw error;
+  } catch (e) {
+    console.error('  watchlist state persist failed:', e.message);
+  }
+}
+
+function minutesUntilSessionStart(session) {
+  if (!session?.ts) return null;
+  return Math.round((session.ts * 1000 - Date.now()) / 60_000);
+}
+
+// Per-session watch alerts (saved-search alerts can hook in here later).
+async function evaluateSessionWatchAlerts(watch, session, ctx) {
+  const {
+    prevAvailable,
+    prevSlots,
+    prevSeenAt,
+    slotsAlerts,
+  } = ctx;
+
+  const threshold = watch.low_slots_threshold ?? THRESH;
+  const fastDrop = watch.fast_drop_threshold ?? 3;
+  const lastCallMins = watch.last_call_minutes_before ?? 120;
+  const currSlots = session.slots ?? null;
+
+  if (!session.available) {
+    clearOpenedAlertState(watch);
+    return;
+  }
+
+  if (watch.alert_when_opens !== false && prevAvailable === false) {
+    await maybeSendWatchAlert(watch, session, 'opened', { urgent: true });
+  }
+
+  if (!slotsAlerts) {
+    if (watch.alert_last_call !== false) {
+      const minsUntil = minutesUntilSessionStart(session);
+      const currSlots = session.slots ?? null;
+      if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && (currSlots == null || currSlots > 0)) {
+        await maybeSendWatchAlert(watch, session, 'last_call', {
+          urgent: true,
+          meta: { minutesUntil: minsUntil },
+        });
+      }
+    }
+    return;
+  }
+
+  if (currSlots == null) return;
+
+  if (watch.alert_when_low_slots !== false && currSlots <= threshold) {
+    const crossedIntoLow = prevSlots == null || prevSlots > threshold;
+    const decreasedWhileLow = prevSlots != null && prevSlots > currSlots && currSlots <= threshold;
+    if (crossedIntoLow || decreasedWhileLow) {
+      await maybeSendWatchAlert(watch, session, 'low_slots', { urgent: true });
+    }
+  }
+
+  if (watch.alert_when_selling_fast !== false && prevSlots != null && currSlots < prevSlots) {
+    const drop = prevSlots - currSlots;
+    let percentDrop = false;
+    if (prevSeenAt && prevSlots > 0) {
+      const minsSince = (Date.now() - prevSeenAt) / 60_000;
+      percentDrop = minsSince <= 30 && drop / prevSlots >= 0.4;
+    }
+    if (drop >= fastDrop || percentDrop) {
+      await maybeSendWatchAlert(watch, session, 'selling_fast', {
+        urgent: currSlots <= threshold,
+        meta: { fromSlots: prevSlots },
+      });
+    }
+  }
+
+  if (watch.alert_last_call !== false) {
+    const minsUntil = minutesUntilSessionStart(session);
+    if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && currSlots > 0) {
+      await maybeSendWatchAlert(watch, session, 'last_call', {
+        urgent: true,
+        meta: { minutesUntil: minsUntil },
+      });
+    }
+  }
+}
+
+async function maybeSendImmediateWatchAlert(watch, session) {
+  if (!session?.available || session.slots == null) return;
+  const threshold = watch.low_slots_threshold ?? THRESH;
+  if (watch.alert_when_low_slots !== false && session.slots <= threshold) {
+    await maybeSendWatchAlert(watch, session, 'low_slots', { urgent: true });
+  }
+}
+
+async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false } = {}) {
+  const updatedSet = new Set(updatedKeys);
+  const now = new Date().toISOString();
+
+  for (const watch of activeWatchItems()) {
+    const session = sessionsByKey.get(watch.session_key);
+    if (!session) continue;
+
+    const prevAvailable = watch.last_seen_available;
+    const prevSlots = watch.last_seen_slots_available;
+    const prevSeenAt = watch.last_seen_at ? new Date(watch.last_seen_at).getTime() : null;
+
+    if (updatedSet.has(watch.session_key)) {
+      await evaluateSessionWatchAlerts(watch, session, {
+        prevAvailable,
+        prevSlots,
+        prevSeenAt,
+        slotsAlerts,
+      });
+    }
+
+    watch.last_seen_available = session.available;
+    watch.last_seen_slots_available = session.slots ?? null;
+    watch.last_seen_at = now;
+    await persistWatchItemState(watch);
+
+    history[watch.session_key] = { available: session.available, slots: session.slots ?? null };
+  }
+
+  for (const key of updatedKeys) {
+    if (!activeWatchItems().some(w => w.session_key === key)) {
+      const s = sessionsByKey.get(key);
+      if (s) history[key] = { available: s.available, slots: s.slots ?? null };
+    }
+  }
+}
+
 function resolveNtfyTopicForWatch(watch) {
   const userTopic = (watch?.ntfy_topic || '').trim();
   if (userTopic) return userTopic;
@@ -441,42 +681,6 @@ function resolveNtfyTopicForRequest(requestTopic) {
   return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
 }
 
-async function maybeSendWatchAlert(watch, session, eventType, { urgent = false } = {}) {
-  const topic = resolveNtfyTopicForWatch(watch);
-  if (!topic) {
-    console.log(`  [alert skip] no ntfy topic for ${watch.session_key} (${eventType})`);
-    return;
-  }
-  if (!watch.ntfy_topic?.trim() && INTERNAL_BETA) {
-    console.log(`  [alert] internal beta fallback topic for ${watch.user_key.slice(0, 8)}…`);
-  }
-
-  const dedupeKey = alertDedupeKey(watch.user_key, watch.session_key, eventType);
-  const prev = lastAlertState.get(dedupeKey);
-
-  if (eventType === 'opened') {
-    if (prev?.available === true) return;
-  } else if (eventType === 'low_slots') {
-    if (prev?.slots === session.slots) return;
-  } else if (eventType === 'slots_changed') {
-    if (prev?.slots === session.slots) return;
-  }
-
-  const message = buildAlertMessage(session, eventType);
-  const result = await sendNtfy(topic, 'AP Session Alert', message, { urgent, clickUrl: APP_URL });
-  await recordNotificationEvent(watch, session, eventType, message, result);
-  if (result.ok) {
-    console.log(`  📲 AP Session Alert → ${topic} (${eventType})`);
-    lastAlertState.set(dedupeKey, {
-      slots: session.slots ?? null,
-      available: session.available,
-      at: Date.now(),
-    });
-  } else {
-    console.error(`  ntfy failed (${eventType}):`, result.error);
-  }
-}
-
 async function loadWatchlistFromSupabase() {
   if (!supabase) return;
   try {
@@ -485,34 +689,60 @@ async function loadWatchlistFromSupabase() {
       .select('*')
       .eq('active', true);
     if (error) throw error;
-    watchItems = asSessionArray(data);
+    watchItems = asSessionArray(data).map(w => ({ ...watchAlertDefaults(w), ...w }));
     console.log(`  Supabase: loaded ${watchItems.length} watchlist item(s)`);
   } catch (e) {
     console.error('  Supabase watchlist load failed:', e.message);
   }
 }
 
-async function upsertWatchItem(row) {
+function mergeWatchBaseline(prev, row) {
+  return {
+    ...row,
+    watched_at: prev?.watched_at ?? row.watched_at,
+    initial_available: prev?.initial_available ?? row.initial_available,
+    initial_slots_available: prev?.initial_slots_available ?? row.initial_slots_available,
+    last_seen_available: prev?.last_seen_available ?? row.last_seen_available,
+    last_seen_slots_available: prev?.last_seen_slots_available ?? row.last_seen_slots_available,
+    last_seen_at: prev?.last_seen_at ?? row.last_seen_at,
+  };
+}
+
+async function upsertWatchItem(row, { isNew = false } = {}) {
+  Object.assign(row, watchAlertDefaults(row));
   if (!row.id) row.id = crypto.randomUUID();
 
-  watchItems = watchItems.filter(
-    w => !(w.user_key === row.user_key && w.session_key === row.session_key)
+  const memExisting = watchItems.find(
+    w => w.user_key === row.user_key && w.session_key === row.session_key
   );
-  watchItems.push(row);
 
-  if (!supabase) return row;
+  if (!supabase) {
+    watchItems = watchItems.filter(
+      w => !(w.user_key === row.user_key && w.session_key === row.session_key)
+    );
+    if (memExisting && !isNew) {
+      const saved = mergeWatchBaseline(memExisting, { ...memExisting, ...row, active: true });
+      watchItems.push(saved);
+      return saved;
+    }
+    if (isNew) enrichWatchBaseline(row, { reset: true });
+    watchItems.push(row);
+    return row;
+  }
+
   try {
     const { data: existing } = await supabase
       .from('watchlist_items')
-      .select('id')
+      .select('*')
       .eq('user_key', row.user_key)
       .eq('session_key', row.session_key)
       .maybeSingle();
 
     if (existing) {
+      const merged = mergeWatchBaseline(existing, { ...existing, ...row, active: true });
       const { data, error } = await supabase
         .from('watchlist_items')
-        .update({ ...row, active: true })
+        .update(merged)
         .eq('id', existing.id)
         .select('*')
         .single();
@@ -522,6 +752,7 @@ async function upsertWatchItem(row) {
       return data;
     }
 
+    if (isNew) enrichWatchBaseline(row, { reset: true });
     const { data, error } = await supabase
       .from('watchlist_items')
       .insert(row)
@@ -533,6 +764,10 @@ async function upsertWatchItem(row) {
     return data;
   } catch (e) {
     console.error('  Supabase watchlist upsert failed:', e.message);
+    watchItems = watchItems.filter(
+      w => !(w.user_key === row.user_key && w.session_key === row.session_key)
+    );
+    watchItems.push(row);
     return row;
   }
 }
@@ -559,6 +794,8 @@ function buildWatchRow(body) {
     wave_side, waveSide, session_type, level,
     time, date, dayLabel, wave,
     alert_when_opens, alert_when_low_slots, low_slots_threshold,
+    alert_when_selling_fast, fast_drop_threshold,
+    alert_last_call, last_call_minutes_before,
   } = body;
 
   const sessionKey = session_key || key;
@@ -577,9 +814,15 @@ function buildWatchRow(body) {
     date: date || null,
     day_label: dayLabel || null,
     wave: wave != null ? +wave : null,
-    alert_when_opens: alert_when_opens !== false,
-    alert_when_low_slots: alert_when_low_slots !== false,
-    low_slots_threshold: low_slots_threshold ?? THRESH,
+    ...watchAlertDefaults({
+      alert_when_opens,
+      alert_when_low_slots,
+      low_slots_threshold,
+      alert_when_selling_fast,
+      fast_drop_threshold,
+      alert_last_call,
+      last_call_minutes_before,
+    }),
     active: true,
   };
 }
@@ -1479,46 +1722,6 @@ function updateEffectiveWeeksCap(detectedWeeks) {
   }
 }
 
-async function processNotifications(updatedKeys, { slotsAlerts = false } = {}) {
-  const updatedSet = new Set(updatedKeys);
-
-  for (const watch of activeWatchItems()) {
-    if (!updatedSet.has(watch.session_key)) continue;
-    const s = sessionsByKey.get(watch.session_key);
-    if (!s) continue;
-
-    const prev = history[watch.session_key] || {};
-    const threshold = watch.low_slots_threshold ?? THRESH;
-    const openedKey = alertDedupeKey(watch.user_key, watch.session_key, 'opened');
-
-    if (!s.available) {
-      lastAlertState.delete(openedKey);
-    }
-
-    if (watch.alert_when_opens !== false && s.available && prev.available === false) {
-      await maybeSendWatchAlert(watch, s, 'opened', { urgent: true });
-    }
-
-    if (watch.alert_when_low_slots !== false && slotsAlerts && s.available && s.slots != null && s.slots <= threshold) {
-      if (prev.slots == null || prev.slots > threshold) {
-        await maybeSendWatchAlert(watch, s, 'low_slots', { urgent: true });
-      }
-    }
-
-    if (slotsAlerts && s.available && s.slots != null && prev.slots != null && s.slots < prev.slots) {
-      const delta = prev.slots - s.slots;
-      const crossedLow = prev.slots > threshold && s.slots <= threshold;
-      if (delta >= 2 && !crossedLow) {
-        await maybeSendWatchAlert(watch, s, 'slots_changed', { urgent: s.slots <= threshold });
-      }
-    }
-  }
-
-  for (const key of updatedKeys) {
-    const s = sessionsByKey.get(key);
-    if (s) history[key] = { available: s.available, slots: s.slots ?? null };
-  }
-}
 
 async function runTierScrape(tier) {
   return withScrapeLock(async () => {
@@ -1576,7 +1779,7 @@ async function runTierScrape(tier) {
       console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
       const coverage = computeDateCoverage();
       console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days, ${coverage.coveragePercent}% dates checked)`);
-      await processNotifications(updatedKeys, { slotsAlerts: cfg.slotCounts });
+      await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
       lastTierRun[tier] = new Date().toISOString();
       lastSuccessfulScrape = new Date().toISOString();
@@ -1676,7 +1879,13 @@ app.post('/api/watchlist', async (req, res) => {
   const row = buildWatchRow(req.body);
   if (!row) return res.status(400).json({ error: 'user_key and session_key required' });
   try {
-    const saved = await upsertWatchItem(row);
+    const isNew = !watchItems.some(
+      w => w.user_key === row.user_key && w.session_key === row.session_key
+    );
+    const saved = await upsertWatchItem(row, { isNew });
+    if (isNew) {
+      await maybeSendImmediateWatchAlert(saved, sessionsByKey.get(saved.session_key));
+    }
     console.log(`  👁  Watching: ${saved.session_type} ${saved.day_label || saved.iso_date || ''} (${saved.user_key.slice(0, 8)}…)`);
     res.json({ ok: true, item: watchItemToClient(saved) });
   } catch (e) {
@@ -1693,7 +1902,10 @@ app.post('/api/watchlist/sync', async (req, res) => {
   for (const item of incoming) {
     const row = buildWatchRow({ ...item, user_key, ntfy_topic: item.ntfy_topic || ntfy_topic });
     if (!row) continue;
-    const saved = await upsertWatchItem(row);
+    const isNew = !watchItems.some(
+      w => w.user_key === row.user_key && w.session_key === row.session_key
+    );
+    const saved = await upsertWatchItem(row, { isNew });
     synced.push(watchItemToClient(saved));
   }
 

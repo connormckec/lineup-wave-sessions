@@ -59,8 +59,29 @@ create table if not exists watchlist_items (
   alert_when_opens boolean not null default true,
   alert_when_low_slots boolean not null default true,
   low_slots_threshold integer not null default 2,
+  alert_when_selling_fast boolean not null default true,
+  fast_drop_threshold integer not null default 3,
+  alert_last_call boolean not null default true,
+  last_call_minutes_before integer not null default 120,
+  watched_at timestamptz,
+  initial_available boolean,
+  initial_slots_available integer,
+  last_seen_available boolean,
+  last_seen_slots_available integer,
+  last_seen_at timestamptz,
   active boolean not null default true
 );
+
+alter table watchlist_items add column if not exists alert_when_selling_fast boolean not null default true;
+alter table watchlist_items add column if not exists fast_drop_threshold integer not null default 3;
+alter table watchlist_items add column if not exists alert_last_call boolean not null default true;
+alter table watchlist_items add column if not exists last_call_minutes_before integer not null default 120;
+alter table watchlist_items add column if not exists watched_at timestamptz;
+alter table watchlist_items add column if not exists initial_available boolean;
+alter table watchlist_items add column if not exists initial_slots_available integer;
+alter table watchlist_items add column if not exists last_seen_available boolean;
+alter table watchlist_items add column if not exists last_seen_slots_available integer;
+alter table watchlist_items add column if not exists last_seen_at timestamptz;
 
 create unique index if not exists watchlist_items_user_session_idx
   on watchlist_items (user_key, session_key);
