@@ -172,7 +172,7 @@ See [TESTING.md](TESTING.md) for verification steps.
 
 ```bash
 curl -s http://localhost:3000/api/debug/collector | jq '{tier1IntervalConfigured,tier1LastCompletedAt,tier1LastSkipReason,tier1TargetDates,lastTier1Scrape,minutesSinceLastTier1,recommendedAction}'
-curl -s -X POST 'http://localhost:3000/api/admin/run-tier1?wait=true' | jq '{completed,skipped,targetDates,sessionsFound,rowsUpserted,error}'
+curl -s -X POST 'http://localhost:3000/api/admin/run-tier1?wait=true' | jq '{completed,sessionsFound,rowsUpserted,upsertError,snapshotsInserted,snapshotInsertError,error}'
 ```
 
 After deploy, within 5–10 minutes `lastTier1Scrape` should be set and `scrapeScheduleEnabled` should be `true`.

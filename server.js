@@ -810,7 +810,9 @@ async function backfillCurrentSessions({ allowOverwrite = false } = {}) {
 
   let rowsUpserted = 0;
   if (toUpsert.length) {
-    rowsUpserted = await upsertCurrentSessionsToSupabase(toUpsert, 0, { scrapeKind: 'basic' });
+    const upsertResult = await upsertCurrentSessionsToSupabase(toUpsert, 0, { scrapeKind: 'basic' });
+    rowsUpserted = upsertResult.rowsUpserted;
+    if (upsertResult.error) errors.push(upsertResult.error);
     mergeSessionsIntoStore(toUpsert);
     await saveLatestSnapshotToSupabase();
   }
@@ -1733,33 +1735,92 @@ async function loadCurrentSessionsFromSupabase({ reloadMeta = true } = {}) {
 }
 
 async function upsertCurrentSessionsToSupabase(scrapedSessions, sourceTier, { scrapeKind = 'basic' } = {}) {
-  if (!supabase) return 0;
-  const batch = asSessionArray(scrapedSessions);
-  if (!batch.length) return 0;
+  const writeResult = {
+    rowsUpserted: 0,
+    sessionsEligibleForUpsert: 0,
+    sessionsSkippedBeforeUpsert: 0,
+    skipReasons: {},
+    error: null,
+    upsertError: null,
+    sampleSessionBeforeUpsert: null,
+    sampleSkippedSessions: [],
+    supabaseConfigured: !!supabase,
+  };
+
+  if (!supabase) {
+    writeResult.error = 'supabase_not_configured';
+    writeResult.upsertError = writeResult.error;
+    return writeResult;
+  }
+
+  const { eligible, skipped, skipReasons } = classifySessionsForUpsert(scrapedSessions);
+  writeResult.sessionsEligibleForUpsert = eligible.length;
+  writeResult.sessionsSkippedBeforeUpsert = skipped.length;
+  writeResult.skipReasons = skipReasons;
+  writeResult.sampleSkippedSessions = skipped.slice(0, 5).map((item) => ({
+    session_key: item.key || item.session?.key || null,
+    iso_date: item.iso_date || sessionDateKey(item.session) || null,
+    start_time: item.session?.time || null,
+    session_type: item.session?.level || null,
+    reason: item.reason,
+  }));
+
+  if (!eligible.length) {
+    writeResult.error = skipped.length ? 'all_sessions_skipped_before_upsert' : 'empty_batch';
+    writeResult.upsertError = writeResult.error;
+    return writeResult;
+  }
 
   try {
-    const rows = batch.map((s) => {
+    const rows = eligible.map((s) => {
       const existing = sessionsByKey.get(s.key);
       const kind = scrapeKind === 'detailed' || sessionHasDetailedData(s) ? 'detailed' : 'basic';
       const merged = mergeSessionFieldsForUpsert(s, existing, { scrapeKind: kind });
       sessionsByKey.set(s.key, merged);
-      return sessionToCurrentRow(merged, sourceTier, { scrapeKind: kind });
+      return sanitizeCurrentSessionRow(sessionToCurrentRow(merged, sourceTier, { scrapeKind: kind }));
     });
+
+    writeResult.sampleSessionBeforeUpsert = rows[0] ? {
+      session_key: rows[0].session_key,
+      iso_date: rows[0].iso_date,
+      start_time: rows[0].start_time,
+      session_type: rows[0].session_type,
+      wave_side: rows[0].wave_side,
+      available: rows[0].available,
+      slots_available: rows[0].slots_available,
+      detail_status: rows[0].detail_status,
+    } : null;
+
     let upserted = 0;
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
       const { error } = await supabase
         .from('current_sessions')
         .upsert(chunk, { onConflict: 'park,session_key' });
-      if (error) throw error;
+      if (error) {
+        writeResult.upsertError = error.message;
+        writeResult.error = error.message;
+        writeResult.errorDetails = {
+          code: error.code,
+          hint: error.hint,
+          details: error.details,
+          chunkStart: i,
+          chunkSize: chunk.length,
+        };
+        console.error('  Supabase current_sessions upsert failed:', error.message, error.details || '');
+        throw error;
+      }
       upserted += chunk.length;
     }
     rebuildSessionsArray();
+    writeResult.rowsUpserted = upserted;
     console.log(`  Supabase: upserted ${upserted} current_sessions row(s) (${scrapeKind})`);
-    return upserted;
+    return writeResult;
   } catch (e) {
+    writeResult.error = writeResult.error || e.message;
+    writeResult.upsertError = writeResult.upsertError || e.message;
     console.error('  Supabase current_sessions upsert failed:', e.message);
-    return 0;
+    return writeResult;
   }
 }
 
@@ -2558,14 +2619,115 @@ function availabilityStatusLabel(s) {
   return 'CLOSING_OUT';
 }
 
+function sanitizeNumericField(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sanitizeRawForDb(raw) {
+  if (!raw || typeof raw !== 'object') return {};
+  try {
+    const cleaned = { ...raw };
+    delete cleaned._recheckReason;
+    return JSON.parse(JSON.stringify(cleaned));
+  } catch {
+    return { key: raw.key, ts: raw.ts, wave: raw.wave };
+  }
+}
+
+function sanitizeCurrentSessionRow(row) {
+  return {
+    ...row,
+    slots_available: row.slots_available != null ? Math.trunc(Number(row.slots_available)) : null,
+    capacity: row.capacity != null ? Math.trunc(Number(row.capacity)) : null,
+    estimated_booked: row.estimated_booked != null ? Math.trunc(Number(row.estimated_booked)) : null,
+    fill_rate: sanitizeNumericField(row.fill_rate),
+    price_min: sanitizeNumericField(row.price_min),
+    price_max: sanitizeNumericField(row.price_max),
+    raw: sanitizeRawForDb(row.raw),
+  };
+}
+
+function classifySessionsForUpsert(sessions) {
+  const eligible = [];
+  const skipped = [];
+  const skipReasons = {};
+  const bump = (reason) => { skipReasons[reason] = (skipReasons[reason] || 0) + 1; };
+
+  for (const s of asSessionArray(sessions)) {
+    if (!s?.key) {
+      skipped.push({ session: s, reason: 'missing_session_key' });
+      bump('missing_session_key');
+      continue;
+    }
+    eligible.push(s);
+  }
+  return { eligible, skipped, skipReasons };
+}
+
+function classifySessionsForSnapshots(sessions) {
+  const eligible = [];
+  const skipped = [];
+  const skipReasons = {};
+  const bump = (reason) => { skipReasons[reason] = (skipReasons[reason] || 0) + 1; };
+
+  for (const s of asSessionArray(sessions)) {
+    if (!s?.key) {
+      skipped.push({ session: s, reason: 'missing_session_key' });
+      bump('missing_session_key');
+      continue;
+    }
+    const isoDate = s.isoDate || s.dateKey || (s.ts
+      ? new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date(Number(s.ts) * 1000))
+      : null);
+    if (!isoDate) {
+      skipped.push({ key: s.key, session: s, reason: 'missing_iso_date' });
+      bump('missing_iso_date');
+      continue;
+    }
+    eligible.push({ ...s, isoDate, dateKey: s.dateKey || isoDate });
+  }
+  return { eligible, skipped, skipReasons };
+}
+
 async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, { snapshotType = 'basic' } = {}) {
-  if (!supabase || !HISTORY_SNAPSHOTS_ENABLED) return 0;
-  const batch = asSessionArray(scrapedSessions);
-  if (!batch.length) return 0;
+  const writeResult = {
+    snapshotsInserted: 0,
+    snapshotsEligible: 0,
+    sessionsSkippedBeforeSnapshot: 0,
+    skipReasons: {},
+    error: null,
+    snapshotInsertError: null,
+    historySnapshotsEnabled: HISTORY_SNAPSHOTS_ENABLED,
+    supabaseConfigured: !!supabase,
+  };
+
+  if (!supabase) {
+    writeResult.error = 'supabase_not_configured';
+    writeResult.snapshotInsertError = writeResult.error;
+    return writeResult;
+  }
+  if (!HISTORY_SNAPSHOTS_ENABLED) {
+    writeResult.error = 'history_snapshots_disabled';
+    writeResult.snapshotInsertError = writeResult.error;
+    return writeResult;
+  }
+
+  const { eligible, skipped, skipReasons } = classifySessionsForSnapshots(scrapedSessions);
+  writeResult.snapshotsEligible = eligible.length;
+  writeResult.sessionsSkippedBeforeSnapshot = skipped.length;
+  writeResult.skipReasons = skipReasons;
+
+  if (!eligible.length) {
+    writeResult.error = skipped.length ? 'all_sessions_skipped_before_snapshot' : 'empty_batch';
+    writeResult.snapshotInsertError = writeResult.error;
+    return writeResult;
+  }
 
   try {
     const scrapedAt = new Date().toISOString();
-    const rows = batch.map((s) => {
+    const rows = eligible.map((s) => {
       const metrics = computeSessionMetrics(
         s.slots ?? null,
         s.capacity ?? null,
@@ -2574,7 +2736,7 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
       );
       const type = snapshotType === 'detailed' || sessionHasDetailedData(s) ? 'detailed' : 'basic';
       const hour = sessionHourFromSession(s);
-      return {
+      return sanitizeCurrentSessionRow({
         scraped_at: scrapedAt,
         park: PARK,
         session_key: s.key,
@@ -2597,23 +2759,89 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
         status_label: availabilityStatusLabel({ ...s, slots: metrics.slots }),
         source_tier: sourceTier,
         snapshot_type: type,
-        raw: s,
-      };
+        raw: sanitizeRawForDb(s),
+      });
     });
 
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
       const { error } = await supabase.from('availability_snapshots').insert(chunk);
-      if (error) throw error;
+      if (error) {
+        writeResult.snapshotInsertError = error.message;
+        writeResult.error = error.message;
+        writeResult.errorDetails = {
+          code: error.code,
+          hint: error.hint,
+          details: error.details,
+          chunkStart: i,
+          chunkSize: chunk.length,
+        };
+        console.error('  Supabase availability snapshots failed:', error.message, error.details || '');
+        throw error;
+      }
     }
 
     lastHistorySnapshotSavedAt = scrapedAt;
+    writeResult.snapshotsInserted = rows.length;
     console.log(`  Supabase: saved ${rows.length} availability snapshot row(s)`);
-    return rows.length;
+    return writeResult;
   } catch (e) {
+    writeResult.error = writeResult.error || e.message;
+    writeResult.snapshotInsertError = writeResult.snapshotInsertError || e.message;
     console.error('  Supabase availability snapshots failed:', e.message);
-    return 0;
+    return writeResult;
   }
+}
+
+async function persistTierScrapeResults(sessions, tier, { slotCountsAttempted = false, slotCountsError = null } = {}) {
+  const merged = asSessionArray(sessions);
+  const diagnostics = {
+    sessionsFound: merged.length,
+    sessionsEligibleForUpsert: 0,
+    sessionsSkippedBeforeUpsert: 0,
+    skipReasons: {},
+    rowsUpserted: 0,
+    upsertError: null,
+    detailUpsertRows: 0,
+    detailUpsertError: null,
+    snapshotsEligible: 0,
+    snapshotsInserted: 0,
+    snapshotInsertError: null,
+    sampleSessionBeforeUpsert: null,
+    sampleSkippedSessions: [],
+  };
+
+  const basicWrite = await upsertCurrentSessionsToSupabase(merged, tier, { scrapeKind: 'basic' });
+  diagnostics.sessionsEligibleForUpsert = basicWrite.sessionsEligibleForUpsert;
+  diagnostics.sessionsSkippedBeforeUpsert = basicWrite.sessionsSkippedBeforeUpsert;
+  diagnostics.skipReasons = { ...basicWrite.skipReasons };
+  diagnostics.rowsUpserted = basicWrite.rowsUpserted;
+  diagnostics.upsertError = basicWrite.upsertError || basicWrite.error || null;
+  diagnostics.sampleSessionBeforeUpsert = basicWrite.sampleSessionBeforeUpsert;
+  diagnostics.sampleSkippedSessions = basicWrite.sampleSkippedSessions;
+
+  if (slotCountsAttempted && !slotCountsError && basicWrite.rowsUpserted > 0) {
+    const detailWrite = await upsertCurrentSessionsToSupabase(merged, tier, { scrapeKind: 'detailed' });
+    diagnostics.detailUpsertRows = detailWrite.rowsUpserted;
+    diagnostics.detailUpsertError = detailWrite.upsertError || detailWrite.error || null;
+    if (detailWrite.rowsUpserted > diagnostics.rowsUpserted) {
+      diagnostics.rowsUpserted = detailWrite.rowsUpserted;
+    }
+  }
+
+  const snapshotType = slotCountsAttempted && !slotCountsError ? 'detailed' : 'basic';
+  const snapshotWrite = await saveAvailabilitySnapshotsToSupabase(merged, tier, { snapshotType });
+  diagnostics.snapshotsEligible = snapshotWrite.snapshotsEligible;
+  diagnostics.snapshotsInserted = snapshotWrite.snapshotsInserted;
+  diagnostics.snapshotInsertError = snapshotWrite.snapshotInsertError || snapshotWrite.error || null;
+  if (snapshotWrite.skipReasons && Object.keys(snapshotWrite.skipReasons).length) {
+    diagnostics.skipReasons = {
+      ...diagnostics.skipReasons,
+      ...Object.fromEntries(Object.entries(snapshotWrite.skipReasons).map(([k, v]) => [`snapshot_${k}`, v])),
+    };
+  }
+
+  return diagnostics;
 }
 
 // ── Detail enrichment (future dates: slots/capacity/price) ─────────────────────
@@ -3061,8 +3289,16 @@ function recordTierRunState(tier, report, { reason = 'scheduled' } = {}) {
     sessionsFound: report.sessionsFound ?? 0,
     rowsUpserted: report.rowsUpserted ?? 0,
     snapshotsInserted: report.snapshotsInserted ?? 0,
+    sessionsEligibleForUpsert: report.sessionsEligibleForUpsert ?? 0,
+    sessionsSkippedBeforeUpsert: report.sessionsSkippedBeforeUpsert ?? 0,
+    skipReasons: report.skipReasons ?? {},
+    upsertError: report.upsertError ?? null,
+    snapshotsEligible: report.snapshotsEligible ?? 0,
+    snapshotInsertError: report.snapshotInsertError ?? null,
+    sampleSessionBeforeUpsert: report.sampleSessionBeforeUpsert ?? null,
+    sampleSkippedSessions: report.sampleSkippedSessions ?? [],
     durationMs: report.durationMs ?? 0,
-    error: report.error || report.errors?.[0]?.error || null,
+    error: report.error || report.upsertError || report.snapshotInsertError || report.errors?.[0]?.error || null,
     blockingScrapeTier: report.blockingScrapeTier ?? null,
     blockingScrapeStartedAt: report.blockingScrapeStartedAt ?? null,
     slotCountsError: report.slotCountsError ?? null,
@@ -3073,7 +3309,7 @@ function recordTierRunState(tier, report, { reason = 'scheduled' } = {}) {
   }
   if (report.completed) {
     collectorState[`${p}LastCompletedAt`] = now;
-    collectorState[`${p}LastError`] = report.slotCountsError || null;
+    collectorState[`${p}LastError`] = report.upsertError || report.snapshotInsertError || report.slotCountsError || null;
   }
   if (report.error || report.errors?.length) {
     collectorState[`${p}LastError`] = report.error || report.errors[0]?.error;
@@ -5392,6 +5628,14 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     sessionsFound: 0,
     rowsUpserted: 0,
     snapshotsInserted: 0,
+    sessionsEligibleForUpsert: 0,
+    sessionsSkippedBeforeUpsert: 0,
+    skipReasons: {},
+    upsertError: null,
+    snapshotsEligible: 0,
+    snapshotInsertError: null,
+    sampleSessionBeforeUpsert: null,
+    sampleSkippedSessions: [],
     durationMs: 0,
     errors: [],
     error: null,
@@ -5517,15 +5761,25 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     hasFreshScrapeThisBoot = true;
     dataSource = supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback';
 
-    rowsUpserted = await upsertCurrentSessionsToSupabase(merged, tier, {
-      scrapeKind: cfg.slotCounts && !report.slotCountsError ? 'detailed' : 'basic',
+    const writeDiag = await persistTierScrapeResults(merged, tier, {
+      slotCountsAttempted: cfg.slotCounts,
+      slotCountsError: report.slotCountsError,
     });
-    snapshotsInserted = await saveAvailabilitySnapshotsToSupabase(
-      merged,
-      tier,
-      { snapshotType: cfg.slotCounts && !report.slotCountsError ? 'detailed' : 'basic' },
-    );
+    rowsUpserted = writeDiag.rowsUpserted;
+    snapshotsInserted = writeDiag.snapshotsInserted;
     lastSnapshotRowsInsertedLastRun = snapshotsInserted;
+    Object.assign(report, writeDiag);
+    if (writeDiag.upsertError) {
+      report.errors.push({ error: writeDiag.upsertError, phase: 'current_sessions_upsert' });
+      report.error = report.error || writeDiag.upsertError;
+      console.error(`  tier ${tier} current_sessions upsert failed: ${writeDiag.upsertError}`);
+    }
+    if (writeDiag.snapshotInsertError) {
+      report.errors.push({ error: writeDiag.snapshotInsertError, phase: 'availability_snapshots' });
+      if (!report.error) report.error = writeDiag.snapshotInsertError;
+      console.error(`  tier ${tier} availability_snapshots insert failed: ${writeDiag.snapshotInsertError}`);
+    }
+
     if (!cfg.slotCounts) {
       const needing = merged.filter(s => sessionQualifiesForDetailEnrichment(s));
       if (needing.length) {
@@ -6189,13 +6443,22 @@ async function adminRunTierHandler(tier, req, res) {
       skipReason: report.skipReason,
       targetDates: report.targetDates,
       sessionsFound: report.sessionsFound ?? 0,
+      sessionsEligibleForUpsert: report.sessionsEligibleForUpsert ?? 0,
+      sessionsSkippedBeforeUpsert: report.sessionsSkippedBeforeUpsert ?? 0,
+      skipReasons: report.skipReasons ?? {},
       rowsUpserted: report.rowsUpserted ?? 0,
+      upsertError: report.upsertError ?? null,
+      snapshotsEligible: report.snapshotsEligible ?? 0,
       snapshotsInserted: report.snapshotsInserted ?? 0,
+      snapshotInsertError: report.snapshotInsertError ?? null,
+      sampleSessionBeforeUpsert: report.sampleSessionBeforeUpsert ?? null,
+      sampleSkippedSessions: report.sampleSkippedSessions ?? [],
       durationMs: report.durationMs ?? 0,
-      error: report.error || report.errors?.[0]?.error || report.slotCountsError || null,
+      error: report.error || report.upsertError || report.snapshotInsertError || report.errors?.[0]?.error || report.slotCountsError || null,
       slotCountsError: report.slotCountsError ?? null,
       blockingScrapeTier: report.blockingScrapeTier ?? null,
       blockingScrapeStartedAt: report.blockingScrapeStartedAt ?? null,
+      supabaseConfigured,
       message: report.completed ? 'completed' : (report.skipped ? 'skipped' : 'failed'),
     });
   } catch (e) {
