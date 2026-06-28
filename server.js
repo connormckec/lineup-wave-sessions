@@ -69,6 +69,11 @@ let lastLatestSnapshotSavedAt = null;
 let lastSnapshotRowsInsertedLastRun = 0;
 const HISTORY_SNAPSHOTS_ENABLED = process.env.HISTORY_SNAPSHOTS !== 'false';
 const PARK = 'atlantic_park';
+const serverStartedAt = new Date().toISOString();
+const scrapeScheduleEnabled = true;
+const ambiguousSideMappings = [];
+const recentSideParseLogs = [];
+const MAX_SIDE_PARSE_LOGS = 40;
 
 function initSupabaseClient() {
   supabaseInitError = null;
@@ -214,7 +219,38 @@ function getStatusFields() {
     latestSnapshotSavedAt: lastLatestSnapshotSavedAt,
     historySnapshotsEnabled: supabaseConfigured && HISTORY_SNAPSHOTS_ENABLED,
     snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
+    minutesSinceLastScrape: dataAgeMinutes,
+    scrapeScheduleEnabled,
+    serverStartedAt,
   };
+}
+
+function waveSideSlug(side) {
+  return (side || 'unknown').toLowerCase().replace(/\s+/g, '-');
+}
+
+function logWaveSideParse(session) {
+  if (!session?.key) return;
+  const entry = {
+    iso_date: session.isoDate || session.dateKey,
+    time: session.time,
+    session_type: session.level,
+    rawTileText: session.tileText || session.sideParseRaw || null,
+    parsed_wave_side: session.waveSide,
+    waveSideSource: session.waveSideSource || 'unknown',
+    wave: session.wave,
+    session_key: session.key,
+    sideKey: `${session.ts}_${waveSideSlug(session.waveSide)}`,
+  };
+  if (session.waveSideAmbiguous) {
+    ambiguousSideMappings.push(entry);
+    if (ambiguousSideMappings.length > 50) ambiguousSideMappings.shift();
+  }
+  recentSideParseLogs.push(entry);
+  if (recentSideParseLogs.length > MAX_SIDE_PARSE_LOGS) recentSideParseLogs.shift();
+  if (process.env.DEBUG_WAVE_SIDE === '1' || session.waveSideAmbiguous) {
+    console.log(`  [wave side] ${entry.iso_date} ${entry.time} ${entry.session_type} wave=${entry.wave} → ${entry.parsed_wave_side} (${entry.waveSideSource})${session.waveSideAmbiguous ? ' AMBIGUOUS' : ''}`);
+  }
 }
 
 async function loadScrapeMetaFromSupabase() {
@@ -587,9 +623,10 @@ function enrichWatchBaseline(row, { reset = false } = {}) {
   Object.assign(row, watchAlertDefaults(row));
   if (reset || row.watched_at == null) {
     row.watched_at = now;
-    row.initial_available = s?.available ?? false;
+    const bookable = !!(s?.available && s.slots !== 0);
+    row.initial_available = bookable;
     row.initial_slots_available = s?.slots ?? null;
-    row.last_seen_available = s?.available ?? false;
+    row.last_seen_available = bookable;
     row.last_seen_slots_available = s?.slots ?? null;
     row.last_seen_at = now;
   }
@@ -661,7 +698,7 @@ function shouldSkipAlert(dedupeKey, eventType, session, meta = {}) {
   return false;
 }
 
-async function recordNotificationEvent(watch, session, eventType, message, result) {
+async function recordNotificationEvent(watch, session, eventType, message, result, detail = {}) {
   if (!supabase) return;
   try {
     await supabase.from('notification_events').insert({
@@ -672,6 +709,11 @@ async function recordNotificationEvent(watch, session, eventType, message, resul
       message,
       sent_ok: !!result.ok,
       error: result.error || null,
+      previous_available: detail.previousAvailable ?? null,
+      current_available: detail.currentAvailable ?? session.available ?? null,
+      previous_slots: detail.previousSlots ?? null,
+      current_slots: detail.currentSlots ?? session.slots ?? null,
+      event_reason: detail.eventReason ?? eventType,
     });
   } catch (e) {
     console.error('  notification_events insert failed:', e.message);
@@ -688,7 +730,7 @@ function markAlertSent(dedupeKey, eventType, session, meta = {}) {
   lastAlertState.set(dedupeKey, payload);
 }
 
-async function maybeSendWatchAlert(watch, session, eventType, { urgent = false, meta = {} } = {}) {
+async function maybeSendWatchAlert(watch, session, eventType, { urgent = false, meta = {}, detail = {} } = {}) {
   const topic = resolveNtfyTopicForWatch(watch);
   if (!topic) {
     console.log(`  [alert skip] no ntfy topic for ${watch.session_key} (${eventType})`);
@@ -702,8 +744,15 @@ async function maybeSendWatchAlert(watch, session, eventType, { urgent = false, 
   if (shouldSkipAlert(dedupeKey, eventType, session, meta)) return false;
 
   const message = buildAlertMessage(session, eventType, meta);
+  const eventDetail = {
+    previousAvailable: detail.previousAvailable,
+    currentAvailable: session.available,
+    previousSlots: detail.previousSlots,
+    currentSlots: session.slots ?? null,
+    eventReason: detail.eventReason || eventType,
+  };
   const result = await sendNtfy(topic, 'AP Session Alert', message, { urgent, clickUrl: APP_URL });
-  await recordNotificationEvent(watch, session, eventType, message, result);
+  await recordNotificationEvent(watch, session, eventType, message, result, eventDetail);
   if (result.ok) {
     console.log(`  📲 AP Session Alert → ${topic} (${eventType})`);
     markAlertSent(dedupeKey, eventType, session, meta);
@@ -711,6 +760,25 @@ async function maybeSendWatchAlert(watch, session, eventType, { urgent = false, 
   }
   console.error(`  ntfy failed (${eventType}):`, result.error);
   return false;
+}
+
+function isOpenedTransition(watch, prevAvailable, prevSlots, session) {
+  if (!session.available) return false;
+  const currSlots = session.slots;
+  const hasSpots = currSlots == null || currSlots > 0;
+  if (!hasSpots) return false;
+
+  if (prevAvailable === false) return true;
+  if (watch.last_seen_available === false) return true;
+  if (prevSlots === 0 && currSlots > 0) return true;
+  return false;
+}
+
+function wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots) {
+  if (prevAvailable === false) return false;
+  if (prevSlots === 0) return false;
+  if (watch.last_seen_available === false) return false;
+  return true;
 }
 
 async function persistWatchItemState(watch) {
@@ -750,24 +818,32 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
   const fastDrop = watch.fast_drop_threshold ?? 3;
   const lastCallMins = watch.last_call_minutes_before ?? 120;
   const currSlots = session.slots ?? null;
+  const alertDetail = {
+    previousAvailable: prevAvailable,
+    previousSlots: prevSlots,
+  };
 
   if (!session.available) {
     clearOpenedAlertState(watch);
     return;
   }
 
-  if (watch.alert_when_opens !== false && prevAvailable === false) {
-    await maybeSendWatchAlert(watch, session, 'opened', { urgent: true });
+  let sentOpened = false;
+  if (watch.alert_when_opens !== false && isOpenedTransition(watch, prevAvailable, prevSlots, session)) {
+    sentOpened = await maybeSendWatchAlert(watch, session, 'opened', {
+      urgent: true,
+      detail: { ...alertDetail, eventReason: 'unavailable_to_available' },
+    });
   }
 
   if (!slotsAlerts) {
-    if (watch.alert_last_call !== false) {
+    if (!sentOpened && watch.alert_last_call !== false) {
       const minsUntil = minutesUntilSessionStart(session);
-      const currSlots = session.slots ?? null;
       if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && (currSlots == null || currSlots > 0)) {
         await maybeSendWatchAlert(watch, session, 'last_call', {
           urgent: true,
           meta: { minutesUntil: minsUntil },
+          detail: { ...alertDetail, eventReason: 'last_call_window' },
         });
       }
     }
@@ -776,15 +852,20 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
 
   if (currSlots == null) return;
 
-  if (watch.alert_when_low_slots !== false && currSlots <= threshold) {
-    const crossedIntoLow = prevSlots == null || prevSlots > threshold;
-    const decreasedWhileLow = prevSlots != null && prevSlots > currSlots && currSlots <= threshold;
-    if (crossedIntoLow || decreasedWhileLow) {
-      await maybeSendWatchAlert(watch, session, 'low_slots', { urgent: true });
+  if (!sentOpened && watch.alert_when_low_slots !== false && wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots)) {
+    if (currSlots <= threshold) {
+      const crossedIntoLow = prevSlots == null || prevSlots > threshold;
+      const decreasedWhileLow = prevSlots != null && prevSlots > currSlots && currSlots <= threshold;
+      if (crossedIntoLow || decreasedWhileLow) {
+        await maybeSendWatchAlert(watch, session, 'low_slots', {
+          urgent: true,
+          detail: { ...alertDetail, eventReason: crossedIntoLow ? 'crossed_low_threshold' : 'decreased_while_low' },
+        });
+      }
     }
   }
 
-  if (watch.alert_when_selling_fast !== false && prevSlots != null && currSlots < prevSlots) {
+  if (!sentOpened && watch.alert_when_selling_fast !== false && wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots) && prevSlots != null && currSlots < prevSlots) {
     const drop = prevSlots - currSlots;
     let percentDrop = false;
     if (prevSeenAt && prevSlots > 0) {
@@ -795,6 +876,7 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
       await maybeSendWatchAlert(watch, session, 'selling_fast', {
         urgent: currSlots <= threshold,
         meta: { fromSlots: prevSlots },
+        detail: { ...alertDetail, eventReason: percentDrop ? 'percent_drop_30m' : 'absolute_drop' },
       });
     }
   }
@@ -805,6 +887,7 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
       await maybeSendWatchAlert(watch, session, 'last_call', {
         urgent: true,
         meta: { minutesUntil: minsUntil },
+        detail: { ...alertDetail, eventReason: 'last_call_window' },
       });
     }
   }
@@ -812,9 +895,17 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
 
 async function maybeSendImmediateWatchAlert(watch, session) {
   if (!session?.available || session.slots == null) return;
+  if (watch.initial_available === false || session.slots === 0) return;
   const threshold = watch.low_slots_threshold ?? THRESH;
   if (watch.alert_when_low_slots !== false && session.slots <= threshold) {
-    await maybeSendWatchAlert(watch, session, 'low_slots', { urgent: true });
+    await maybeSendWatchAlert(watch, session, 'low_slots', {
+      urgent: true,
+      detail: {
+        previousAvailable: watch.initial_available,
+        previousSlots: watch.initial_slots_available,
+        eventReason: 'immediate_low_on_watch',
+      },
+    });
   }
 }
 
@@ -839,7 +930,7 @@ async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false 
       });
     }
 
-    watch.last_seen_available = session.available;
+    watch.last_seen_available = !!(session.available && session.slots !== 0);
     watch.last_seen_slots_available = session.slots ?? null;
     watch.last_seen_at = now;
     await persistWatchItemState(watch);
@@ -1226,9 +1317,124 @@ async function getSlotCount(page, ts, wave) {
 // Parse session tiles currently visible in the agenda DOM.
 // Dates derive from the tile unix timestamp (Atlantic Park local time via browser TZ).
 function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOffset = 0 } = {}) {
-  const WAVE_SIDES = {
-    1: 'Right Wave', 2: 'Left Wave', 3: 'Right Lesson', 4: 'Left Lesson',
+  // Site column index fallback — only used when tile/column text does not resolve side.
+  // Atlantic Park agenda columns: 1=Left Wave, 2=Right Wave, 3=Left Lesson, 4=Right Lesson.
+  const WAVE_INDEX_FALLBACK = {
+    1: 'Left Wave', 2: 'Right Wave', 3: 'Left Lesson', 4: 'Right Lesson',
   };
+
+  function isLessonLevel(level) {
+    return /progressive|lesson|cruiser/i.test(level || '');
+  }
+
+  function normalizeSideLabel(raw, level) {
+    const text = (raw || '').replace(/\s+/g, ' ').trim();
+    const low = text.toLowerCase();
+    if (!text) return null;
+    const lesson = /lesson/.test(low) || isLessonLevel(level);
+    const left = /\bleft\b/.test(low);
+    const right = /\bright\b/.test(low);
+    if (left) return lesson ? 'Left Lesson' : 'Left Wave';
+    if (right) return lesson ? 'Right Lesson' : 'Right Wave';
+    return null;
+  }
+
+  function parseSideFromTitle(html, level) {
+    if (!html) return null;
+    const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const fieldPatterns = [
+      /(?:wave\s*side|session\s*side|side|wave)\s*:?\s*(?:<\/b>)?\s*([^|<]+)/i,
+    ];
+    for (const re of fieldPatterns) {
+      const m = html.match(re) || text.match(re);
+      if (m) {
+        const side = normalizeSideLabel(m[1], level);
+        if (side) return { side, source: 'title_field', raw: m[1].trim() };
+      }
+    }
+    const labelMatch = text.match(/\b(Left|Right)\s+(Wave|Lesson)\b/i)
+      || text.match(/\b(Wave|Lesson)\s+(Left|Right)\b/i);
+    if (labelMatch) {
+      const side = normalizeSideLabel(labelMatch[0], level);
+      if (side) return { side, source: 'title_text', raw: labelMatch[0] };
+    }
+    return null;
+  }
+
+  function parseSideFromColumn(el, level) {
+    const td = el.closest('td');
+    if (td) {
+      const table = td.closest('table');
+      if (table) {
+        const colIdx = td.cellIndex;
+        const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+        const headerCell = headerRow?.cells?.[colIdx];
+        const headerText = headerCell?.textContent?.replace(/\s+/g, ' ').trim();
+        if (headerText) {
+          const side = normalizeSideLabel(headerText, level);
+          if (side) return { side, source: 'column_header', raw: headerText };
+        }
+      }
+    }
+
+    let node = el.parentElement;
+    for (let depth = 0; depth < 6 && node; depth++) {
+      const headers = node.querySelectorAll('th, [class*="header"], [class*="agenda-col"]');
+      if (headers.length >= 2) {
+        const idx = [...node.children].indexOf(el.parentElement);
+        if (idx >= 0 && headers[idx]) {
+          const headerText = headers[idx].textContent.replace(/\s+/g, ' ').trim();
+          const side = normalizeSideLabel(headerText, level);
+          if (side) return { side, source: 'grid_header', raw: headerText };
+        }
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function resolveWaveSide(el, wave, level, titleHtml) {
+    const fromTitle = parseSideFromTitle(titleHtml, level);
+    const fromColumn = parseSideFromColumn(el, level);
+    const tileText = titleHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    if (fromTitle && fromColumn && fromTitle.side !== fromColumn.side) {
+      return {
+        waveSide: fromTitle.side,
+        waveSideSource: 'title_over_column_conflict',
+        sideParseRaw: `${fromTitle.raw} | column:${fromColumn.raw}`,
+        tileText,
+        waveSideAmbiguous: true,
+      };
+    }
+    if (fromTitle) {
+      return {
+        waveSide: fromTitle.side,
+        waveSideSource: fromTitle.source,
+        sideParseRaw: fromTitle.raw,
+        tileText,
+        waveSideAmbiguous: false,
+      };
+    }
+    if (fromColumn) {
+      return {
+        waveSide: fromColumn.side,
+        waveSideSource: fromColumn.source,
+        sideParseRaw: fromColumn.raw,
+        tileText,
+        waveSideAmbiguous: false,
+      };
+    }
+    const fallback = WAVE_INDEX_FALLBACK[wave] || `Wave ${wave}`;
+    return {
+      waveSide: fallback,
+      waveSideSource: 'wave_index_fallback',
+      sideParseRaw: `wave_index_${wave}`,
+      tileText,
+      waveSideAmbiguous: true,
+    };
+  }
+
   const seen = new Set(), out = [];
   const allEls = document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
   const rawCount = allEls.length;
@@ -1256,6 +1462,7 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
     if (d.toDateString() === today.toDateString())     dayLabel = 'Today';
     else if (d.toDateString() === tom.toDateString())  dayLabel = 'Tomorrow';
     else dayLabel = displayDate;
+    const sideInfo = resolveWaveSide(el, wave, level, t);
     out.push({
       key, ts, wave, level,
       available : !cls.includes('expired_timeslot'),
@@ -1266,7 +1473,12 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
       isoDate,
       displayDate,
       weekday,
-      waveSide  : WAVE_SIDES[wave] || `Wave ${wave}`,
+      waveSide  : sideInfo.waveSide,
+      waveSideSource: sideInfo.waveSideSource,
+      sideParseRaw: sideInfo.sideParseRaw,
+      tileText  : sideInfo.tileText,
+      waveSideAmbiguous: sideInfo.waveSideAmbiguous,
+      sideKey   : `${ts}_${sideInfo.waveSide.toLowerCase().replace(/\s+/g, '-')}`,
       sessionType: level,
       weekOffset,
     });
@@ -1848,6 +2060,7 @@ function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
     }
     sessionsByKey.set(raw.key, merged);
     updatedKeys.push(raw.key);
+    logWaveSideParse(merged);
   }
 
   rebuildSessionsArray();
@@ -2038,6 +2251,11 @@ function statusPayload(userKey = null) {
     internalBetaNotifications: INTERNAL_BETA,
     internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
     watchlistCount: activeWatchItems().length,
+    waveSideDebug: {
+      ambiguousCount: ambiguousSideMappings.length,
+      ambiguousSamples: ambiguousSideMappings.slice(-10),
+      recentParses: recentSideParseLogs.slice(-12),
+    },
     ...dateCoverage,
     scrapeMeta: {
       weeksAvailableOnSite,

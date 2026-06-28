@@ -613,16 +613,16 @@ const CARRIERS = {
 };
 
 const WAVE_NAMES = {
-  1: 'Right Wave',
-  2: 'Left Wave',
-  3: 'Right Lesson',
-  4: 'Left Lesson',
+  1: 'Left Wave',
+  2: 'Right Wave',
+  3: 'Left Lesson',
+  4: 'Right Lesson',
 };
 
 const WAVE_FILTERS = [
   { wave: null, label: 'All' },
-  { wave: 1, label: 'Right Wave' },
-  { wave: 2, label: 'Left Wave' },
+  { wave: 1, label: 'Left Wave' },
+  { wave: 2, label: 'Right Wave' },
 ];
 const LESSON_WAVES = [3, 4];
 const BOOKING_TZ = 'America/New_York';
@@ -706,10 +706,10 @@ function browseCountLabel(openCount) {
     return `${openCount} ${level} session${openCount === 1 ? '' : 's'} ${dateWord}`;
   }
   if (activeWave === 1) {
-    return `${openCount} Right Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+    return `${openCount} Left Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
   }
   if (activeWave === 2) {
-    return `${openCount} Left Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+    return `${openCount} Right Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
   }
   return `${openCount} open session${openCount === 1 ? '' : 's'} ${dateWord}`;
 }

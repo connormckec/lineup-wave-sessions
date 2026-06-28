@@ -51,8 +51,21 @@ On startup the server loads saved sessions from `current_sessions` before accept
 | `NTFY_TOPIC` | — | Optional server fallback when internal beta is on |
 | `LOW_SLOTS_THRESHOLD` | `2` | Notify when watched sessions drop to this many slots or fewer |
 | `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead |
+| `DEBUG_WAVE_SIDE` | — | Set `1` to log every parsed wave side during scrapes |
 
 See [TESTING.md](TESTING.md) for verification steps.
+
+### Railway / background collector health
+
+The scraper must run continuously — **disable Railway Serverless/App Sleep** on this service. If the process sleeps, `lastScrapeAttempt` in `/api/status` will go stale and availability snapshots stop accumulating.
+
+Check collector health via `/api/status`:
+
+- `lastScrapeAttempt` / `lastSuccessfulScrape` — should update every few minutes (tier 1)
+- `minutesSinceLastScrape` — alert if this grows beyond ~2× `CHECK_EVERY_MINS`
+- `scrapeScheduleEnabled` — should be `true`
+- `serverStartedAt` — when the current process booted
+- `waveSideDebug` — recent side parses and any ambiguous mappings
 
 ## API endpoints
 

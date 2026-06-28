@@ -149,8 +149,19 @@ create table if not exists notification_events (
   ntfy_topic text,
   message text,
   sent_ok boolean,
-  error text
+  error text,
+  previous_available boolean,
+  current_available boolean,
+  previous_slots integer,
+  current_slots integer,
+  event_reason text
 );
+
+alter table notification_events add column if not exists previous_available boolean;
+alter table notification_events add column if not exists current_available boolean;
+alter table notification_events add column if not exists previous_slots integer;
+alter table notification_events add column if not exists current_slots integer;
+alter table notification_events add column if not exists event_reason text;
 
 create index if not exists notification_events_session_idx
   on notification_events (session_key, created_at desc);

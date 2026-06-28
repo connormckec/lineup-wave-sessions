@@ -35,10 +35,28 @@
 ### API checks
 
 ```bash
-curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, snapshotRowsInsertedLastRun, lastSuccessfulScrape, source}'
+curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, lastScrapeAttempt, lastSuccessfulScrape, minutesSinceLastScrape, scrapeScheduleEnabled, serverStartedAt, waveSideDebug}'
 curl -s http://localhost:3000/api/analytics/availability-summary | jq '.snapshotCount, .averageSlotsByWeekday'
 curl -s -X POST http://localhost:3000/api/notify/test -H 'Content-Type: application/json' -d '{"ntfy_topic":"your-topic"}'
 ```
+
+### Collector health (Railway)
+
+- **Disable App Sleep / Serverless sleep** on the Railway service — background tier-1 scrapes must run every ~5 minutes.
+- If `minutesSinceLastScrape` is much larger than `CHECK_EVERY_MINS`, the service may be sleeping or the scraper crashed.
+- Compare `serverStartedAt` with `lastScrapeAttempt` to distinguish a fresh deploy from a stalled scraper.
+
+### Wave side mapping
+
+- Set `DEBUG_WAVE_SIDE=1` to log parsed side for each session tile during scrapes.
+- Check `/api/status` → `waveSideDebug.ambiguousSamples` if Left/Right labels look wrong.
+- Side is parsed from tile tooltip text and column headers first; wave index is fallback only.
+
+### Opened vs low-slot alerts
+
+- Watching a **packed/sold-out** session should produce an **`opened`** alert when spots appear — not `low_slots`.
+- If a session opens with 1–2 spots, only **`opened`** fires on that scrape (not both).
+- `notification_events` rows include `previous_available`, `current_available`, `previous_slots`, `current_slots`, and `event_reason`.
 
 ### Frontend behavior
 
