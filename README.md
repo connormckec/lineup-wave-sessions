@@ -108,7 +108,7 @@ Two scrape levels run in parallel:
 
 **Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors. `GET /api/debug/date/:isoDate` — `failedDetailsSample`, `unknownDetailsSample`, `checkedOpenNoSlotsSample`, `failedCookieOverlaySample`, `detailStatusSummary`. `GET /api/debug/session/:sessionKey` — parse result and latest captured modal/tile text.
 
-Detail tile lookup uses scored matching (time, type, wave side, `raw_tile_text`, column index) with cookie-banner dismissal before modal interaction. `POST /api/admin/enrich-date` with `mode: failed_first` retries `failed_cookie_overlay` → `failed_selector` → `failed_parse` → unknown attempted → missing slots.
+Detail tile lookup uses scored matching with multi-stage cookie consent dismissal (Playwright locators + init-script consent keys) before modal interaction. `POST /api/admin/enrich-date` returns reconciled outcome counts, `skipReason` when skipped, and cookie diagnostics (`cookieDismissAttempted`, `cookieBannerStillVisible`, etc.).
 
 **Status fields:** `detailCoveragePercent`, `sessionsWithSlotsCount`, `sessionsWithCapacityCount`, `sessionsWithPriceCount`, `enrichmentQueuePending`, `detailEnrichmentInProgress`, `lastDetailEnrichmentAt`.
 

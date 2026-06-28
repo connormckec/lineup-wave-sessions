@@ -188,7 +188,7 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `GET /api/debug/boot` | Park timezone, saved session counts, why Browse would show not_checked |
 | `GET /api/debug/enrichment` | Enrichment queue, stale/missing counts, run duration, recent errors |
 | `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
-| `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date |
+| `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date. Returns reconciled outcome counts (`sessionsUpdatedWithSlots`, `sessionsFailedCookieOverlay`, etc.), `skipReason` when skipped, cookie diagnostics, and `unchangedReasons`. |
 | `GET /api/debug/coverage` | Expected vs actual dates across sources |
 
 ---

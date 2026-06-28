@@ -2437,8 +2437,60 @@ function incrementDetailFailureStats(stats, status) {
   if (st === 'failed_cookie_overlay') stats.sessionsFailedCookieOverlay = (stats.sessionsFailedCookieOverlay || 0) + 1;
   else if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
   else if (st === 'failed_selector') stats.sessionsFailedSelector = (stats.sessionsFailedSelector || 0) + 1;
+  else if (st === 'failed_modal_open') stats.sessionsFailedModalOpen = (stats.sessionsFailedModalOpen || 0) + 1;
   else if (st === 'failed_timeout') stats.sessionsTimedOut = (stats.sessionsTimedOut || 0) + 1;
   else stats.sessionsFailed = (stats.sessionsFailed || 0) + 1;
+}
+
+function attachCookieDiagnosticsToStats(stats) {
+  const cookie = cookieDiagnosticsSnapshot();
+  stats.cookieDismissAttempted = cookie.cookieDismissAttempted;
+  stats.cookieDismissSucceeded = cookie.cookieDismissSucceeded;
+  stats.cookieBannerStillVisible = cookie.cookieBannerStillVisible;
+  stats.cookieClickMethod = cookie.cookieClickMethod;
+  stats.modalTextAfterCookieDismissSample = cookie.modalTextAfterCookieDismissSample;
+  return stats;
+}
+
+function finalizeEnrichmentStats(stats) {
+  const outcomeTotal = (stats.sessionsUpdatedWithSlots || 0)
+    + (stats.sessionsMarkedPacked || 0)
+    + (stats.sessionsCheckedOpenNoSlotsVisible || 0)
+    + (stats.sessionsFailedCookieOverlay || 0)
+    + (stats.sessionsFailedParse || 0)
+    + (stats.sessionsFailedSelector || 0)
+    + (stats.sessionsFailedModalOpen || 0)
+    + (stats.sessionsTimedOut || 0)
+    + (stats.sessionsFailed || 0)
+    + (stats.sessionsUnchanged || 0);
+  stats.outcomeTotal = outcomeTotal;
+  stats.outcomeReconciles = stats.sessionsAttempted === 0 || outcomeTotal === stats.sessionsAttempted;
+  attachCookieDiagnosticsToStats(stats);
+  return stats;
+}
+
+function emptyEnrichmentStats({ skipped = false, skipReason = null, sessionsQueued = 0 } = {}) {
+  return finalizeEnrichmentStats({
+    skipped,
+    skipReason,
+    sessionsQueued,
+    sessionsAttempted: 0,
+    sessionsUpdatedWithSlots: 0,
+    sessionsUpdatedWithCapacity: 0,
+    sessionsUpdatedWithPrice: 0,
+    sessionsMarkedPacked: 0,
+    sessionsCheckedOpenNoSlotsVisible: 0,
+    sessionsCheckedNoSlotsVisible: 0,
+    sessionsFailed: 0,
+    sessionsFailedParse: 0,
+    sessionsFailedSelector: 0,
+    sessionsFailedModalOpen: 0,
+    sessionsFailedCookieOverlay: 0,
+    sessionsTimedOut: 0,
+    sessionsUnchanged: 0,
+    unchangedReasons: [],
+    errors: [],
+  });
 }
 
 function sessionQualifiesForFailedFirstEnrich(s) {
@@ -3095,12 +3147,19 @@ function releaseDetailEnrichmentLock() {
 
 async function runDetailEnrichment({ priority = null, isoDate = null, sessions: explicitSessions = null, reason = 'scheduled' } = {}) {
   if (!tryAcquireDetailEnrichmentLock(`detail enrichment (${reason})`)) {
-    return { skipped: true, reason: 'busy' };
+    return emptyEnrichmentStats({
+      skipped: true,
+      skipReason: scrapeInProgress ? 'scrape_in_progress' : 'detail_enrichment_busy',
+    });
   }
 
+  resetCookieDismissDiagnostics();
   const runStarted = Date.now();
   const stats = {
     isoDate: isoDate || null,
+    skipped: false,
+    skipReason: null,
+    sessionsQueued: explicitSessions?.length || 0,
     sessionsAttempted: 0,
     sessionsUpdatedWithSlots: 0,
     sessionsUpdatedWithCapacity: 0,
@@ -3111,8 +3170,11 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     sessionsFailed: 0,
     sessionsFailedParse: 0,
     sessionsFailedSelector: 0,
+    sessionsFailedModalOpen: 0,
     sessionsFailedCookieOverlay: 0,
     sessionsTimedOut: 0,
+    sessionsUnchanged: 0,
+    unchangedReasons: [],
     errors: [],
   };
 
@@ -3122,8 +3184,11 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
       ? sortSessionsForDetailRetry(asSessionArray(explicitSessions)).slice(0, DETAIL_ENRICH_MAX_PER_RUN)
       : await pickSessionsForDetailEnrichment({ priority, isoDate });
 
+    stats.sessionsQueued = toEnrich.length;
+
     if (!toEnrich.length) {
-      return stats;
+      stats.skipReason = 'no_sessions_to_enrich';
+      return finalizeEnrichmentStats(stats);
     }
 
     console.log(`\n[${new Date().toLocaleTimeString()}] Detail enrichment (${reason}): ${toEnrich.length} session(s)`);
@@ -3137,8 +3202,10 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
     for (const [weekOffset, sessionsInWeek] of weekGroups) {
       if (currentWeek !== weekOffset) {
+        await dismissCookieBanner(page);
         await navigateToWeekOffset(page, weekOffset);
         currentWeek = weekOffset;
+        await dismissCookieBanner(page);
         await page.waitForTimeout(300);
       }
 
@@ -3148,21 +3215,35 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
         const entry = { ...sessionsByKey.get(s.key), ...s };
         const prior = { ...entry };
+        const priorStatus = effectiveDetailStatus(prior);
+        const priorSlots = prior.slots;
         entry.detailStatus = 'checking';
         sessionsByKey.set(s.key, entry);
         sessionsNeedingDetailAfterBasic.delete(s.key);
 
         try {
+          await dismissCookieBanner(page);
           const details = await getSessionDetailsWithFallback(page, s, networkCapture);
           if (!details || isDetailFailureStatus(normalizeDetailStatus(details.detailStatus || details.failureType))) {
             const err = details?.detailError || details?.detailStatus || 'no_details';
-            stats.errors.push({ session_key: s.key, error: err, detail_status: details?.detailStatus || 'failed_parse' });
+            const failStatus = normalizeDetailStatus(details?.detailStatus || details?.failureType) || 'failed_parse';
+            stats.errors.push({ session_key: s.key, error: err, detail_status: failStatus });
             applyDetailFailureToSession(entry, details || {
               detailStatus: 'failed_parse',
               detailError: 'no_details',
             }, { prior });
             sessionsByKey.set(s.key, entry);
             incrementDetailFailureStats(stats, entry.detailStatus);
+            const newStatus = effectiveDetailStatus(entry);
+            if (newStatus === priorStatus && priorSlots === entry.slots) {
+              stats.sessionsUnchanged++;
+              stats.unchangedReasons.push({
+                session_key: s.key,
+                reason: `still_${newStatus}`,
+                prior_status: priorStatus,
+                detail_error: entry.detailError || err,
+              });
+            }
             await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
             await markQueueItemStatus(s.key, 'pending', { error: err });
             enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), session_key: s.key, error: err });
@@ -3185,6 +3266,19 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
             stats.sessionsCheckedNoSlotsVisible++;
           }
           if (result.category === 'failed') incrementDetailFailureStats(stats, entry.detailStatus);
+
+          const newStatus = effectiveDetailStatus(entry);
+          const changed = newStatus !== priorStatus
+            || priorSlots !== entry.slots
+            || prior.capacity !== entry.capacity;
+          if (!changed && result.category !== 'with_slots' && result.category !== 'packed' && result.category !== 'open_no_slots_visible') {
+            stats.sessionsUnchanged++;
+            stats.unchangedReasons.push({
+              session_key: s.key,
+              reason: `still_${newStatus}`,
+              prior_status: priorStatus,
+            });
+          }
 
           await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
           await saveAvailabilitySnapshotsToSupabase([entry], 0, { snapshotType: 'detailed' });
@@ -3216,7 +3310,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     const durationMs = Date.now() - runStarted;
     enrichmentMetrics.lastRunAt = lastDetailEnrichmentAt;
     enrichmentMetrics.lastDurationMs = durationMs;
-    enrichmentMetrics.lastRunStats = { ...stats };
+    enrichmentMetrics.lastRunStats = finalizeEnrichmentStats({ ...stats });
     enrichmentMetrics.runsCompleted += 1;
     enrichmentMetrics.averageDurationMs = enrichmentMetrics.averageDurationMs == null
       ? durationMs
@@ -3225,15 +3319,15 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
       enrichmentMetrics.recentErrors = enrichmentMetrics.recentErrors.slice(-50);
     }
 
-    console.log(`  detail enrichment done (${durationMs}ms): ${stats.sessionsUpdatedWithSlots} slots, ${stats.sessionsUpdatedWithCapacity} capacity, ${stats.sessionsUpdatedWithPrice} price`);
-    return stats;
+    console.log(`  detail enrichment done (${durationMs}ms): ${stats.sessionsUpdatedWithSlots} slots, ${stats.sessionsFailedCookieOverlay} cookie, ${stats.sessionsFailedParse} parse`);
+    return finalizeEnrichmentStats(stats);
   } catch (e) {
     lastDetailEnrichmentError = e.message;
     stats.errors.push({ error: e.message });
     enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), error: e.message });
     console.error('  detail enrichment failed:', e.message);
     await releaseEnrichmentBrowserPool();
-    return stats;
+    return finalizeEnrichmentStats(stats);
   } finally {
     releaseDetailEnrichmentLock();
     if (!keepBrowser) await releaseEnrichmentBrowserPool();
@@ -4038,62 +4132,269 @@ function buildWatchRow(body) {
 const MAX_SLOT_CLICKS = 30;
 const MODAL_SELECTORS = ['.modal.in', '.modal.show', '.modal', '[class*="modal-dialog"]', '[class*="popup"]', '[class*="booking"]', '.popover'];
 
-async function dismissCookieBanner(page) {
+const COOKIE_CONSENT_INIT_SCRIPT = `
+(() => {
   try {
-    const clicked = await page.evaluate(() => {
-      const acceptPatterns = [
-        /^allow cookies$/i, /^accept all$/i, /^accept cookies$/i, /^accept$/i,
-        /^agree$/i, /^i agree$/i, /^got it$/i, /^ok$/i,
-      ];
-      const refusePatterns = [/^refuse cookies$/i, /^reject all$/i, /^reject$/i, /^decline$/i];
-      const buttons = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
-      for (const btn of buttons) {
-        const t = (btn.innerText || btn.textContent || btn.value || '').replace(/\s+/g, ' ').trim();
-        if (!t) continue;
-        if (acceptPatterns.some(re => re.test(t)) || refusePatterns.some(re => re.test(t))) {
-          btn.click();
-          return t;
-        }
+    const storageKeys = [
+      'CookieConsent', 'cookieconsent_status', 'cookies_accepted', 'cookie_consent',
+      'gdpr-consent', 'euconsent-v2', 'OptanonConsent', 'cookie-agreed', 'cookie_agreed',
+      'allowCookies', 'acceptCookies', 'cookie_notice_accepted', 'cb-enabled', 'cookieControl',
+      'cookieconsent', 'cookies-policy', 'cookie_policy', 'consent_status',
+    ];
+    const storageValues = ['true', 'allow', '1', 'yes', 'accepted', 'dismiss', 'all'];
+    for (const key of storageKeys) {
+      for (const val of storageValues) {
+        try { localStorage.setItem(key, val); } catch {}
+        try { sessionStorage.setItem(key, val); } catch {}
       }
-      const banner = document.querySelector('[class*="cookie"], [id*="cookie"], [class*="consent"], [id*="consent"]');
-      if (banner) {
-        const innerBtn = banner.querySelector('button, a, [role="button"]');
-        if (innerBtn) {
-          innerBtn.click();
-          return (innerBtn.innerText || innerBtn.textContent || 'cookie_banner_button').trim();
-        }
+    }
+    const cookiePairs = [
+      'CookieConsent=true', 'cookieconsent_status=allow', 'cookies_accepted=1',
+      'cookie_consent=accepted', 'allowCookies=1', 'acceptCookies=true',
+    ];
+    for (const pair of cookiePairs) {
+      try { document.cookie = pair + '; path=/; max-age=31536000; SameSite=Lax'; } catch {}
+    }
+  } catch {}
+})();
+`;
+
+let cookieDismissDiagnostics = {
+  cookieDismissAttempted: 0,
+  cookieDismissSucceeded: 0,
+  cookieBannerStillVisible: false,
+  cookieClickMethod: null,
+  modalTextAfterCookieDismissSample: null,
+};
+
+function resetCookieDismissDiagnostics() {
+  cookieDismissDiagnostics = {
+    cookieDismissAttempted: 0,
+    cookieDismissSucceeded: 0,
+    cookieBannerStillVisible: false,
+    cookieClickMethod: null,
+    modalTextAfterCookieDismissSample: null,
+  };
+}
+
+function cookieDiagnosticsSnapshot() {
+  return { ...cookieDismissDiagnostics };
+}
+
+async function setupBookingBrowserContext(context) {
+  await context.addInitScript(COOKIE_CONSENT_INIT_SCRIPT);
+}
+
+async function isCookieBannerVisible(page) {
+  return page.evaluate(() => {
+    const body = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
+    const hasCookieCopy = body.includes('this website uses cookies')
+      || (body.includes('cookie') && (body.includes('allow cookies') || body.includes('refuse cookies')));
+    const selectors = [
+      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
+      '[class*="gdpr" i]', '[id*="gdpr" i]', '[class*="cc-" i]', '.cc-window', '#cookie-law-info-bar',
+    ];
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        const visible = style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && parseFloat(style.opacity || '1') > 0.05
+          && rect.width > 40
+          && rect.height > 20;
+        if (visible) return true;
       }
-      return null;
-    });
-    if (clicked) {
-      console.log(`  [cookie] dismissed via "${clicked}"`);
+    }
+    return hasCookieCopy && (body.includes('allow cookies') || body.includes('refuse cookies'));
+  }).catch(() => false);
+}
+
+async function waitForCookieBannerGone(page, timeout = 6000) {
+  await page.waitForFunction(() => {
+    const body = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
+    const hasBannerText = body.includes('this website uses cookies')
+      || (body.includes('cookie') && body.includes('allow cookies') && body.includes('refuse cookies'));
+    if (!hasBannerText) return true;
+    const selectors = [
+      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
+      '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar',
+    ];
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        const visible = style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && parseFloat(style.opacity || '1') > 0.05
+          && rect.width > 40
+          && rect.height > 20;
+        if (visible) return false;
+      }
+    }
+    return !hasBannerText;
+  }, { timeout }).catch(() => {});
+}
+
+async function clickCookieConsentButton(page) {
+  const playwrightAttempts = [
+    {
+      method: 'playwright_role_allow_cookies',
+      run: async () => page.getByRole('button', { name: /allow cookies/i }).first(),
+    },
+    {
+      method: 'playwright_role_accept_all',
+      run: async () => page.getByRole('button', { name: /accept all cookies?/i }).first(),
+    },
+    {
+      method: 'playwright_role_accept',
+      run: async () => page.getByRole('button', { name: /^accept$/i }).first(),
+    },
+    {
+      method: 'playwright_text_allow_cookies',
+      run: async () => page.getByText(/\ballow cookies\b/i).first(),
+    },
+    {
+      method: 'playwright_locator_allow_cookies',
+      run: async () => page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
+        .filter({ hasText: /\ballow cookies\b/i }).first(),
+    },
+    {
+      method: 'playwright_role_refuse_cookies',
+      run: async () => page.getByRole('button', { name: /refuse cookies/i }).first(),
+    },
+    {
+      method: 'playwright_locator_refuse_cookies',
+      run: async () => page.locator('button, a, [role="button"]')
+        .filter({ hasText: /\brefuse cookies\b/i }).first(),
+    },
+    {
+      method: 'playwright_css_cookie_banner_button',
+      run: async () => page.locator('[class*="cookie" i] button, [id*="cookie" i] button, [class*="consent" i] button, .cc-btn, .cc-allow, .cc-dismiss').first(),
+    },
+  ];
+
+  for (const attempt of playwrightAttempts) {
+    try {
+      const locator = await attempt.run();
+      if (await locator.isVisible({ timeout: 600 }).catch(() => false)) {
+        await locator.click({ timeout: 4000, force: true });
+        return attempt.method;
+      }
+    } catch {}
+  }
+
+  return page.evaluate(() => {
+    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+    const low = (t) => norm(t).toLowerCase();
+    const isAllow = (t) => /\ballow cookies\b/i.test(t) || /\baccept all\b/i.test(t)
+      || /\baccept cookies\b/i.test(t) || /^accept$/i.test(t) || /^agree$/i.test(t);
+    const isRefuse = (t) => /\brefuse cookies\b/i.test(t) || /\breject all\b/i.test(t) || /^decline$/i.test(t);
+
+    function clickEl(el, label) {
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      if (typeof el.click === 'function') el.click();
+      return label;
+    }
+
+    const candidates = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"], span, div, p')];
+    for (const el of candidates) {
+      const text = norm(el.innerText || el.textContent || el.value);
+      if (!text) continue;
+      if (isAllow(text)) {
+        for (const child of el.querySelectorAll('*')) {
+          const ct = norm(child.innerText || child.textContent);
+          if (isAllow(ct) && !isRefuse(ct)) return clickEl(child, `dom_allow_child:${ct.slice(0, 40)}`);
+        }
+        return clickEl(el, `dom_allow:${text.slice(0, 60)}`);
+      }
+    }
+    for (const el of candidates) {
+      const text = norm(el.innerText || el.textContent || el.value);
+      if (!text) continue;
+      if (isRefuse(text)) return clickEl(el, `dom_refuse:${text.slice(0, 60)}`);
+    }
+    const combined = norm(document.body?.innerText || '');
+    if (/refuse cookiesallow cookies/i.test(combined.replace(/\s+/g, ''))) {
+      for (const el of candidates) {
+        const text = low(el.innerText || el.textContent);
+        if (text.includes('allow cookies')) return clickEl(el, 'dom_concatenated_allow');
+      }
+    }
+    return null;
+  }).catch(() => null);
+}
+
+async function dismissCookieBanner(page) {
+  cookieDismissDiagnostics.cookieDismissAttempted++;
+  try {
+    if (!(await isCookieBannerVisible(page))) {
+      cookieDismissDiagnostics.cookieBannerStillVisible = false;
+      return { success: true, method: 'already_hidden' };
+    }
+
+    const method = await clickCookieConsentButton(page);
+    if (method) {
+      cookieDismissDiagnostics.cookieClickMethod = method;
       await page.waitForTimeout(500);
-      await page.waitForFunction(() => {
-        const body = (document.body?.innerText || '').toLowerCase();
-        const hasBanner = body.includes('this website uses cookies')
-          && (body.includes('allow cookies') || body.includes('refuse cookies'));
-        const overlay = document.querySelector('[class*="cookie" i], [id*="cookie" i], [class*="consent" i]');
-        if (!overlay) return !hasBanner;
-        const style = window.getComputedStyle(overlay);
-        return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || !hasBanner;
-      }, { timeout: 4000 }).catch(() => {});
-      return true;
+      await waitForCookieBannerGone(page);
+    }
+
+    const stillVisible = await isCookieBannerVisible(page);
+    cookieDismissDiagnostics.cookieBannerStillVisible = stillVisible;
+    if (!stillVisible) {
+      cookieDismissDiagnostics.cookieDismissSucceeded++;
+      console.log(`  [cookie] dismissed via ${method || 'unknown'}`);
+      return { success: true, method: method || 'unknown' };
+    }
+
+    if (method) {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(300);
+      const retryMethod = await clickCookieConsentButton(page);
+      if (retryMethod) {
+        cookieDismissDiagnostics.cookieClickMethod = `${method}|retry:${retryMethod}`;
+        await page.waitForTimeout(500);
+        await waitForCookieBannerGone(page);
+        const stillAfterRetry = await isCookieBannerVisible(page);
+        cookieDismissDiagnostics.cookieBannerStillVisible = stillAfterRetry;
+        if (!stillAfterRetry) {
+          cookieDismissDiagnostics.cookieDismissSucceeded++;
+          console.log(`  [cookie] dismissed on retry via ${retryMethod}`);
+          return { success: true, method: retryMethod };
+        }
+      }
     }
   } catch (e) {
-    console.log(`  [cookie] dismiss skipped: ${e.message}`);
+    console.log(`  [cookie] dismiss failed: ${e.message}`);
   }
-  return false;
+  cookieDismissDiagnostics.cookieBannerStillVisible = await isCookieBannerVisible(page).catch(() => true);
+  return { success: false, method: cookieDismissDiagnostics.cookieClickMethod };
 }
 
 async function readModalText(page, modal) {
   return modal.evaluate(() => {
-    const el = document.querySelector('.modal.in, .modal.show, .modal, [role="dialog"]') || document.body;
+    const modalEl = document.querySelector('.modal.in, .modal.show, [role="dialog"].show, [role="dialog"][aria-modal="true"]');
+    const el = modalEl || document.querySelector('.modal.in, .modal.show, .modal, [role="dialog"]');
+    if (!el) return { text: '', maxQty: null };
     const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-    const qty = document.querySelector('input.qty-info');
+    const qty = el.querySelector('input.qty-info') || document.querySelector('input.qty-info');
     const maxAttr = qty?.getAttribute('max');
     const maxQty = maxAttr ? parseInt(maxAttr, 10) : null;
     return { text, maxQty: Number.isFinite(maxQty) && maxQty > 0 ? maxQty : null };
   });
+}
+
+async function clickSessionTileForModal(page, session, label) {
+  await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 4000);
+  const { tile, selector: tileSel, method: tileMethod } = await findSessionTile(page, session, label);
+  if (!tile) return { tile: null, tileSel, tileMethod, modal: null, rawTileText: null };
+  const rawTileText = await tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => '');
+  console.log(`  [getSessionModalDetails ${label}] clicking tile (${tileMethod})`);
+  await tile.click({ timeout: 10_000 });
+  const modal = await waitForModal(page, label);
+  return { tile, tileSel, tileMethod, modal, rawTileText };
 }
 
 function cookieOverlayFailure(rawTileText, rawModalText) {
@@ -4457,24 +4758,25 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
   console.log(`\n[getSessionModalDetails ${label}] starting`);
 
   await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 4000);
 
   try {
-    const { tile, selector: tileSel, method: tileMethod } = await findSessionTile(page, session, label);
-    if (!tile) {
-      console.log(`  [getSessionModalDetails ${label}] tile not found (${tileSel})`);
+    const firstOpen = await clickSessionTileForModal(page, session, label);
+    if (!firstOpen.tile) {
+      console.log(`  [getSessionModalDetails ${label}] tile not found (${firstOpen.tileSel})`);
       return {
         detailStatus: 'failed_selector',
         failureType: 'failed_selector',
-        detailError: `tile not found (${tileSel})`,
-        failedSelector: tileSel,
+        detailError: `tile not found (${firstOpen.tileSel})`,
+        failedSelector: firstOpen.tileSel,
         rawTileText: ctx.tileText || null,
         rawModalText: null,
         parseReason: 'tile_not_found',
       };
     }
 
-    const rawTileText = await tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => ctx.tileText || '');
-    console.log(`  [getSessionModalDetails ${label}] tile found via ${tileMethod}, text="${rawTileText.slice(0, 80)}"`);
+    const rawTileText = firstOpen.rawTileText || ctx.tileText || '';
+    console.log(`  [getSessionModalDetails ${label}] tile found via ${firstOpen.tileMethod}, text="${rawTileText.slice(0, 80)}"`);
 
     const tileParsed = parseDetailAvailabilityFromText(rawTileText);
     if (tileParsed?.packed) {
@@ -4488,10 +4790,7 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
       return payload;
     }
 
-    console.log(`  [getSessionModalDetails ${label}] clicking tile for modal...`);
-    await tile.click({ timeout: 10_000 });
-
-    const modal = await waitForModal(page, label);
+    let modal = firstOpen.modal;
     if (!modal) {
       console.log(`  [getSessionModalDetails ${label}] abort — modal never appeared`);
       if (tileParsed?.openNoCount) {
@@ -4522,15 +4821,35 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
       console.log(`  [getSessionModalDetails ${label}] modal text read skipped: ${pe.message}`);
     }
 
-    if (isCookieBannerText(rawModalText)) {
+    const bannerStillVisible = await isCookieBannerVisible(page);
+    if (isCookieBannerText(rawModalText) || (bannerStillVisible && !modalTextLooksLikeSessionDetail(rawModalText, session))) {
       console.log(`  [getSessionModalDetails ${label}] cookie overlay detected in modal text`);
       await closeModal(page, label);
       if (cookieRetryAllowed) {
         await dismissCookieBanner(page);
-        await page.waitForTimeout(400);
-        return getSessionModalDetails(page, session, { cookieRetryAllowed: false });
+        await waitForCookieBannerGone(page, 6000);
+        const retryOpen = await clickSessionTileForModal(page, session, label);
+        modal = retryOpen.modal;
+        if (modal) {
+          try {
+            const meta = await readModalText(page, modal);
+            rawModalText = meta.text || '';
+            capacityFromModal = meta.maxQty;
+            cookieDismissDiagnostics.modalTextAfterCookieDismissSample = truncateDetailText(rawModalText, 300);
+          } catch (pe) {
+            console.log(`  [getSessionModalDetails ${label}] retry modal read failed: ${pe.message}`);
+          }
+        }
+        if (!isCookieBannerText(rawModalText) && modalTextLooksLikeSessionDetail(rawModalText, session)) {
+          console.log(`  [getSessionModalDetails ${label}] session modal recovered after cookie dismiss`);
+        } else if (isCookieBannerText(rawModalText)) {
+          return cookieOverlayFailure(rawTileText, rawModalText);
+        } else if (!modal) {
+          return cookieOverlayFailure(rawTileText, rawModalText || 'cookie dismissed but session modal missing');
+        }
+      } else {
+        return cookieOverlayFailure(rawTileText, rawModalText);
       }
-      return cookieOverlayFailure(rawTileText, rawModalText);
     }
 
     const modalParsed = parseDetailAvailabilityFromText(rawModalText);
@@ -4596,10 +4915,6 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
 
     console.log(`  [getSessionModalDetails ${label}] could not parse slots from modal`);
     if (isCookieBannerText(rawModalText)) {
-      if (cookieRetryAllowed) {
-        await dismissCookieBanner(page);
-        return getSessionModalDetails(page, session, { cookieRetryAllowed: false });
-      }
       return cookieOverlayFailure(rawTileText, rawModalText);
     }
 
@@ -5295,8 +5610,11 @@ async function retreatCalendarWeek(page) {
 
 async function navigateToWeekOffset(page, weekOffset) {
   await openBookingPage(page);
+  await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 4000);
   for (let w = 0; w < weekOffset; w++) {
     if (!await advanceCalendarWeek(page)) return false;
+    await dismissCookieBanner(page).catch(() => {});
   }
   return true;
 }
@@ -5492,9 +5810,10 @@ async function launchBrowser({ blockHeavyAssets = false } = {}) {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36',
     timezoneId: BOOKING_TZ,
   });
+  await setupBookingBrowserContext(context);
   const page = await context.newPage();
   if (blockHeavyAssets) await configurePageForSpeed(page);
-  return { browser, page };
+  return { browser, page, context };
 }
 
 async function acquireEnrichmentBrowser() {
@@ -5560,6 +5879,11 @@ async function buildEnrichmentDebugPayload() {
     runsCompleted: enrichmentMetrics.runsCompleted,
     lastRunStats: enrichmentMetrics.lastRunStats,
     recentErrors: enrichmentMetrics.recentErrors.slice(-10),
+    cookieDismissAttempted: cookieDismissDiagnostics.cookieDismissAttempted,
+    cookieDismissSucceeded: cookieDismissDiagnostics.cookieDismissSucceeded,
+    cookieBannerStillVisible: cookieDismissDiagnostics.cookieBannerStillVisible,
+    cookieClickMethod: cookieDismissDiagnostics.cookieClickMethod,
+    modalTextAfterCookieDismissSample: cookieDismissDiagnostics.modalTextAfterCookieDismissSample,
     enrichmentBrowserActive: !!enrichmentBrowserPool?.browser?.isConnected?.(),
     prioritySchedule: {
       p1: { everyMinutes: CHECK_MINS, staleHours: detailStaleMaxAgeHours(1) },
@@ -5571,9 +5895,11 @@ async function buildEnrichmentDebugPayload() {
 }
 
 async function openBookingPage(page) {
+  await dismissCookieBanner(page).catch(() => {});
   await page.goto(BOOKING, { waitUntil: 'networkidle', timeout: 30_000 });
   await page.waitForSelector('.dynamic-cal-booking-ts', { timeout: 15_000 });
   await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 6000);
 }
 
 async function detectAvailableWeeks(page) {
@@ -6349,25 +6675,40 @@ app.post('/api/admin/enrich-date', async (req, res) => {
     await enqueueDateForEnrichment(isoDate, { priority: 1, reason: `admin_enrich_date_${mode}` });
     const waitForResult = req.body?.wait === true || req.query?.wait === 'true';
 
-    const enrichResponseFields = (result) => ({
-      isoDate,
-      mode,
-      sessionsQueued: toProcess.length,
-      sessionsAttempted: result.sessionsAttempted ?? toProcess.length,
-      sessionsUpdatedWithSlots: result.sessionsUpdatedWithSlots ?? 0,
-      sessionsUpdatedWithCapacity: result.sessionsUpdatedWithCapacity ?? 0,
-      sessionsUpdatedWithPrice: result.sessionsUpdatedWithPrice ?? 0,
-      sessionsMarkedPacked: result.sessionsMarkedPacked ?? 0,
-      sessionsCheckedOpenNoSlotsVisible: result.sessionsCheckedOpenNoSlotsVisible ?? result.sessionsCheckedNoSlotsVisible ?? 0,
-      sessionsFailedParse: result.sessionsFailedParse ?? 0,
-      sessionsFailedSelector: result.sessionsFailedSelector ?? 0,
-      sessionsFailedCookieOverlay: result.sessionsFailedCookieOverlay ?? 0,
-      sessionsTimedOut: result.sessionsTimedOut ?? 0,
-      sessionsFailed: result.sessionsFailed ?? 0,
-      topErrors: buildTopDetailErrors(result.errors),
-      errors: result.errors ?? [],
-      skipped: result.skipped ?? false,
-    });
+    const enrichResponseFields = (result) => {
+      const skipped = !!result.skipped;
+      const skipReason = skipped ? (result.skipReason || result.reason || 'unknown_skip') : null;
+      return {
+        isoDate,
+        mode,
+        sessionsQueued: result.sessionsQueued ?? toProcess.length,
+        sessionsAttempted: skipped ? 0 : (result.sessionsAttempted ?? 0),
+        sessionsUpdatedWithSlots: result.sessionsUpdatedWithSlots ?? 0,
+        sessionsUpdatedWithCapacity: result.sessionsUpdatedWithCapacity ?? 0,
+        sessionsUpdatedWithPrice: result.sessionsUpdatedWithPrice ?? 0,
+        sessionsMarkedPacked: result.sessionsMarkedPacked ?? 0,
+        sessionsCheckedOpenNoSlotsVisible: result.sessionsCheckedOpenNoSlotsVisible ?? result.sessionsCheckedNoSlotsVisible ?? 0,
+        sessionsFailedParse: result.sessionsFailedParse ?? 0,
+        sessionsFailedSelector: result.sessionsFailedSelector ?? 0,
+        sessionsFailedCookieOverlay: result.sessionsFailedCookieOverlay ?? 0,
+        sessionsTimedOut: result.sessionsTimedOut ?? 0,
+        sessionsFailed: result.sessionsFailed ?? 0,
+        sessionsUnchanged: result.sessionsUnchanged ?? 0,
+        outcomeTotal: result.outcomeTotal ?? 0,
+        outcomeReconciles: result.outcomeReconciles ?? null,
+        topErrors: buildTopDetailErrors(result.errors),
+        errors: result.errors ?? [],
+        unchangedReasons: result.unchangedReasons ?? [],
+        skipped,
+        skipReason,
+        enrichDateSkipReason: skipReason,
+        cookieDismissAttempted: result.cookieDismissAttempted ?? 0,
+        cookieDismissSucceeded: result.cookieDismissSucceeded ?? 0,
+        cookieBannerStillVisible: result.cookieBannerStillVisible ?? false,
+        cookieClickMethod: result.cookieClickMethod ?? null,
+        modalTextAfterCookieDismissSample: result.modalTextAfterCookieDismissSample ?? null,
+      };
+    };
 
     if (!waitForResult) {
       setImmediate(() => {
@@ -6378,7 +6719,7 @@ app.post('/api/admin/enrich-date', async (req, res) => {
         }).catch(console.error);
       });
       return res.json({
-        ...enrichResponseFields({ sessionsAttempted: 0, errors: [] }),
+        ...enrichResponseFields({ skipped: false, sessionsQueued: toProcess.length, sessionsAttempted: 0, errors: [] }),
         queued: true,
       });
     }

@@ -140,15 +140,16 @@ curl -s http://localhost:3000/api/debug/session/<session_key> | jq '{parseResult
 ```bash
 curl -s -X POST http://localhost:3000/api/admin/enrich-date \
   -H 'Content-Type: application/json' \
-  -d '{"isoDate":"2026-06-29","mode":"failed_first","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedOpenNoSlotsVisible,sessionsFailedParse,sessionsFailedSelector,sessionsFailedCookieOverlay,sessionsTimedOut,topErrors}'
+  -d '{"isoDate":"2026-06-29","mode":"failed_first","wait":true}' | jq '{skipped,skipReason,sessionsQueued,sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedOpenNoSlotsVisible,sessionsFailedCookieOverlay,sessionsFailedParse,sessionsFailedSelector,sessionsUnchanged,outcomeReconciles,cookieDismissAttempted,cookieDismissSucceeded,cookieBannerStillVisible,cookieClickMethod,topErrors,unchangedReasons}'
 ```
 
 4. Confirm `failedDetailsSample`, `unknownDetailsSample`, and `failedCookieOverlaySample` explain tile/modal/selector/cookie failures with parsed fields.
 5. Confirm attempted rows no longer stay `unknown` (`detail_check_ran_but_status_not_recorded` should disappear).
-6. Confirm `sessionsWithSlotsCount` increases after parser/tile fixes when re-running enrich-date with `mode: failed_first`.
-7. Confirm packed sessions get `slots_available = 0` and `detail_status = checked_packed`.
-8. Confirm a failed retry does not wipe previously known slot counts.
-9. Confirm cards show booked line (`8/12 booked · 4 spots left`), `Packed`, or `Open · details pending/unavailable`.
+6. Confirm `sessionsWithSlotsCount` increases after cookie handling + enrich-date with `mode: failed_first`; if cookie overlay persists, `sessionsFailedCookieOverlay > 0` with `cookieBannerStillVisible: true`.
+7. Confirm enrich-date never returns `sessionsAttempted > 0` with all outcome counters 0, `errors: []`, and `skipped: true` without `skipReason`.
+8. Confirm packed sessions get `slots_available = 0` and `detail_status = checked_packed`.
+9. Confirm a failed retry does not wipe previously known slot counts.
+10. Confirm cards show booked line (`8/12 booked · 4 spots left`), `Packed`, or `Open · details pending/unavailable`.
 
 ---
 
