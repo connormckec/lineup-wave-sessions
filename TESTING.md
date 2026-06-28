@@ -87,6 +87,12 @@ curl -s http://localhost:3000/api/status | jq '{detailCoveragePercent, sessionsW
 curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{sessionsCount, sessionsWithSlotsCount, sessionsWithCapacityCount, sessionsWithPriceCount, detailStatusSummary, latestLastDetailedCheckAt, sampleSessions}'
 ```
 
+3b. **Enrichment worker health:**
+
+```bash
+curl -s http://localhost:3000/api/debug/enrichment | jq '{queuePending, queueRunning, sessionsMissingSlots, sessionsMissingPrice, sessionsWithStaleDetails, lastDetailEnrichmentAt, lastRunDurationMs, averageEnrichmentDurationMs, enrichmentBrowserActive, prioritySchedule, recentErrors}'
+```
+
 4. **Force enrichment:**
 
 ```bash
@@ -99,8 +105,9 @@ curl -s -X POST http://localhost:3000/api/admin/enrich-date \
 6. Repeat for `2026-07-10`.
 7. Confirm today/tomorrow still show detailed counts after Tier 1 refresh.
 8. Confirm future sessions remain visible when details are pending (not hidden).
-9. Confirm `availability_snapshots` rows include `snapshot_type` `basic` and `detailed`.
+9. Confirm `availability_snapshots` rows include `snapshot_type` `basic` and `detailed`, plus `hour` for heat-map analytics.
 10. Confirm app loads saved data immediately on hard refresh.
+11. Confirm every session card shows **Updated Xm ago** from `last_detailed_check_at` or `last_basic_check_at`.
 
 ---
 

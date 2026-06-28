@@ -90,20 +90,25 @@ Two scrape levels run in parallel:
 
 - Saved/basic sessions render immediately — enrichment never blocks the UI.
 - Basic scrapes **never overwrite** detailed slot/capacity/price fields with null.
-- Opening a date in Browse enqueues background enrichment for that date.
-- `POST /api/admin/enrich-date` with `{ "isoDate": "2026-07-02" }` forces detail collection for a date.
+- Browse reads saved Supabase data only — **no frontend-triggered scraping**. The selected date is used only to raise background enrichment priority.
+- Detail enrichment runs only when data is missing, stale, watched, within 48h, or a basic scrape detected an availability change.
+- `POST /api/admin/enrich-date` with `{ "isoDate": "2026-07-02" }` forces detail collection for a date (admin only).
 
 **Schedule:**
 
-| Priority | Coverage | Frequency |
-|----------|----------|-----------|
-| P1 | Watched, selected date, today/tomorrow, next 48h | Every `CHECK_EVERY_MINS` (default 5 min) |
+| Priority | Coverage | Detail check frequency |
+|----------|----------|------------------------|
+| P1 | Watched, selected date, today/tomorrow, next 48h | Every `CHECK_EVERY_MINS` (default 5 min), offset from Tier 1 |
 | P2 | Next 7 days | Every `ENRICHMENT_TIER2_EVERY_MINS` (default 45 min) |
-| P3 | Weeks 2–4 | Every 6 hours (with Tier 3 scrape) |
+| P3 | Weeks 2–3 | Every `ENRICHMENT_TIER3_STALE_HOURS` (default 12 h); basic Tier 3 scrape every 6 h |
+
+**Optimizations:** persistent enrichment browser (reused Chromium context), week-grouped navigation, network JSON preferred over modals, images/fonts/media blocked during enrichment, per-session upsert + `availability_snapshots` insert.
+
+**Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors.
 
 **Status fields:** `detailCoveragePercent`, `sessionsWithSlotsCount`, `sessionsWithCapacityCount`, `sessionsWithPriceCount`, `enrichmentQueuePending`, `detailEnrichmentInProgress`, `lastDetailEnrichmentAt`.
 
-**Railway:** Disable App Sleep / Serverless sleep so background scrapes and enrichment run on schedule. Playwright/Chromium is CPU-heavy — consider a dedicated worker service or upgraded compute if enrichment is slow.
+**Railway:** Disable App Sleep / Serverless sleep so background scrapes and enrichment run on schedule. Playwright/Chromium is CPU-heavy — **split into web/API + background worker services** when possible, and increase CPU/memory if enrichment is slow.
 
 See [`AUDIT.md`](AUDIT.md) for schema columns (`detail_status`, `last_detailed_check_at`, `session_enrichment_queue`).
 
@@ -143,6 +148,11 @@ localStorage caches the watchlist as a fallback. On startup the app loads Lineup
 | `SUPABASE_URL` | — | Supabase project URL (server only) |
 | `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase service role key (server only) |
 | `CHECK_EVERY_MINS` | `5` | Tier 1 scrape interval |
+| `ENRICHMENT_TIER2_EVERY_MINS` | `45` | P2 detail enrichment interval |
+| `ENRICHMENT_TIER3_STALE_HOURS` | `12` | P3 detail enrichment interval |
+| `DETAIL_ENRICH_MAX_PER_RUN` | `25` | Max sessions per enrichment run |
+| `ENRICHMENT_DELAY_MS` | `350` | Pause between modal/network detail checks |
+| `ENRICHMENT_BROWSER_IDLE_MS` | `300000` | Close idle enrichment browser after 5 min |
 | `HISTORY_SNAPSHOTS` | `true` | Set `false` to disable `availability_snapshots` inserts |
 | `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder demo only — shows **Demo Alerts** in Settings and enables ntfy testing |
 | `NTFY_TOPIC` | — | Optional server fallback when internal beta is on |

@@ -1623,10 +1623,17 @@ function daysFromTodayKey(dateKey) {
   return Math.round((d - today) / 86_400_000);
 }
 
+function sessionUpdatedAt(s) {
+  return s.lastDetailedCheckAt || s.last_detailed_check_at
+    || s.lastBasicCheckAt || s.last_basic_check_at
+    || s.lastScraped || null;
+}
+
 function freshnessLabel(s) {
-  if (!s.lastScraped) return '';
-  if (daysFromTodayKey(s.dateKey) <= 1) return '';
-  const mins = Math.round((Date.now() - new Date(s.lastScraped)) / 60_000);
+  const updated = sessionUpdatedAt(s);
+  if (!updated) return '';
+  const mins = Math.round((Date.now() - new Date(updated)) / 60_000);
+  if (mins < 1) return 'Updated just now';
   if (mins < 60) return `Updated ${mins}m ago`;
   const hrs = Math.round(mins / 60);
   if (hrs < 24) return `Updated ${hrs}h ago`;

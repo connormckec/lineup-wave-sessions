@@ -67,6 +67,7 @@ create table if not exists availability_snapshots (
   start_ts bigint,
   start_time text,
   weekday text,
+  hour smallint,
   wave_side text,
   session_type text,
   available boolean,
@@ -229,6 +230,7 @@ alter table availability_snapshots add column if not exists price_min numeric;
 alter table availability_snapshots add column if not exists price_max numeric;
 alter table availability_snapshots add column if not exists currency text default 'USD';
 alter table availability_snapshots add column if not exists snapshot_type text default 'basic';
+alter table availability_snapshots add column if not exists hour smallint;
 
 alter table scrape_runs add column if not exists coverage_percent integer;
 

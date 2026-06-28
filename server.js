@@ -47,6 +47,10 @@ const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || 
 const DETAIL_ENRICH_MAX_PER_RUN = parseInt(process.env.DETAIL_ENRICH_MAX_PER_RUN || '25', 10);
 const ENRICHMENT_STALE_HOURS = parseInt(process.env.ENRICHMENT_STALE_HOURS || '6', 10);
 const ENRICHMENT_TIER2_EVERY_MINS = parseInt(process.env.ENRICHMENT_TIER2_EVERY_MINS || '45', 10);
+const ENRICHMENT_TIER3_STALE_HOURS = parseInt(process.env.ENRICHMENT_TIER3_STALE_HOURS || '12', 10);
+const ENRICHMENT_DELAY_MS = parseInt(process.env.ENRICHMENT_DELAY_MS || '350', 10);
+const ENRICHMENT_BROWSER_IDLE_MS = parseInt(process.env.ENRICHMENT_BROWSER_IDLE_MS || '300000', 10);
+const ENRICHMENT_P1_OFFSET_MS = parseInt(process.env.ENRICHMENT_P1_OFFSET_MS || '120000', 10);
 const SCRAPE_WEEKS_AHEAD = parseInt(process.env.SCRAPE_WEEKS_AHEAD || '4', 10);
 const SUPABASE_URL              = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -90,6 +94,18 @@ let enrichmentQueuePendingCount = 0;
 let enrichmentQueueRunningCount = 0;
 let fallbackAvailableCached = false;
 const enrichmentQueueMemory = new Map();
+const sessionsNeedingDetailAfterBasic = new Set();
+let enrichmentBrowserPool = null;
+let enrichmentBrowserLastUsed = 0;
+let enrichmentNetworkCapture = null;
+const enrichmentMetrics = {
+  lastRunAt: null,
+  lastDurationMs: null,
+  lastRunStats: null,
+  recentErrors: [],
+  runsCompleted: 0,
+  averageDurationMs: null,
+};
 let hasFreshScrapeThisBoot = false;
 let dataSource = 'memory';
 let supabaseConfigured = false;
@@ -1574,11 +1590,58 @@ function sessionHasDetailedData(s) {
 }
 
 function sessionNeedsDetailEnrichment(s, maxAgeHours = ENRICHMENT_STALE_HOURS) {
-  if (!s?.available || !s.key) return false;
+  if (!s?.key) return false;
+  const watchKeys = watchedSessionKeys();
+  if (!s.available && !watchKeys.has(s.key)) return false;
   if (!sessionHasDetailedData(s)) return true;
   if (!s.lastDetailedCheckAt) return true;
   const ageMs = Date.now() - new Date(s.lastDetailedCheckAt).getTime();
   return ageMs > maxAgeHours * 3_600_000;
+}
+
+function detailStaleMaxAgeHours(priority) {
+  if (priority === 1) return Math.max(CHECK_MINS / 60, 5 / 60);
+  if (priority === 2) return Math.max(ENRICHMENT_TIER2_EVERY_MINS / 60, 0.75);
+  return ENRICHMENT_TIER3_STALE_HOURS;
+}
+
+function sessionQualifiesForDetailEnrichment(s, { availabilityChanged = false, force = false } = {}) {
+  if (!s?.key) return false;
+  if (force) return s.available !== false;
+  const watchKeys = watchedSessionKeys();
+  const priority = enrichmentPriorityForSession(s);
+  const days = daysFromToday(s.isoDate || s.dateKey || todayDateKey());
+
+  if (!s.available && !watchKeys.has(s.key)) return false;
+  if (availabilityChanged || sessionsNeedingDetailAfterBasic.has(s.key)) return true;
+  if (watchKeys.has(s.key)) return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+  if (days <= 2) return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+  if (!sessionHasDetailedData(s)) return true;
+  return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority));
+}
+
+function sessionHourFromSession(s) {
+  if (s?.time) {
+    const m = String(s.time).match(/(\d{1,2})/);
+    if (m) return parseInt(m[1], 10);
+  }
+  if (s?.ts) {
+    try {
+      return new Date(Number(s.ts) * 1000).getHours();
+    } catch {}
+  }
+  return null;
+}
+
+function groupSessionsByWeekOffset(sessions) {
+  const groups = new Map();
+  for (const s of asSessionArray(sessions)) {
+    const dk = s.isoDate || s.dateKey;
+    const wo = Math.max(0, Math.floor(daysFromToday(dk || todayDateKey()) / 7));
+    if (!groups.has(wo)) groups.set(wo, []);
+    groups.get(wo).push(s);
+  }
+  return [...groups.entries()].sort((a, b) => a[0] - b[0]);
 }
 
 function enrichmentPriorityForSession(s) {
@@ -1633,7 +1696,7 @@ function detailCoverageStats() {
   const withSlots = all.filter(s => s.slots != null);
   const withCapacity = all.filter(s => s.capacity != null);
   const withPrice = all.filter(s => s.priceText || s.priceMin != null);
-  const needing = all.filter(s => sessionNeedsDetailEnrichment(s));
+  const needing = all.filter(s => sessionQualifiesForDetailEnrichment(s));
   const total = all.length || 1;
   return {
     sessionsWithSlotsCount: withSlots.length,
@@ -1709,6 +1772,7 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
         { inferCapacityFromLevel: snapshotType === 'detailed' && s.slots != null },
       );
       const type = snapshotType === 'detailed' || sessionHasDetailedData(s) ? 'detailed' : 'basic';
+      const hour = sessionHourFromSession(s);
       return {
         scraped_at: scrapedAt,
         park: PARK,
@@ -1717,6 +1781,7 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
         start_ts: s.ts,
         start_time: s.time,
         weekday: s.weekday || null,
+        hour,
         wave_side: s.waveSide || null,
         session_type: s.level,
         available: s.available,
@@ -1757,7 +1822,7 @@ function installBookingNetworkCapture(page) {
   page.on('response', async (response) => {
     try {
       const url = response.url();
-      if (!/atlanticparksurf|wave7|booking|activity|agenda/i.test(url)) return;
+      if (!/atlanticparksurf|wave7|booking|activity|agenda|session|slot|calendar|api/i.test(url)) return;
       const ct = (response.headers()['content-type'] || '').toLowerCase();
       if (!ct.includes('json')) return;
       const body = await response.text();
@@ -1791,8 +1856,11 @@ function deepFindSessionDetails(node, ts, depth = 0) {
   const matchesTs = candidates.some(v => v === tsMs || v === tsSec || v * 1000 === tsMs);
 
   const slots = node.slotsAvailable ?? node.slots_available ?? node.availableSlots
-    ?? node.remainingSlots ?? node.remaining ?? node.qty ?? node.quantity ?? null;
-  const capacity = node.capacity ?? node.maxCapacity ?? node.maxQty ?? node.max ?? null;
+    ?? node.remainingSlots ?? node.remaining ?? node.qty ?? node.quantity
+    ?? node.placesAvailable ?? node.places_available ?? node.spotsRemaining
+    ?? node.spots_remaining ?? node.availablePlaces ?? null;
+  const capacity = node.capacity ?? node.maxCapacity ?? node.maxQty ?? node.max
+    ?? node.totalCapacity ?? node.total_capacity ?? null;
 
   if (matchesTs && (slots != null || capacity != null)) {
     const priceRaw = node.priceText || node.price_text || node.price || '';
@@ -1862,7 +1930,7 @@ async function refreshEnrichmentQueueCounts() {
 
 async function enqueueSessionsForEnrichment(sessionsToQueue, { priority = 2, reason = 'auto' } = {}) {
   const items = asSessionArray(sessionsToQueue)
-    .filter(s => s?.key && s.available && sessionNeedsDetailEnrichment(s))
+    .filter(s => s?.key && sessionQualifiesForDetailEnrichment(s))
     .map(s => ({
       park: PARK,
       session_key: s.key,
@@ -1921,7 +1989,7 @@ async function pickSessionsForDetailEnrichment({ priority = null, isoDate = null
       .slice(0, limit);
   }
 
-  let candidates = allStoredSessions().filter(s => sessionNeedsDetailEnrichment(s));
+  let candidates = allStoredSessions().filter(s => sessionQualifiesForDetailEnrichment(s));
   if (priority != null) {
     candidates = candidates.filter(s => enrichmentPriorityForSession(s) === priority);
   }
@@ -1996,6 +2064,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     return { skipped: true, reason: 'busy' };
   }
 
+  const runStarted = Date.now();
   const stats = {
     isoDate: isoDate || null,
     sessionsAttempted: 0,
@@ -2005,7 +2074,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     errors: [],
   };
 
-  let launched;
+  let keepBrowser = false;
   try {
     const toEnrich = explicitSessions?.length
       ? asSessionArray(explicitSessions).slice(0, DETAIL_ENRICH_MAX_PER_RUN)
@@ -2017,77 +2086,98 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
     console.log(`\n[${new Date().toLocaleTimeString()}] Detail enrichment (${reason}): ${toEnrich.length} session(s)`);
 
-    launched = await launchBrowser();
-    const { page } = launched;
-    const networkCapture = installBookingNetworkCapture(page);
+    const { page } = await acquireEnrichmentBrowser();
+    const networkCapture = enrichmentNetworkCapture;
     await openBookingPage(page);
 
-    const updatedSessions = [];
+    const weekGroups = groupSessionsByWeekOffset(toEnrich);
+    let currentWeek = null;
 
-    for (const s of toEnrich) {
-      stats.sessionsAttempted++;
-      await markQueueItemStatus(s.key, 'running', { incrementAttempt: true });
+    for (const [weekOffset, sessionsInWeek] of weekGroups) {
+      if (currentWeek !== weekOffset) {
+        await navigateToWeekOffset(page, weekOffset);
+        currentWeek = weekOffset;
+        await page.waitForTimeout(300);
+      }
 
-      const entry = { ...sessionsByKey.get(s.key), ...s };
-      entry.detailStatus = 'checking';
-      sessionsByKey.set(s.key, entry);
+      for (const s of sessionsInWeek) {
+        stats.sessionsAttempted++;
+        await markQueueItemStatus(s.key, 'running', { incrementAttempt: true });
 
-      try {
-        await navigateToSessionDate(page, s.isoDate || s.dateKey);
-        await page.waitForTimeout(400);
+        const entry = { ...sessionsByKey.get(s.key), ...s };
+        entry.detailStatus = 'checking';
+        sessionsByKey.set(s.key, entry);
+        sessionsNeedingDetailAfterBasic.delete(s.key);
 
-        const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
-        if (!details) {
-          stats.errors.push({ session_key: s.key, error: 'no_details' });
+        try {
+          const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
+          if (!details) {
+            stats.errors.push({ session_key: s.key, error: 'no_details' });
+            entry.detailStatus = sessionHasDetailedData(entry) ? 'checked' : 'failed';
+            entry.detailError = entry.detailError || 'no_details';
+            await markQueueItemStatus(s.key, 'pending', { error: 'no_details' });
+            enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), session_key: s.key, error: 'no_details' });
+            continue;
+          }
+
+          const hadSlots = entry.slots != null;
+          const hadCapacity = entry.capacity != null;
+          const hadPrice = entry.priceText != null || entry.priceMin != null;
+
+          applyDetailPayloadToSession(entry, details, s.level);
+          sessionsByKey.set(s.key, entry);
+
+          if (!hadSlots && entry.slots != null) stats.sessionsUpdatedWithSlots++;
+          if (!hadCapacity && entry.capacity != null) stats.sessionsUpdatedWithCapacity++;
+          if (!hadPrice && (entry.priceText || entry.priceMin != null)) stats.sessionsUpdatedWithPrice++;
+
+          await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
+          await saveAvailabilitySnapshotsToSupabase([entry], 0, { snapshotType: 'detailed' });
+
+          await markQueueItemStatus(s.key, 'done');
+          await page.waitForTimeout(ENRICHMENT_DELAY_MS);
+        } catch (e) {
+          stats.errors.push({ session_key: s.key, error: e.message });
           entry.detailStatus = sessionHasDetailedData(entry) ? 'checked' : 'failed';
-          entry.detailError = entry.detailError || 'no_details';
-          await markQueueItemStatus(s.key, 'pending', { error: 'no_details' });
-          continue;
+          entry.detailError = e.message;
+          sessionsByKey.set(s.key, entry);
+          await markQueueItemStatus(s.key, 'pending', { error: e.message });
+          enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), session_key: s.key, error: e.message });
         }
-
-        const hadSlots = entry.slots != null;
-        const hadCapacity = entry.capacity != null;
-        const hadPrice = entry.priceText != null || entry.priceMin != null;
-
-        applyDetailPayloadToSession(entry, details, s.level);
-        sessionsByKey.set(s.key, entry);
-        updatedSessions.push(entry);
-
-        if (!hadSlots && entry.slots != null) stats.sessionsUpdatedWithSlots++;
-        if (!hadCapacity && entry.capacity != null) stats.sessionsUpdatedWithCapacity++;
-        if (!hadPrice && (entry.priceText || entry.priceMin != null)) stats.sessionsUpdatedWithPrice++;
-
-        await markQueueItemStatus(s.key, 'done');
-        await page.waitForTimeout(250);
-      } catch (e) {
-        stats.errors.push({ session_key: s.key, error: e.message });
-        entry.detailStatus = sessionHasDetailedData(entry) ? 'checked' : 'failed';
-        entry.detailError = e.message;
-        sessionsByKey.set(s.key, entry);
-        await markQueueItemStatus(s.key, 'pending', { error: e.message });
       }
     }
 
     rebuildSessionsArray();
-
-    if (updatedSessions.length) {
-      await upsertCurrentSessionsToSupabase(updatedSessions, 0, { scrapeKind: 'detailed' });
-      await saveAvailabilitySnapshotsToSupabase(updatedSessions, 0, { snapshotType: 'detailed' });
-      if (supabase) await loadCurrentSessionsFromSupabase({ reloadMeta: false });
-    }
+    keepBrowser = true;
+    enrichmentBrowserLastUsed = Date.now();
+    scheduleEnrichmentBrowserIdleClose();
 
     lastDetailEnrichmentAt = new Date().toISOString();
-    lastDetailEnrichmentError = null;
-    console.log(`  detail enrichment done: ${stats.sessionsUpdatedWithSlots} slots, ${stats.sessionsUpdatedWithCapacity} capacity, ${stats.sessionsUpdatedWithPrice} price`);
+    lastDetailEnrichmentError = stats.errors.length ? `${stats.errors.length} session error(s)` : null;
+    const durationMs = Date.now() - runStarted;
+    enrichmentMetrics.lastRunAt = lastDetailEnrichmentAt;
+    enrichmentMetrics.lastDurationMs = durationMs;
+    enrichmentMetrics.lastRunStats = { ...stats };
+    enrichmentMetrics.runsCompleted += 1;
+    enrichmentMetrics.averageDurationMs = enrichmentMetrics.averageDurationMs == null
+      ? durationMs
+      : Math.round((enrichmentMetrics.averageDurationMs * (enrichmentMetrics.runsCompleted - 1) + durationMs) / enrichmentMetrics.runsCompleted);
+    if (enrichmentMetrics.recentErrors.length > 50) {
+      enrichmentMetrics.recentErrors = enrichmentMetrics.recentErrors.slice(-50);
+    }
+
+    console.log(`  detail enrichment done (${durationMs}ms): ${stats.sessionsUpdatedWithSlots} slots, ${stats.sessionsUpdatedWithCapacity} capacity, ${stats.sessionsUpdatedWithPrice} price`);
     return stats;
   } catch (e) {
     lastDetailEnrichmentError = e.message;
     stats.errors.push({ error: e.message });
+    enrichmentMetrics.recentErrors.push({ at: new Date().toISOString(), error: e.message });
     console.error('  detail enrichment failed:', e.message);
+    await releaseEnrichmentBrowserPool();
     return stats;
   } finally {
     releaseDetailEnrichmentLock();
-    if (launched?.browser) await launched.browser.close().catch(() => {});
+    if (!keepBrowser) await releaseEnrichmentBrowserPool();
     await refreshEnrichmentQueueCounts();
   }
 }
@@ -3787,6 +3877,12 @@ function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
     if (!sessionHasDetailedData(merged) && merged.detailStatus !== 'checking') {
       merged.detailStatus = merged.detailStatus || (existing?.detailStatus === 'checked' ? 'checked' : 'pending');
     }
+    if (existing && existing.available !== merged.available) {
+      sessionsNeedingDetailAfterBasic.add(raw.key);
+    } else if (existing && existing.available && merged.available
+      && existing.slots != null && merged.slots != null && existing.slots !== merged.slots) {
+      sessionsNeedingDetailAfterBasic.add(raw.key);
+    }
     sessionsByKey.set(raw.key, merged);
     updatedKeys.push(raw.key);
     logWaveSideParse(merged);
@@ -3796,7 +3892,17 @@ function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
   return updatedKeys;
 }
 
-async function launchBrowser() {
+async function configurePageForSpeed(page) {
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'font', 'media'].includes(type)) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+}
+
+async function launchBrowser({ blockHeavyAssets = false } = {}) {
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
@@ -3806,7 +3912,81 @@ async function launchBrowser() {
     timezoneId: BOOKING_TZ,
   });
   const page = await context.newPage();
+  if (blockHeavyAssets) await configurePageForSpeed(page);
   return { browser, page };
+}
+
+async function acquireEnrichmentBrowser() {
+  if (enrichmentBrowserPool?.browser?.isConnected?.()) {
+    enrichmentBrowserLastUsed = Date.now();
+    if (!enrichmentNetworkCapture) {
+      enrichmentNetworkCapture = installBookingNetworkCapture(enrichmentBrowserPool.page);
+    }
+    return enrichmentBrowserPool;
+  }
+  if (enrichmentBrowserPool?.browser) {
+    await enrichmentBrowserPool.browser.close().catch(() => {});
+  }
+  const launched = await launchBrowser({ blockHeavyAssets: true });
+  enrichmentBrowserPool = launched;
+  enrichmentBrowserLastUsed = Date.now();
+  enrichmentNetworkCapture = installBookingNetworkCapture(launched.page);
+  return enrichmentBrowserPool;
+}
+
+async function releaseEnrichmentBrowserPool() {
+  if (!enrichmentBrowserPool?.browser) return;
+  try {
+    await enrichmentBrowserPool.browser.close();
+  } catch {}
+  enrichmentBrowserPool = null;
+  enrichmentNetworkCapture = null;
+}
+
+function scheduleEnrichmentBrowserIdleClose() {
+  setTimeout(async () => {
+    if (!enrichmentBrowserPool) return;
+    if (Date.now() - enrichmentBrowserLastUsed >= ENRICHMENT_BROWSER_IDLE_MS) {
+      await releaseEnrichmentBrowserPool();
+    }
+  }, ENRICHMENT_BROWSER_IDLE_MS + 1000);
+}
+
+async function buildEnrichmentDebugPayload() {
+  await refreshEnrichmentQueueCounts();
+  const all = allStoredSessions();
+  const stale = all.filter(s => sessionQualifiesForDetailEnrichment(s));
+  const missingSlots = all.filter(s => s.available && s.slots == null);
+  const missingPrice = all.filter(s => s.available && !s.priceText && s.priceMin == null);
+  const stats = detailCoverageStats();
+
+  return {
+    queuePending: enrichmentQueuePendingCount,
+    queueRunning: enrichmentQueueRunningCount,
+    lastDetailEnrichmentAt: lastDetailEnrichmentAt,
+    lastDetailEnrichmentError: lastDetailEnrichmentError,
+    detailEnrichmentInProgress,
+    sessionsNeedingDetail: stale.length,
+    sessionsMissingSlots: missingSlots.length,
+    sessionsMissingPrice: missingPrice.length,
+    sessionsWithStaleDetails: stale.length,
+    detailCoveragePercent: stats.detailCoveragePercent,
+    sessionsWithSlotsCount: stats.sessionsWithSlotsCount,
+    sessionsWithCapacityCount: stats.sessionsWithCapacityCount,
+    sessionsWithPriceCount: stats.sessionsWithPriceCount,
+    lastRunDurationMs: enrichmentMetrics.lastDurationMs,
+    averageEnrichmentDurationMs: enrichmentMetrics.averageDurationMs,
+    runsCompleted: enrichmentMetrics.runsCompleted,
+    lastRunStats: enrichmentMetrics.lastRunStats,
+    recentErrors: enrichmentMetrics.recentErrors.slice(-10),
+    enrichmentBrowserActive: !!enrichmentBrowserPool?.browser?.isConnected?.(),
+    prioritySchedule: {
+      p1: { everyMinutes: CHECK_MINS, staleHours: detailStaleMaxAgeHours(1) },
+      p2: { everyMinutes: ENRICHMENT_TIER2_EVERY_MINS, staleHours: detailStaleMaxAgeHours(2) },
+      p3: { everyHours: ENRICHMENT_TIER3_STALE_HOURS, tier3ScrapeEveryHours: 6 },
+    },
+    pendingAfterBasicChange: sessionsNeedingDetailAfterBasic.size,
+  };
 }
 
 async function openBookingPage(page) {
@@ -3926,7 +4106,7 @@ async function runTierScrape(tier) {
       { snapshotType: cfg.slotCounts ? 'detailed' : 'basic' },
     );
     if (!cfg.slotCounts) {
-      const needing = merged.filter(sessionNeedsDetailEnrichment);
+      const needing = merged.filter(s => sessionQualifiesForDetailEnrichment(s));
       if (needing.length) {
         await enqueueSessionsForEnrichment(needing, {
           priority: tier === 2 ? 2 : 3,
@@ -4068,6 +4248,7 @@ app.get('/api/sessions', async (req, res) => {
   const isoDate = normalizeIsoDateParam(req.query.date || req.query.iso_date || req.query.isoDate);
 
   if (isoDate) {
+    lastRequestedDateForEnrichment = isoDate;
     try {
       const payload = await buildSessionsForDatePayload(isoDate);
       res.json(payload);
@@ -4124,6 +4305,16 @@ app.get('/api/debug/coverage', async (_req, res) => {
   try {
     await ensureSessionsForStatus();
     const payload = await buildCoverageDebugPayload();
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/debug/enrichment', async (_req, res) => {
+  try {
+    await ensureSessionsForStatus();
+    const payload = await buildEnrichmentDebugPayload();
     res.json(payload);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4582,13 +4773,13 @@ function bootstrapInBackground() {
 }
 
 cron.schedule(`*/${CHECK_MINS} * * * *`, () => runTierScrape(1).catch(console.error));
-cron.schedule(`*/${CHECK_MINS} * * * *`, () => runDetailEnrichmentByPriority(1).catch(console.error));
+cron.schedule(`*/${CHECK_MINS} * * * *`, () => {
+  setTimeout(() => runDetailEnrichmentByPriority(1).catch(console.error), ENRICHMENT_P1_OFFSET_MS);
+});
 cron.schedule('*/30 * * * *', () => runTierScrape(2).catch(console.error));
 cron.schedule(`*/${ENRICHMENT_TIER2_EVERY_MINS} * * * *`, () => runDetailEnrichmentByPriority(2).catch(console.error));
-cron.schedule('0 */6 * * *', () => {
-  runTierScrape(3).catch(console.error);
-  setTimeout(() => runDetailEnrichmentByPriority(3).catch(console.error), 90_000);
-});
+cron.schedule('0 */6 * * *', () => runTierScrape(3).catch(console.error));
+cron.schedule('0 */12 * * *', () => runDetailEnrichmentByPriority(3).catch(console.error));
 cron.schedule('0 0 * * *', () => {
   detectWeeksOnStartup()
     .then(() => runTierScrape(4))
@@ -4604,10 +4795,11 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`\nAP Session Watcher running on :${PORT}`);
     console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
-    console.log(`Detail enrichment P1 (watched/today/selected): every ${CHECK_MINS} min`);
+    console.log(`Detail enrichment P1 (watched/today/selected/48h): every ${CHECK_MINS} min (offset ${Math.round(ENRICHMENT_P1_OFFSET_MS / 1000)}s)`);
     console.log('Tier 2 (this week):              every 30 min');
     console.log(`Detail enrichment P2 (next 7 days): every ${ENRICHMENT_TIER2_EVERY_MINS} min`);
-    console.log('Tier 3 (weeks 2–3):              every 6 hours (+ detail P3)');
+    console.log('Tier 3 (weeks 2–3):              every 6 hours');
+    console.log(`Detail enrichment P3 (weeks 2–3): every ${ENRICHMENT_TIER3_STALE_HOURS} hours`);
     console.log('Tier 4 (weeks 4+):               daily at midnight');
     console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
     if (supabaseConfigured) {
