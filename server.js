@@ -3,6 +3,7 @@ const express  = require('express');
 const { chromium } = require('playwright');
 const cron     = require('node-cron');
 const path     = require('path');
+const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
 
@@ -14,6 +15,7 @@ const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
+const APP_URL    = process.env.APP_URL || BOOKING;
 const CHECK_MINS      = parseInt(process.env.CHECK_EVERY_MINS || '5', 10);
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
@@ -38,7 +40,8 @@ const TIER_CONFIG = {
 // ── In-memory state (persists while the server is running) ───────────────────
 let sessions      = [];   // merged view served via API
 const sessionsByKey = new Map();
-let watchList     = [];   // [{id, key, ts, wave, level, time, date, dayLabel}]
+let watchItems      = [];   // active watchlist rows (all users), synced from Supabase
+const lastAlertState = new Map(); // `${userKey}:${sessionKey}:${eventType}` -> { slots, available, at }
 let history       = {};   // {key: {available, slots}} — for change detection
 let slotCache     = {};   // {key: {slots, available, lastCheckedCycle}}
 let slotCheckDeferrals = new Set();
@@ -318,29 +321,254 @@ function withScrapeLock(fn) {
 }
 
 // ── Push notification via Ntfy.sh ────────────────────────────────────────────
-async function push(title, body, urgent = false) {
-  if (!TOPIC) {
-    console.log(`[push — no topic set] ${title}`);
-    return;
-  }
+async function sendNtfy(topic, title, body, { urgent = false, clickUrl = APP_URL } = {}) {
+  const cleanTopic = (topic || '').trim();
+  if (!cleanTopic) return { ok: false, error: 'no topic' };
   try {
-    const r = await fetch(`https://ntfy.sh/${TOPIC}`, {
+    const r = await fetch(`https://ntfy.sh/${encodeURIComponent(cleanTopic)}`, {
       method: 'POST',
       headers: {
-        Title:    title,
+        Title: title,
         Priority: urgent ? 'urgent' : 'high',
-        Tags:     urgent ? 'wave,exclamation' : 'wave,tada',
-        Click:    BOOKING,
+        Tags: urgent ? 'wave,exclamation' : 'wave',
+        Click: clickUrl,
       },
       body,
     });
-    console.log(`📲  "${title}" → ntfy ${r.status}`);
+    return { ok: r.ok, status: r.status, error: r.ok ? null : `HTTP ${r.status}` };
   } catch (e) {
-    console.error('ntfy error:', e.message);
+    return { ok: false, error: e.message };
   }
 }
 
-const MAX_SLOT_CLICKS = 30; // safety ceiling only — actual max comes from the booking UI
+function activeWatchItems() {
+  return watchItems.filter(w => w.active !== false);
+}
+
+function watchedSessionKeys() {
+  return new Set(activeWatchItems().map(w => w.session_key));
+}
+
+function watchItemToClient(w) {
+  const wave = w.wave ?? (w.session_key?.includes('_') ? +w.session_key.split('_').pop() : null);
+  return {
+    id: w.id,
+    key: w.session_key,
+    session_key: w.session_key,
+    user_key: w.user_key,
+    ntfy_topic: w.ntfy_topic,
+    ts: w.start_ts,
+    wave,
+    level: w.session_type,
+    session_type: w.session_type,
+    wave_side: w.wave_side,
+    iso_date: w.iso_date,
+    time: w.time || w.start_time,
+    date: w.date || w.display_date,
+    dayLabel: w.day_label,
+    alert_when_opens: w.alert_when_opens !== false,
+    alert_when_low_slots: w.alert_when_low_slots !== false,
+    low_slots_threshold: w.low_slots_threshold ?? THRESH,
+  };
+}
+
+function watchlistForUser(userKey) {
+  if (!userKey) return [];
+  return activeWatchItems()
+    .filter(w => w.user_key === userKey)
+    .map(watchItemToClient);
+}
+
+function alertDedupeKey(userKey, sessionKey, eventType) {
+  return `${userKey}:${sessionKey}:${eventType}`;
+}
+
+function sessionAlertWhen(s) {
+  const day = s.dayLabel || s.date || '';
+  const time = s.time || '';
+  const side = s.waveSide || `Wave ${s.wave}`;
+  return { day, time, side, label: `${s.level} ${side}` };
+}
+
+function buildAlertMessage(s, eventType) {
+  const { day, time, side, label } = sessionAlertWhen(s);
+  const when = `${day} at ${time}`.replace(/\s+/g, ' ').trim();
+  if (eventType === 'opened') {
+    return `${s.level} ${side} opened: ${when}`;
+  }
+  if (eventType === 'low_slots') {
+    const n = s.slots;
+    const slotWord = n === 1 ? 'slot' : 'slots';
+    const dayWord = day.toLowerCase() === 'today' ? 'today' : when;
+    return `${s.level} ${side} is closing out: ${n} ${slotWord} left ${dayWord} at ${time}`;
+  }
+  if (eventType === 'slots_changed') {
+    return `${label} slot update: ${s.slots} open ${when}`;
+  }
+  return `${label} update: ${when}`;
+}
+
+async function recordNotificationEvent(watch, session, eventType, message, result) {
+  if (!supabase) return;
+  try {
+    await supabase.from('notification_events').insert({
+      user_key: watch.user_key,
+      session_key: watch.session_key,
+      event_type: eventType,
+      ntfy_topic: watch.ntfy_topic || null,
+      message,
+      sent_ok: !!result.ok,
+      error: result.error || null,
+    });
+  } catch (e) {
+    console.error('  notification_events insert failed:', e.message);
+  }
+}
+
+async function maybeSendWatchAlert(watch, session, eventType, { urgent = false } = {}) {
+  const topic = (watch.ntfy_topic || '').trim() || TOPIC;
+  if (!topic) {
+    console.log(`  [alert skip] no ntfy topic for ${watch.session_key} (${eventType})`);
+    return;
+  }
+  if (topic === TOPIC && !watch.ntfy_topic) {
+    console.log(`  [alert] using fallback NTFY_TOPIC for ${watch.user_key}`);
+  }
+
+  const dedupeKey = alertDedupeKey(watch.user_key, watch.session_key, eventType);
+  const prev = lastAlertState.get(dedupeKey);
+
+  if (eventType === 'opened') {
+    if (prev?.available === true) return;
+  } else if (eventType === 'low_slots') {
+    if (prev?.slots === session.slots) return;
+  } else if (eventType === 'slots_changed') {
+    if (prev?.slots === session.slots) return;
+  }
+
+  const message = buildAlertMessage(session, eventType);
+  const result = await sendNtfy(topic, 'AP Session Alert', message, { urgent, clickUrl: APP_URL });
+  await recordNotificationEvent(watch, session, eventType, message, result);
+  if (result.ok) {
+    console.log(`  📲 AP Session Alert → ${topic} (${eventType})`);
+    lastAlertState.set(dedupeKey, {
+      slots: session.slots ?? null,
+      available: session.available,
+      at: Date.now(),
+    });
+  } else {
+    console.error(`  ntfy failed (${eventType}):`, result.error);
+  }
+}
+
+async function loadWatchlistFromSupabase() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase
+      .from('watchlist_items')
+      .select('*')
+      .eq('active', true);
+    if (error) throw error;
+    watchItems = asSessionArray(data);
+    console.log(`  Supabase: loaded ${watchItems.length} watchlist item(s)`);
+  } catch (e) {
+    console.error('  Supabase watchlist load failed:', e.message);
+  }
+}
+
+async function upsertWatchItem(row) {
+  if (!row.id) row.id = crypto.randomUUID();
+
+  watchItems = watchItems.filter(
+    w => !(w.user_key === row.user_key && w.session_key === row.session_key)
+  );
+  watchItems.push(row);
+
+  if (!supabase) return row;
+  try {
+    const { data: existing } = await supabase
+      .from('watchlist_items')
+      .select('id')
+      .eq('user_key', row.user_key)
+      .eq('session_key', row.session_key)
+      .maybeSingle();
+
+    if (existing) {
+      const { data, error } = await supabase
+        .from('watchlist_items')
+        .update({ ...row, active: true })
+        .eq('id', existing.id)
+        .select('*')
+        .single();
+      if (error) throw error;
+      watchItems = watchItems.filter(w => w.id !== data.id);
+      watchItems.push(data);
+      return data;
+    }
+
+    const { data, error } = await supabase
+      .from('watchlist_items')
+      .insert(row)
+      .select('*')
+      .single();
+    if (error) throw error;
+    watchItems = watchItems.filter(w => w.id !== data.id);
+    watchItems.push(data);
+    return data;
+  } catch (e) {
+    console.error('  Supabase watchlist upsert failed:', e.message);
+    return row;
+  }
+}
+
+async function deactivateWatchItem(id, userKey) {
+  watchItems = watchItems.filter(w => w.id !== id);
+  if (!supabase) return;
+  try {
+    const { error } = await supabase
+      .from('watchlist_items')
+      .update({ active: false })
+      .eq('id', id)
+      .eq('user_key', userKey);
+    if (error) throw error;
+  } catch (e) {
+    console.error('  Supabase watchlist deactivate failed:', e.message);
+  }
+}
+
+function buildWatchRow(body) {
+  const {
+    user_key, ntfy_topic, session_key, key,
+    start_ts, ts, iso_date, dateKey,
+    wave_side, waveSide, session_type, level,
+    time, date, dayLabel, wave,
+    alert_when_opens, alert_when_low_slots, low_slots_threshold,
+  } = body;
+
+  const sessionKey = session_key || key;
+  if (!user_key || !sessionKey) return null;
+
+  return {
+    user_key,
+    ntfy_topic: (ntfy_topic || '').trim() || null,
+    session_key: sessionKey,
+    iso_date: iso_date || dateKey || null,
+    start_ts: start_ts ?? ts ?? null,
+    wave_side: wave_side || waveSide || null,
+    session_type: session_type || level || null,
+    start_time: time || null,
+    time: time || null,
+    date: date || null,
+    day_label: dayLabel || null,
+    wave: wave != null ? +wave : null,
+    alert_when_opens: alert_when_opens !== false,
+    alert_when_low_slots: alert_when_low_slots !== false,
+    low_slots_threshold: low_slots_threshold ?? THRESH,
+    active: true,
+  };
+}
+
+const MAX_SLOT_CLICKS = 30;
 const MODAL_SELECTORS = ['.modal.in', '.modal.show', '.modal', '[class*="modal-dialog"]', '[class*="popup"]', '[class*="booking"]', '.popover'];
 const PLUS_SELECTORS = [
   '.btn-plus',
@@ -792,7 +1020,7 @@ function prioritizeForSlotCheck(batch) {
 }
 
 async function fillSlotCounts(page, batch, byKey, prevByKey, stats) {
-  const watchKeys = new Set(watchList.map(w => w.key));
+  const watchKeys = watchedSessionKeys();
   const toRecheck = [];
 
   for (const s of batch) {
@@ -1236,22 +1464,43 @@ function updateEffectiveWeeksCap(detectedWeeks) {
 }
 
 async function processNotifications(updatedKeys, { slotsAlerts = false } = {}) {
-  for (const key of updatedKeys) {
-    const s = sessionsByKey.get(key);
-    if (!s || !watchList.find(w => w.key === key)) continue;
-    const prev = history[s.key] || {};
-    const label = `${s.level} · ${s.date} ${s.time} (Wave ${s.wave})`;
+  const updatedSet = new Set(updatedKeys);
 
-    if (s.available && prev.available === false) {
-      await push(`🏄 Spot opened! ${s.level}`, `${label}\n\nBook now: ${BOOKING}`, true);
-    } else if (slotsAlerts && s.available && s.slots != null && s.slots <= THRESH) {
-      if (prev.slots == null || prev.slots > THRESH) {
-        const n = s.slots === 1 ? 'slot' : 'slots';
-        await push(`⚡ Only ${s.slots} ${n} left — ${s.level}`, `${label}\n\nBook soon: ${BOOKING}`, true);
+  for (const watch of activeWatchItems()) {
+    if (!updatedSet.has(watch.session_key)) continue;
+    const s = sessionsByKey.get(watch.session_key);
+    if (!s) continue;
+
+    const prev = history[watch.session_key] || {};
+    const threshold = watch.low_slots_threshold ?? THRESH;
+    const openedKey = alertDedupeKey(watch.user_key, watch.session_key, 'opened');
+
+    if (!s.available) {
+      lastAlertState.delete(openedKey);
+    }
+
+    if (watch.alert_when_opens !== false && s.available && prev.available === false) {
+      await maybeSendWatchAlert(watch, s, 'opened', { urgent: true });
+    }
+
+    if (watch.alert_when_low_slots !== false && slotsAlerts && s.available && s.slots != null && s.slots <= threshold) {
+      if (prev.slots == null || prev.slots > threshold) {
+        await maybeSendWatchAlert(watch, s, 'low_slots', { urgent: true });
       }
     }
 
-    history[s.key] = { available: s.available, slots: s.slots ?? null };
+    if (slotsAlerts && s.available && s.slots != null && prev.slots != null && s.slots < prev.slots) {
+      const delta = prev.slots - s.slots;
+      const crossedLow = prev.slots > threshold && s.slots <= threshold;
+      if (delta >= 2 && !crossedLow) {
+        await maybeSendWatchAlert(watch, s, 'slots_changed', { urgent: s.slots <= threshold });
+      }
+    }
+  }
+
+  for (const key of updatedKeys) {
+    const s = sessionsByKey.get(key);
+    if (s) history[key] = { available: s.available, slots: s.slots ?? null };
   }
 }
 
@@ -1350,14 +1599,16 @@ async function detectWeeksOnStartup() {
 }
 
 // ── REST API ─────────────────────────────────────────────────────────────────
-function statusPayload() {
+function statusPayload(userKey = null) {
   const dateCoverage = computeDateCoverage();
   return {
     sessions: asSessionArray(sessions),
-    watchList: asSessionArray(watchList),
+    watchList: watchlistForUser(userKey),
     history: history || {},
     lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
+    ntfyFallbackConfigured: !!TOPIC,
+    watchlistCount: activeWatchItems().length,
     ...dateCoverage,
     scrapeMeta: {
       weeksAvailableOnSite,
@@ -1371,12 +1622,12 @@ function statusPayload() {
   };
 }
 
-app.get('/api/status', (_req, res) => {
-  res.json(statusPayload());
+app.get('/api/status', (req, res) => {
+  res.json(statusPayload(req.query.user_key || null));
 });
 
-app.get('/api/sessions', (_req, res) => {
-  res.json(statusPayload());
+app.get('/api/sessions', (req, res) => {
+  res.json(statusPayload(req.query.user_key || null));
 });
 
 app.get('/api/debug/scrape', (_req, res) => {
@@ -1397,20 +1648,83 @@ app.get('/api/debug/scrape', (_req, res) => {
   });
 });
 
-app.post('/api/watch', (req, res) => {
-  const { key, ts, wave, level, time, date, dayLabel } = req.body;
-  if (!key) return res.status(400).json({ error: 'key required' });
-  if (watchList.some(w => w.key === key)) return res.json({ ok: true, duplicate: true });
-  const id = Date.now().toString();
-  watchList.push({ id, key, ts: +ts, wave: +wave, level, time, date, dayLabel });
-  console.log(`  👁  Watching: ${level} ${date} ${time} W${wave}`);
-  res.json({ ok: true, id });
+app.get('/api/watchlist', (req, res) => {
+  const userKey = req.query.user_key;
+  if (!userKey) return res.status(400).json({ error: 'user_key required' });
+  res.json({ items: watchlistForUser(userKey) });
 });
 
-app.delete('/api/watch/:id', (req, res) => {
-  const before = watchList.length;
-  watchList = watchList.filter(w => w.id !== req.params.id);
-  console.log(`  🗑  Removed watch (${before - watchList.length} removed)`);
+app.post('/api/watchlist', async (req, res) => {
+  const row = buildWatchRow(req.body);
+  if (!row) return res.status(400).json({ error: 'user_key and session_key required' });
+  try {
+    const saved = await upsertWatchItem(row);
+    console.log(`  👁  Watching: ${saved.session_type} ${saved.day_label || saved.iso_date || ''} (${saved.user_key.slice(0, 8)}…)`);
+    res.json({ ok: true, item: watchItemToClient(saved) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/watchlist/sync', async (req, res) => {
+  const { user_key, ntfy_topic, items } = req.body || {};
+  if (!user_key) return res.status(400).json({ error: 'user_key required' });
+  const incoming = asSessionArray(items);
+  const synced = [];
+
+  for (const item of incoming) {
+    const row = buildWatchRow({ ...item, user_key, ntfy_topic: item.ntfy_topic || ntfy_topic });
+    if (!row) continue;
+    const saved = await upsertWatchItem(row);
+    synced.push(watchItemToClient(saved));
+  }
+
+  const incomingKeys = new Set(incoming.map(i => i.session_key || i.key));
+  watchItems = watchItems.filter(
+    w => w.user_key !== user_key || incomingKeys.has(w.session_key)
+  );
+
+  res.json({ ok: true, items: watchlistForUser(user_key) });
+});
+
+app.delete('/api/watchlist/:id', async (req, res) => {
+  const userKey = req.query.user_key || req.body?.user_key;
+  if (!userKey) return res.status(400).json({ error: 'user_key required' });
+  await deactivateWatchItem(req.params.id, userKey);
+  for (const key of [...lastAlertState.keys()]) {
+    if (key.startsWith(`${userKey}:`)) lastAlertState.delete(key);
+  }
+  console.log(`  🗑  Removed watch ${req.params.id}`);
+  res.json({ ok: true });
+});
+
+app.post('/api/notify/test', async (req, res) => {
+  const topic = (req.body?.ntfy_topic || '').trim() || TOPIC;
+  if (!topic) return res.status(400).json({ error: 'ntfy_topic required' });
+  const result = await sendNtfy(
+    topic,
+    'AP Session Alert',
+    'Test notification — your AP Sessions alerts are working.',
+    { clickUrl: APP_URL }
+  );
+  if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
+  res.json({ ok: true });
+});
+
+// Legacy routes (deprecated)
+app.post('/api/watch', async (req, res) => {
+  const userKey = req.body.user_key;
+  if (!userKey) return res.status(400).json({ error: 'user_key required — use POST /api/watchlist' });
+  const row = buildWatchRow(req.body);
+  if (!row) return res.status(400).json({ error: 'session key required' });
+  const saved = await upsertWatchItem(row);
+  res.json({ ok: true, id: saved.id, item: watchItemToClient(saved) });
+});
+
+app.delete('/api/watch/:id', async (req, res) => {
+  const userKey = req.query.user_key;
+  if (!userKey) return res.status(400).json({ error: 'user_key required' });
+  await deactivateWatchItem(req.params.id, userKey);
   res.json({ ok: true });
 });
 
@@ -1440,6 +1754,7 @@ async function startBackgroundServices() {
   if (supabase) {
     try {
       await loadLatestSnapshotFromSupabase();
+      await loadWatchlistFromSupabase();
     } catch (e) {
       supabaseInitError = supabaseInitError || e.message;
       console.error('Supabase cache load failed:', e.message);
@@ -1459,7 +1774,7 @@ function startServer() {
     console.log('Tier 3 (weeks 2–3):              every 6 hours');
     console.log('Tier 4 (weeks 4+):               daily at midnight');
     console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
-    console.log(TOPIC ? `Ntfy topic: ${TOPIC}` : 'WARNING: NTFY_TOPIC not set — no notifications will be sent');
+    console.log(TOPIC ? `Ntfy fallback topic configured (personal testing)` : 'No NTFY_TOPIC fallback — users set topics in Setup');
     startBackgroundServices().catch((e) => {
       console.error('Background startup error:', e.message);
       bootstrapInBackground();

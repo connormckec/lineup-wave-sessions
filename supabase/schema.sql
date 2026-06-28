@@ -39,3 +39,48 @@ create index if not exists availability_snapshots_scraped_at_idx
 
 create index if not exists availability_snapshots_session_type_idx
   on availability_snapshots (session_type, iso_date);
+
+-- Per-user session watchlist for ntfy alerts
+create table if not exists watchlist_items (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  user_key text not null,
+  ntfy_topic text,
+  session_key text not null,
+  iso_date date,
+  start_ts bigint,
+  start_time text,
+  time text,
+  date text,
+  day_label text,
+  wave integer,
+  wave_side text,
+  session_type text,
+  alert_when_opens boolean not null default true,
+  alert_when_low_slots boolean not null default true,
+  low_slots_threshold integer not null default 2,
+  active boolean not null default true
+);
+
+create unique index if not exists watchlist_items_user_session_idx
+  on watchlist_items (user_key, session_key);
+
+create index if not exists watchlist_items_user_key_idx
+  on watchlist_items (user_key)
+  where active = true;
+
+-- Audit log of sent notifications (dedupe / debugging)
+create table if not exists notification_events (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  user_key text,
+  session_key text,
+  event_type text,
+  ntfy_topic text,
+  message text,
+  sent_ok boolean,
+  error text
+);
+
+create index if not exists notification_events_session_idx
+  on notification_events (session_key, created_at desc);

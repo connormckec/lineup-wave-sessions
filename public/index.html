@@ -304,10 +304,13 @@ input.field:focus{border-color:var(--accent)}
 }
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--sub)}
 .divider{height:1px;background:var(--border);margin:18px 0}
-.lbl{
-  font-size:10px;color:var(--sub);text-transform:uppercase;
-  letter-spacing:.1em;margin-bottom:7px;font-weight:600;
+.book-link{
+  display:inline-block;margin-top:6px;font-size:11px;font-weight:600;
+  color:var(--accent);text-decoration:none;letter-spacing:.04em;
 }
+.book-link:hover{text-decoration:underline}
+.setup-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.setup-actions .btn{flex:1;min-width:120px}
 </style>
 </head>
 <body>
@@ -357,13 +360,17 @@ input.field:focus{border-color:var(--accent)}
     <div class="pane" id="pane-setup">
       <div class="setup-block">
         <h3>Push Notifications</h3>
-        <p>Install the free <strong>Ntfy</strong> app (App Store or Google Play). Then subscribe to your topic:</p>
-        <div class="lbl">Your Ntfy topic</div>
-        <div class="mono-box" id="ntfy-topic-box">Set NTFY_TOPIC in Railway → Variables</div>
-        <div id="ntfy-status-msg" style="font-size:12px;color:var(--sub);margin-bottom:10px"></div>
-        <div class="step"><div class="step-n">1</div><p>Install Ntfy from the App Store or Google Play (it's free)</p></div>
-        <div class="step"><div class="step-n">2</div><p>Open Ntfy → tap <strong>+</strong> → subscribe to the topic above</p></div>
-        <div class="step"><div class="step-n">3</div><p>Notifications arrive instantly — like a surf report text</p></div>
+        <p>Install the free <strong>Ntfy</strong> app, subscribe to your own private topic, then save it here.</p>
+        <div class="lbl">Your ntfy topic</div>
+        <input class="field" type="text" id="ntfy-topic-input" placeholder="my-secret-ap-topic" autocomplete="off">
+        <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:8px 0 0"></p>
+        <div class="setup-actions">
+          <button type="button" class="btn btn-outline" onclick="saveNtfyTopic()">Save topic</button>
+          <button type="button" class="btn btn-outline" onclick="sendTestNotification()">Send test notification</button>
+        </div>
+        <div class="step" style="margin-top:14px"><div class="step-n">1</div><p>Install Ntfy from the App Store or Google Play</p></div>
+        <div class="step"><div class="step-n">2</div><p>Open Ntfy → tap <strong>+</strong> → subscribe to your topic</p></div>
+        <div class="step"><div class="step-n">3</div><p>Save the same topic here, then tap 🔔 on sessions to watch</p></div>
       </div>
 
       <div class="divider"></div>
@@ -393,7 +400,7 @@ input.field:focus{border-color:var(--accent)}
         <h3>Watcher Settings</h3>
         <p>Configure these in Railway → Variables.</p>
         <div style="font-size:12px;color:var(--sub);line-height:2.2">
-          <code style="color:var(--accent)">NTFY_TOPIC</code> — push notification topic<br>
+          <code style="color:var(--accent)">NTFY_TOPIC</code> — optional server fallback for personal testing only<br>
           <code style="color:var(--accent)">LOW_SLOTS_THRESHOLD</code> — alert when slots ≤ this (default: 2)<br>
           <code style="color:var(--accent)">CHECK_EVERY_MINS</code> — check interval (default: 5)<br>
           <code style="color:var(--accent)">MAX_SLOT_CHECKS</code> — slot counts per cycle (default: 50)<br>
@@ -442,6 +449,117 @@ input.field:focus{border-color:var(--accent)}
 </div>
 
 <script>
+const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
+
+const STORAGE = {
+  userKey: 'ap_user_key',
+  ntfyTopic: 'ap_ntfy_topic',
+  watchlist: 'ap_watchlist',
+};
+
+function getUserKey() {
+  let key = localStorage.getItem(STORAGE.userKey);
+  if (!key) {
+    key = crypto.randomUUID();
+    localStorage.setItem(STORAGE.userKey, key);
+  }
+  return key;
+}
+
+function getNtfyTopic() {
+  return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
+}
+
+function setNtfyTopic(value) {
+  localStorage.setItem(STORAGE.ntfyTopic, (value || '').trim());
+}
+
+function loadLocalWatchlist() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE.watchlist) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalWatchlist(list) {
+  localStorage.setItem(STORAGE.watchlist, JSON.stringify(list));
+}
+
+let localWatchlist = loadLocalWatchlist();
+
+function mergeWatchlistFromServer(serverList) {
+  if (!Array.isArray(serverList) || !serverList.length) return;
+  const byKey = new Map(localWatchlist.map(w => [w.session_key || w.key, w]));
+  for (const item of serverList) {
+    byKey.set(item.session_key || item.key, item);
+  }
+  localWatchlist = [...byKey.values()];
+  saveLocalWatchlist(localWatchlist);
+}
+
+function watchlistForUi() {
+  return localWatchlist;
+}
+
+function isWatched(sessionKey) {
+  return localWatchlist.some(w => (w.session_key || w.key) === sessionKey);
+}
+
+async function syncWatchlistToServer() {
+  if (!localWatchlist.length) return;
+  try {
+    await fetch('/api/watchlist/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_key: getUserKey(),
+        ntfy_topic: getNtfyTopic(),
+        items: localWatchlist.map(w => ({
+          ...w,
+          ntfy_topic: w.ntfy_topic || getNtfyTopic(),
+        })),
+      }),
+    });
+  } catch (e) {
+    console.warn('[syncWatchlist]', e);
+  }
+}
+
+function saveNtfyTopic() {
+  const input = document.getElementById('ntfy-topic-input');
+  setNtfyTopic(input?.value || '');
+  renderSetup();
+  renderStatusBar();
+}
+
+async function sendTestNotification() {
+  const topic = getNtfyTopic();
+  if (!topic) {
+    alert('Enter and save your ntfy topic first.');
+    return;
+  }
+  const msgEl = document.getElementById('ntfy-topic-msg');
+  try {
+    const res = await fetch('/api/notify/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ntfy_topic: topic, user_key: getUserKey() }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Test failed');
+    if (msgEl) {
+      msgEl.textContent = 'Test sent — check your ntfy app.';
+      msgEl.style.color = '#00c9a7';
+    }
+  } catch (e) {
+    if (msgEl) {
+      msgEl.textContent = `Test failed: ${e.message}`;
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+}
+
 const LEVELS = {
   'Intermediate':     { s:'INT', c:'#00b4d8', pri:true },
   'Progressive':      { s:'PRG', c:'#48cae4', pri:true },
@@ -700,7 +818,7 @@ async function refresh() {
   const btn = document.getElementById('refresh-btn');
   btn.classList.add('spinning');
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch(`/api/status?user_key=${encodeURIComponent(getUserKey())}`);
     const payload = await res.json();
     data = {
       ...payload,
@@ -708,6 +826,8 @@ async function refresh() {
       watchList: asSessionArray(payload.watchList),
       history: payload.history && typeof payload.history === 'object' ? payload.history : {},
     };
+    mergeWatchlistFromServer(data.watchList);
+    data.watchList = watchlistForUi();
     const withSlots = data.sessions.filter(s => s.slots != null).length;
     console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
     if (!activeDayKey) activeDayKey = todayKey();
@@ -730,7 +850,7 @@ function renderAll() {
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
-  dot.className = data.ntfyOk ? 'ok' : '';
+  dot.className = (getNtfyTopic() || data.ntfyFallbackConfigured) ? 'ok' : '';
 
   const {
     scrapeInProgress,
@@ -823,7 +943,7 @@ function renderBrowse() {
 
 function sessionCardHtml(s) {
   const cfg     = LEVELS[s.level] || { s:'?', c:'#5d8aa8' };
-  const watched = data.watchList.some(w => w.key === s.key);
+  const watched = isWatched(s.key);
   const hist    = data.history[s.key] || {};
   const slots   = s.slots ?? hist.slots;
   const cond    = surfCondition(s, hist);
@@ -834,22 +954,24 @@ function sessionCardHtml(s) {
   const sJson = encodeURIComponent(JSON.stringify({
     key: s.key, ts: s.ts, wave: s.wave, level: s.level,
     time: s.time, date: s.date, dayLabel: s.dayLabel,
+    dateKey: dateKeyFromSession(s), waveSide: s.waveSide || waveLabel(s.wave),
   }));
 
   const fresh = freshnessLabel(s);
 
-  return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)" onclick="toggleWatch('${sJson}')">
+  return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)">
     <div class="sc-accent" style="background:${accent}"></div>
     <div class="sc-body">
       <div class="sc-time" style="color:${dimmed ? '#5d8aa8' : '#e8f4f8'}">${s.time.toUpperCase()}</div>
       <div class="sc-level" style="color:${dimmed ? '#1a3a55' : cfg.c}">${s.level}</div>
       ${slotBarHtml(slots, s.level, cfg.c, dimmed)}
       <div class="sc-wave">${waveLabel(s.wave)}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
+      <a class="book-link" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
     </div>
     <div class="sc-right">
       <div class="cond-badge" style="color:${cond.color}">${cond.text}</div>
       <button class="bell-btn${watched ? ' on' : ''}"
-        onclick="event.stopPropagation();toggleWatch('${sJson}')"
+        onclick="toggleWatch('${sJson}')"
         aria-label="${watched ? 'Stop watching' : 'Watch'} this session">
         <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
       </button>
@@ -860,18 +982,22 @@ function sessionCardHtml(s) {
 function renderWatching() {
   const el = document.getElementById('watch-list');
   const wb = document.getElementById('watch-badge');
-  const n  = data.watchList.length;
+  const list = watchlistForUi();
+  const n  = list.length;
   wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Lineup';
 
   if (!n) {
-    el.innerHTML = '<div class="empty">Add sessions to your lineup with the 🔔 button.<br>Get alerted when conditions change<br>or spots open up.</div>';
+    el.innerHTML = '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Get ntfy alerts when spots open or slots run low.</div>';
     return;
   }
 
-  el.innerHTML = data.watchList.map(w => {
-    const cfg  = LEVELS[w.level] || { s:'?', c:'#5d8aa8' };
-    const live = data.sessions.find(s => s.key === w.key);
-    const hist = data.history[w.key] || {};
+  el.innerHTML = list.map(w => {
+    const cfg  = LEVELS[w.level || w.session_type] || { s:'?', c:'#5d8aa8' };
+    const sessionKey = w.session_key || w.key;
+    const live = data.sessions.find(s => s.key === sessionKey);
+    const hist = data.history[sessionKey] || {};
+    const slots = live?.slots ?? hist.slots;
+    const side = w.wave_side || waveLabel(w.wave);
     let statusHtml = '<div class="wc-status" style="color:var(--sub)">AWAITING CHECK...</div>';
 
     if (live) {
@@ -883,11 +1009,14 @@ function renderWatching() {
       }
     }
 
+    const slotsText = slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '';
+    const dateLine = w.dayLabel || w.date || w.iso_date || '';
+
     return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
         <div>
-          <div class="wc-title" style="color:${cfg.c}">${w.level}</div>
-          <div class="wc-meta">${w.dayLabel} · ${w.time.toUpperCase()} · ${waveLabel(w.wave)}</div>
+          <div class="wc-title" style="color:${cfg.c}">${w.level || w.session_type}</div>
+          <div class="wc-meta">${dateLine} · ${(w.time || '').toUpperCase()} · ${side}${slotsText}</div>
         </div>
         <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>
@@ -897,18 +1026,19 @@ function renderWatching() {
 }
 
 function renderSetup() {
-  const topicEl = document.getElementById('ntfy-topic-box');
-  const msgEl   = document.getElementById('ntfy-status-msg');
-  if (data.ntfyOk) {
-    topicEl.textContent = 'Topic configured ✓ (Railway → Variables → NTFY_TOPIC)';
-    topicEl.style.color = '#00c9a7';
-    msgEl.textContent   = '✓ Notifications active';
-    msgEl.style.color   = '#00c9a7';
-  } else {
-    topicEl.textContent = 'NTFY_TOPIC not set in Railway Variables';
-    topicEl.style.color = '#ff6b35';
-    msgEl.textContent   = '⚠  Add NTFY_TOPIC in Railway → Variables';
-    msgEl.style.color   = '#ff6b35';
+  const input = document.getElementById('ntfy-topic-input');
+  const msgEl = document.getElementById('ntfy-topic-msg');
+  if (input && document.activeElement !== input) {
+    input.value = getNtfyTopic();
+  }
+  if (msgEl) {
+    if (getNtfyTopic()) {
+      msgEl.textContent = 'Topic saved on this device. Subscribe to the same topic in ntfy.';
+      msgEl.style.color = '#00c9a7';
+    } else {
+      msgEl.textContent = 'Enter your private ntfy topic and tap Save.';
+      msgEl.style.color = 'var(--sub)';
+    }
   }
 
   const total = data.totalSessionsTracked ?? data.sessionsCount ?? data.sessions?.length ?? 0;
@@ -929,22 +1059,56 @@ function renderSetup() {
 
 async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
-  const existing = data.watchList.find(w => w.key === s.key);
+  const userKey = getUserKey();
+  const topic = getNtfyTopic();
+  const existing = localWatchlist.find(w => (w.session_key || w.key) === s.key);
+
   if (existing) {
-    await fetch(`/api/watch/${existing.id}`, { method: 'DELETE' });
+    localWatchlist = localWatchlist.filter(w => w.id !== existing.id);
+    saveLocalWatchlist(localWatchlist);
+    await fetch(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
   } else {
-    await fetch('/api/watch', {
+    const payload = {
+      user_key: userKey,
+      ntfy_topic: topic,
+      session_key: s.key,
+      key: s.key,
+      start_ts: s.ts,
+      ts: s.ts,
+      iso_date: s.dateKey,
+      dateKey: s.dateKey,
+      wave_side: s.waveSide,
+      waveSide: s.waveSide,
+      session_type: s.level,
+      level: s.level,
+      time: s.time,
+      date: s.date,
+      dayLabel: s.dayLabel,
+      wave: s.wave,
+    };
+    const res = await fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(s),
+      body: JSON.stringify(payload),
     });
+    const body = await res.json().catch(() => ({}));
+    if (body.item) {
+      localWatchlist.push(body.item);
+      saveLocalWatchlist(localWatchlist);
+    }
   }
-  await refresh();
+
+  data.watchList = watchlistForUi();
+  renderAll();
 }
 
 async function removeWatch(id) {
-  await fetch(`/api/watch/${id}`, { method: 'DELETE' });
-  await refresh();
+  const userKey = getUserKey();
+  localWatchlist = localWatchlist.filter(w => w.id !== id);
+  saveLocalWatchlist(localWatchlist);
+  await fetch(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+  data.watchList = watchlistForUi();
+  renderAll();
 }
 
 function showTab(name, btn) {
@@ -1109,7 +1273,8 @@ function copySms() {
   }
 }
 
-refresh();
+getUserKey();
+refresh().then(() => syncWatchlistToServer());
 setInterval(refresh, 120_000);
 
 if ('serviceWorker' in navigator) {
