@@ -216,6 +216,7 @@ function schemaHealthPayload() {
 }
 let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
+let lastWeeksScraped = 0;
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const datesCheckedDuringScrape = new Set();
 let persistedDatesChecked = new Set();
@@ -284,7 +285,7 @@ function buildScrapeMetaPayload() {
     lastTierRun: { ...lastTierRun },
     lastFullCoverageScrape,
     slotCache,
-    weeksScraped: lastWeeksScraped,
+    weeksScraped: lastWeeksScraped ?? 0,
     datesCheckedDuringScrape: [...persistedDatesChecked],
     datesCheckedEmpty: [...datesCheckedEmpty],
   };
@@ -324,7 +325,7 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
     if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
     if (meta.lastFullCoverageScrape) lastFullCoverageScrape = meta.lastFullCoverageScrape;
     if (meta.slotCache && typeof meta.slotCache === 'object') slotCache = meta.slotCache;
-    if (meta.weeksScraped != null) lastWeeksScraped = meta.weeksScraped;
+    if (meta.weeksScraped != null) lastWeeksScraped = meta.weeksScraped ?? 0;
     if (Array.isArray(meta.datesCheckedDuringScrape)) {
       for (const d of meta.datesCheckedDuringScrape) {
         datesCheckedDuringScrape.add(d);
@@ -3649,7 +3650,7 @@ async function scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates = 
     }
   }
 
-  lastWeeksScraped = Math.max(lastWeeksScraped, weeksScraped);
+  lastWeeksScraped = Math.max(lastWeeksScraped ?? 0, weeksScraped);
   return {
     sessions: [...allByKey.values()],
     weeksScraped,
@@ -4124,7 +4125,7 @@ function computeDateCoverage() {
     datesCheckedDuringScrape: [...checked].sort(),
     datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     datesWithSessionsCount: datesWithSessions.length,
-    weeksScraped: lastWeeksScraped,
+    weeksScraped: lastWeeksScraped ?? 0,
   };
 }
 
