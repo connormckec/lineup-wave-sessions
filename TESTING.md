@@ -43,11 +43,19 @@ curl -s "http://localhost:3000/api/status?selected_date=2026-06-29" | jq '{selec
 
 1. On desktop: **Settings** → confirm sync code `ap-surf-connor-2026` → **Save code**.
 2. Add a session to Lineup via 🔔.
-3. On phone (Safari or installed PWA): same code → **Save code** → **Sync now**.
-4. Confirm the same watched sessions appear on both devices.
-5. Remove a watch on one device → **Sync now** on the other → confirm it updates.
+3. Hard-refresh — Lineup should still show watched sessions (loads from `GET /api/watchlist`, not empty localStorage).
+4. Close and reopen the app — same Lineup should appear after “Loading your lineup…”.
+5. On phone (Safari or installed PWA): same code → **Save code** → confirm same watched sessions (use **Sync now** if needed).
+6. Remove a watch on one device → **Sync now** on the other → confirm it updates.
 
-Profile codes derive a stable `user_key` client-side (`profile:` + SHA-256). Watches are stored in Supabase by that key. Future public release should replace this with Supabase Auth.
+Verify watchlist debug fields:
+
+```bash
+curl -s "http://localhost:3000/api/status?user_key=YOUR_PROFILE_USER_KEY&profile_code=ap-surf-connor-2026" | jq '{user_key, watchlistCount, watchlistRowsLoaded, watchlistLastError, supabaseAvailable}'
+curl -s "http://localhost:3000/api/watchlist?user_key=YOUR_PROFILE_USER_KEY" | jq '{watchlistCount, watchlistLastError, items: .items | length}'
+```
+
+Profile codes derive a stable `user_key` client-side (`profile:` + SHA-256). Watches are stored in Supabase by that key. Startup must **not** call `/api/watchlist/sync` with an empty list (that would have wiped server rows before this fix).
 
 ### Mobile layout (iPhone Safari / PWA)
 

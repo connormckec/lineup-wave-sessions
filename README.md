@@ -63,9 +63,9 @@ Cross-device Lineup sync uses a **Profile Sync Code** instead of full login:
 1. Open **Settings** → enter the same code on phone and computer (default internal code: `ap-surf-connor-2026`).
 2. The app derives a stable `user_key` from the code (SHA-256 hash, prefixed `profile:`).
 3. Watchlist rows in Supabase are keyed by that `user_key`, so Lineup and bell states sync across devices.
-4. **Sync now** pulls the server watchlist and refreshes the UI.
+4. **Sync now** pulls the server watchlist first, then uploads any local-only rows (never wipes server with an empty client list).
 
-localStorage still caches the watchlist locally as a fallback. The public app should eventually use Supabase Auth / Apple / email login instead of sync codes.
+localStorage caches the watchlist as a fallback. On startup the app loads Lineup from `GET /api/watchlist` before rendering an empty state. `/api/watchlist/sync` only removes server rows when `replace: true` is sent explicitly.
 
 ### Mobile / PWA
 

@@ -45,6 +45,8 @@ const TIER_CONFIG = {
 let sessions      = [];   // merged view served via API
 const sessionsByKey = new Map();
 let watchItems      = [];   // active watchlist rows (all users), synced from Supabase
+let watchlistLastError = null;
+let watchlistRowsLoaded = 0;
 const lastAlertState = new Map(); // `${userKey}:${sessionKey}:${eventType}` -> { slots, available, at }
 let history       = {};   // {key: {available, slots}} — for change detection
 let slotCache     = {};   // {key: {slots, available, lastCheckedCycle}}
@@ -1261,19 +1263,46 @@ function resolveNtfyTopicForRequest(requestTopic) {
   return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
 }
 
-async function loadWatchlistFromSupabase() {
-  if (!supabase) return;
-  try {
-    const { data, error } = await supabase
-      .from('watchlist_items')
-      .select('*')
-      .eq('active', true);
-    if (error) throw error;
-    watchItems = asSessionArray(data).map(w => ({ ...watchAlertDefaults(w), ...w }));
-    console.log(`  Supabase: loaded ${watchItems.length} watchlist item(s)`);
-  } catch (e) {
-    console.error('  Supabase watchlist load failed:', e.message);
+async function reloadWatchlistFromSupabase(userKey = null) {
+  if (!supabase) {
+    watchlistRowsLoaded = userKey
+      ? watchItems.filter(w => w.user_key === userKey && w.active !== false).length
+      : watchItems.filter(w => w.active !== false).length;
+    return watchlistRowsLoaded;
   }
+  try {
+    let query = supabase.from('watchlist_items').select('*').eq('active', true);
+    if (userKey) query = query.eq('user_key', userKey);
+    const { data, error } = await query;
+    if (error) throw error;
+    const rows = asSessionArray(data).map(w => ({ ...watchAlertDefaults(w), ...w }));
+    if (userKey) {
+      watchItems = watchItems.filter(w => w.user_key !== userKey).concat(rows);
+      watchlistRowsLoaded = rows.length;
+      console.log(`  Supabase: loaded ${rows.length} watchlist row(s) for ${userKey.slice(0, 12)}…`);
+    } else {
+      watchItems = rows;
+      watchlistRowsLoaded = rows.length;
+      console.log(`  Supabase: loaded ${rows.length} watchlist item(s)`);
+    }
+    watchlistLastError = null;
+    return watchlistRowsLoaded;
+  } catch (e) {
+    watchlistLastError = e.message;
+    console.error('  Supabase watchlist load failed:', e.message);
+    return userKey
+      ? watchItems.filter(w => w.user_key === userKey && w.active !== false).length
+      : watchItems.filter(w => w.active !== false).length;
+  }
+}
+
+async function loadWatchlistFromSupabase() {
+  return reloadWatchlistFromSupabase();
+}
+
+async function ensureWatchlistForUser(userKey) {
+  if (!userKey) return;
+  await reloadWatchlistFromSupabase(userKey);
 }
 
 function mergeWatchBaseline(prev, row) {
@@ -1341,8 +1370,10 @@ async function upsertWatchItem(row, { isNew = false } = {}) {
     if (error) throw error;
     watchItems = watchItems.filter(w => w.id !== data.id);
     watchItems.push(data);
+    watchlistLastError = null;
     return data;
   } catch (e) {
+    watchlistLastError = e.message;
     console.error('  Supabase watchlist upsert failed:', e.message);
     watchItems = watchItems.filter(
       w => !(w.user_key === row.user_key && w.session_key === row.session_key)
@@ -1353,8 +1384,10 @@ async function upsertWatchItem(row, { isNew = false } = {}) {
 }
 
 async function deactivateWatchItem(id, userKey) {
-  watchItems = watchItems.filter(w => w.id !== id);
-  if (!supabase) return;
+  if (!supabase) {
+    watchItems = watchItems.filter(w => w.id !== id);
+    return;
+  }
   try {
     const { error } = await supabase
       .from('watchlist_items')
@@ -1362,8 +1395,12 @@ async function deactivateWatchItem(id, userKey) {
       .eq('id', id)
       .eq('user_key', userKey);
     if (error) throw error;
+    watchItems = watchItems.filter(w => w.id !== id);
+    watchlistLastError = null;
   } catch (e) {
+    watchlistLastError = e.message;
     console.error('  Supabase watchlist deactivate failed:', e.message);
+    throw e;
   }
 }
 
@@ -2583,13 +2620,14 @@ async function detectWeeksOnStartup() {
 }
 
 // ── REST API ─────────────────────────────────────────────────────────────────
-function statusPayload(userKey = null, selectedDate = null) {
+function statusPayload(userKey = null, selectedDate = null, profileCode = null) {
   const dateCoverage = computeDateCoverage();
   const uiDatesChecked = datesCheckedForUi();
   const selectedDateDebug = buildSelectedDateDebug(selectedDate);
+  const userWatchlist = watchlistForUser(userKey);
   return {
     sessions: asSessionArray(sessions),
-    watchList: watchlistForUser(userKey),
+    watchList: userWatchlist,
     history: history || {},
     lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
@@ -2597,7 +2635,12 @@ function statusPayload(userKey = null, selectedDate = null) {
     internalBetaNotifications: INTERNAL_BETA,
     internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
     internalDefaultProfileCode: INTERNAL_DEFAULT_PROFILE_CODE,
-    watchlistCount: activeWatchItems().length,
+    user_key: userKey || null,
+    profileCode: profileCode || null,
+    watchlistCount: userWatchlist.length,
+    watchlistRowsLoaded: userKey ? userWatchlist.length : watchlistRowsLoaded,
+    watchlistLastError,
+    supabaseAvailable: !!supabase,
     watchlistSideDebug: buildWatchlistSideDebug(userKey),
     waveSideDebug: {
       ambiguousCount: ambiguousSideMappings.length,
@@ -2629,25 +2672,35 @@ function statusPayload(userKey = null, selectedDate = null) {
 
 app.get('/api/status', async (req, res) => {
   try {
+    const userKey = req.query.user_key || null;
+    const profileCode = req.query.profile_code || req.query.profileCode || null;
     await ensureSessionsForStatus();
+    if (userKey) await ensureWatchlistForUser(userKey);
     const selectedDate = req.query.selected_date || req.query.selectedDate || null;
-    res.json(statusPayload(req.query.user_key || null, selectedDate));
+    res.json(statusPayload(userKey, selectedDate, profileCode));
   } catch (e) {
     console.error('/api/status error:', e.message);
+    const userKey = req.query.user_key || null;
+    const profileCode = req.query.profile_code || req.query.profileCode || null;
     const selectedDate = req.query.selected_date || req.query.selectedDate || null;
-    res.json({ ...statusPayload(req.query.user_key || null, selectedDate), statusError: e.message });
+    res.json({ ...statusPayload(userKey, selectedDate, profileCode), statusError: e.message });
   }
 });
 
 app.get('/api/sessions', async (req, res) => {
   try {
+    const userKey = req.query.user_key || null;
+    const profileCode = req.query.profile_code || req.query.profileCode || null;
     await ensureSessionsForStatus();
+    if (userKey) await ensureWatchlistForUser(userKey);
     const selectedDate = req.query.selected_date || req.query.selectedDate || null;
-    res.json(statusPayload(req.query.user_key || null, selectedDate));
+    res.json(statusPayload(userKey, selectedDate, profileCode));
   } catch (e) {
     console.error('/api/sessions error:', e.message);
+    const userKey = req.query.user_key || null;
+    const profileCode = req.query.profile_code || req.query.profileCode || null;
     const selectedDate = req.query.selected_date || req.query.selectedDate || null;
-    res.json({ ...statusPayload(req.query.user_key || null, selectedDate), statusError: e.message });
+    res.json({ ...statusPayload(userKey, selectedDate, profileCode), statusError: e.message });
   }
 });
 
@@ -2857,10 +2910,20 @@ app.get('/api/analytics/availability-summary', async (_req, res) => {
   }
 });
 
-app.get('/api/watchlist', (req, res) => {
+app.get('/api/watchlist', async (req, res) => {
   const userKey = req.query.user_key;
   if (!userKey) return res.status(400).json({ error: 'user_key required' });
-  res.json({ items: watchlistForUser(userKey) });
+  await ensureWatchlistForUser(userKey);
+  const items = watchlistForUser(userKey);
+  res.json({
+    items,
+    user_key: userKey,
+    watchlistCount: items.length,
+    watchlistRowsLoaded: items.length,
+    watchlistLastError,
+    supabaseConfigured,
+    supabaseAvailable: !!supabase,
+  });
 });
 
 app.post('/api/watchlist', async (req, res) => {
@@ -2875,18 +2938,25 @@ app.post('/api/watchlist', async (req, res) => {
       await maybeSendImmediateWatchAlert(saved, sessionsByKey.get(saved.session_key));
     }
     console.log(`  👁  Watching: ${saved.session_type} ${saved.day_label || saved.iso_date || ''} (${saved.user_key.slice(0, 8)}…)`);
-    res.json({ ok: true, item: watchItemToClient(saved) });
+    res.json({ ok: true, item: enrichWatchItemForClient(saved), watchlistLastError });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    watchlistLastError = e.message;
+    res.status(500).json({ error: e.message, watchlistLastError });
   }
 });
 
 app.post('/api/watchlist/sync', async (req, res) => {
-  const { user_key, ntfy_topic, items } = req.body || {};
+  const { user_key, ntfy_topic, items, replace = false } = req.body || {};
   if (!user_key) return res.status(400).json({ error: 'user_key required' });
   const incoming = asSessionArray(items);
-  const synced = [];
 
+  if (replace && incoming.length === 0) {
+    return res.status(400).json({
+      error: 'Refusing to replace watchlist with an empty list — pass replace:true only when intentional',
+    });
+  }
+
+  const synced = [];
   for (const item of incoming) {
     const row = buildWatchRow({ ...item, user_key, ntfy_topic: item.ntfy_topic || ntfy_topic });
     if (!row) continue;
@@ -2894,26 +2964,40 @@ app.post('/api/watchlist/sync', async (req, res) => {
       w => w.user_key === row.user_key && w.session_key === row.session_key
     );
     const saved = await upsertWatchItem(row, { isNew });
-    synced.push(watchItemToClient(saved));
+    synced.push(enrichWatchItemForClient(saved));
   }
 
-  const incomingKeys = new Set(incoming.map(i => i.session_key || i.key));
-  watchItems = watchItems.filter(
-    w => w.user_key !== user_key || incomingKeys.has(w.session_key)
-  );
+  if (replace === true && incoming.length > 0) {
+    const incomingKeys = new Set(incoming.map(i => i.session_key || i.key));
+    for (const w of [...watchItems]) {
+      if (w.user_key === user_key && !incomingKeys.has(w.session_key)) {
+        await deactivateWatchItem(w.id, user_key);
+      }
+    }
+  }
 
-  res.json({ ok: true, items: watchlistForUser(user_key) });
+  await ensureWatchlistForUser(user_key);
+  res.json({
+    ok: true,
+    items: watchlistForUser(user_key),
+    syncedCount: synced.length,
+    watchlistLastError,
+  });
 });
 
 app.delete('/api/watchlist/:id', async (req, res) => {
   const userKey = req.query.user_key || req.body?.user_key;
   if (!userKey) return res.status(400).json({ error: 'user_key required' });
-  await deactivateWatchItem(req.params.id, userKey);
-  for (const key of [...lastAlertState.keys()]) {
-    if (key.startsWith(`${userKey}:`)) lastAlertState.delete(key);
+  try {
+    await deactivateWatchItem(req.params.id, userKey);
+    for (const key of [...lastAlertState.keys()]) {
+      if (key.startsWith(`${userKey}:`)) lastAlertState.delete(key);
+    }
+    console.log(`  🗑  Removed watch ${req.params.id}`);
+    res.json({ ok: true, watchlistLastError });
+  } catch (e) {
+    res.status(500).json({ error: e.message, watchlistLastError });
   }
-  console.log(`  🗑  Removed watch ${req.params.id}`);
-  res.json({ ok: true });
 });
 
 app.post('/api/notify/test', async (req, res) => {

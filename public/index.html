@@ -602,15 +602,9 @@ async function applyProfileUserKey(code) {
 async function initProfileUserKey() {
   let code = getSavedProfileCode();
   if (!code) code = DEFAULT_PROFILE_CODE;
-  if (code) {
-    await applyProfileUserKey(code);
-    if (!getSavedProfileCode()) setProfileCode(code);
-  } else if (localStorage.getItem(STORAGE.userKey)) {
-    cachedUserKey = localStorage.getItem(STORAGE.userKey);
-  } else {
-    cachedUserKey = crypto.randomUUID();
-    localStorage.setItem(STORAGE.userKey, cachedUserKey);
-  }
+  await applyProfileUserKey(code);
+  if (!getSavedProfileCode()) setProfileCode(code);
+  console.log(`[lineup] profile_code=${code} user_key=${cachedUserKey}`);
   return cachedUserKey;
 }
 
@@ -621,33 +615,49 @@ function getUserKey() {
     cachedUserKey = stored;
     return stored;
   }
+  if (getSavedProfileCode()) {
+    console.warn('[lineup] user_key missing but profile code exists — wait for initProfileUserKey');
+    return '';
+  }
   cachedUserKey = crypto.randomUUID();
   localStorage.setItem(STORAGE.userKey, cachedUserKey);
   return cachedUserKey;
 }
 
-async function fetchWatchlistFromServer() {
+let watchlistLoadState = 'idle';
+
+async function loadWatchlistFromServer() {
+  const userKey = getUserKey();
+  if (!userKey) return localWatchlist;
+  watchlistLoadState = 'loading';
+  renderWatching();
   try {
-    const res = await fetch(`/api/status?user_key=${encodeURIComponent(getUserKey())}`);
-    const payload = await res.json();
-    const serverList = asSessionArray(payload.watchList);
-    localWatchlist = serverList;
-    saveLocalWatchlist(localWatchlist);
-    if (payload.watchList) {
-      data.watchList = serverList;
+    const res = await fetch(`/api/watchlist?user_key=${encodeURIComponent(userKey)}`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || body.watchlistLastError || res.statusText);
+    mergeWatchlistFromServer(asSessionArray(body.items));
+    if (body.watchlistLastError) {
+      console.warn('[loadWatchlist] server warning:', body.watchlistLastError);
     }
-    return serverList;
+    watchlistLoadState = 'ready';
+    console.log(`[lineup] loaded ${watchlistForUi().length} watchlist row(s) for ${userKey.slice(0, 16)}…`);
+    return watchlistForUi();
   } catch (e) {
-    console.warn('[fetchWatchlist]', e);
+    console.warn('[loadWatchlist]', e);
+    watchlistLoadState = localWatchlist.length ? 'ready' : 'error';
     return localWatchlist;
   }
+}
+
+async function fetchWatchlistFromServer() {
+  return loadWatchlistFromServer();
 }
 
 async function syncProfileNow() {
   const msgEl = document.getElementById('profile-code-msg');
   try {
-    await fetchWatchlistFromServer();
-    await syncWatchlistToServer();
+    await loadWatchlistFromServer();
+    await pushLocalWatchlistToServer();
     await refresh();
     if (msgEl) {
       msgEl.textContent = `Synced · ${watchlistForUi().length} session(s) in Lineup.`;
@@ -688,8 +698,8 @@ async function saveProfileCode() {
     msgEl.style.color = 'var(--sub)';
   }
 
-  await fetchWatchlistFromServer();
-  await syncWatchlistToServer();
+  await loadWatchlistFromServer();
+  if (localWatchlist.length) await pushLocalWatchlistToServer();
   await refresh();
   renderSetup();
 
@@ -742,17 +752,22 @@ let localWatchlist = loadLocalWatchlist();
 
 function mergeWatchlistFromServer(serverList) {
   if (!Array.isArray(serverList)) return;
-  if (getUserKey().startsWith('profile:')) {
-    localWatchlist = serverList;
-    saveLocalWatchlist(localWatchlist);
-    return;
-  }
-  if (!serverList.length) return;
+  const server = serverList.filter(Boolean);
+  if (!server.length) return;
+
   const byKey = new Map(localWatchlist.map(w => [w.session_key || w.key, w]));
-  for (const item of serverList) {
+  for (const item of server) {
     byKey.set(item.session_key || item.key, item);
   }
   localWatchlist = [...byKey.values()];
+  saveLocalWatchlist(localWatchlist);
+}
+
+function mergeWatchlistServerPreferred(serverList) {
+  if (!Array.isArray(serverList)) return;
+  const server = serverList.filter(Boolean);
+  if (!server.length) return;
+  localWatchlist = server;
   saveLocalWatchlist(localWatchlist);
 }
 
@@ -764,24 +779,34 @@ function isWatched(sessionKey) {
   return localWatchlist.some(w => (w.session_key || w.key) === sessionKey);
 }
 
-async function syncWatchlistToServer() {
+async function pushLocalWatchlistToServer() {
   if (!localWatchlist.length) return;
   try {
-    await fetch('/api/watchlist/sync', {
+    const res = await fetch('/api/watchlist/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         user_key: getUserKey(),
         ntfy_topic: getNtfyTopic(),
+        replace: false,
         items: localWatchlist.map(w => ({
           ...w,
           ntfy_topic: w.ntfy_topic || getNtfyTopic(),
         })),
       }),
     });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || body.watchlistLastError || res.statusText);
+    mergeWatchlistServerPreferred(asSessionArray(body.items));
+    if (body.watchlistLastError) console.warn('[pushWatchlist]', body.watchlistLastError);
   } catch (e) {
-    console.warn('[syncWatchlist]', e);
+    console.warn('[pushWatchlist]', e);
+    throw e;
   }
+}
+
+async function syncWatchlistToServer() {
+  return pushLocalWatchlistToServer();
 }
 
 function saveNtfyTopic() {
@@ -1108,6 +1133,9 @@ function loadStatusCache() {
         sessions: asSessionArray(cached.sessions),
         history: cached.history && typeof cached.history === 'object' ? cached.history : {},
       };
+      if (asSessionArray(cached.watchlist).length) {
+        localWatchlist = asSessionArray(cached.watchlist);
+      }
       if (cached.activeDayKey && cached.activeDayKey >= todayKey()) {
         activeDayKey = cached.activeDayKey;
       }
@@ -1133,6 +1161,7 @@ function saveStatusCache() {
       effectiveWeeksAhead: data.effectiveWeeksAhead || data.scrapeMeta?.effectiveWeeksAhead,
       datesCheckedDuringScrape: data.datesCheckedDuringScrape || data.scrapeMeta?.datesCheckedDuringScrape,
       datesCheckedEmpty: data.datesCheckedEmpty || data.scrapeMeta?.datesCheckedEmpty,
+      watchlist: localWatchlist,
       activeDayKey,
     }));
   } catch (e) {
@@ -1313,6 +1342,8 @@ async function refresh() {
       user_key: getUserKey(),
       selected_date: activeDayKey || todayKey(),
     });
+    const profileCode = getSavedProfileCode();
+    if (profileCode) params.set('profile_code', profileCode);
     const res = await fetch(`/api/status?${params}`);
     const payload = await res.json();
     const incoming = asSessionArray(payload.sessions);
@@ -1328,7 +1359,7 @@ async function refresh() {
     saveStatusCache();
     validateActiveDayKey();
     const withSlots = data.sessions.filter(s => s.slots != null).length;
-    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), date=${activeDayKey}, source=${data.dataSource}`);
+    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), lineup=${watchlistForUi().length}, user_key=${getUserKey().slice(0, 16)}…, source=${data.dataSource}`);
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
     updateDateNavButtons();
@@ -1546,6 +1577,16 @@ function renderWatching() {
   const n  = list.length;
   wb.innerHTML = n > 0 ? `<span class="wbadge">${n}</span>` : 'Lineup';
 
+  if (watchlistLoadState === 'loading') {
+    el.innerHTML = '<div class="empty">Loading your lineup…</div>';
+    return;
+  }
+
+  if (watchlistLoadState === 'error' && !n) {
+    el.innerHTML = '<div class="empty">Could not load lineup — check connection and tap Sync now in Settings.</div>';
+    return;
+  }
+
   if (!n) {
     el.innerHTML = alertsEnabled()
       ? '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Demo ntfy alerts fire when spots open or slots run low.</div>'
@@ -1559,10 +1600,10 @@ function renderWatching() {
     const live = data.sessions.find(s => s.key === sessionKey);
     const hist = data.history[sessionKey] || {};
     const slots = live?.slots ?? w.slots ?? hist.slots;
-    const side = w.waveSide || w.wave_side || (live ? (live.waveSide || waveLabel(live.wave)) : waveLabel(w.wave));
-    const booked = live ? formatBookedLine(live, hist) : (slots != null ? formatSpotCountShort(slots) : '');
+    const side = live?.waveSide || w.waveSide || w.wave_side || (live ? waveLabel(live.wave) : waveLabel(w.wave));
+    const booked = live ? formatBookedLine(live, hist) : (w.slots != null ? formatSpotCountShort(w.slots) : '');
     const price = live ? formatPrice(live) : (w.priceText ? w.priceText : '');
-    let statusHtml = '<div class="wc-status" style="color:var(--sub)">Awaiting check…</div>';
+    let statusHtml = '<div class="wc-status" style="color:var(--sub)">Latest data unavailable</div>';
 
     if (live) {
       const display = sessionConditionDisplay(live, hist);
@@ -1610,9 +1651,10 @@ function renderSetup() {
   }
   if (profileHint) {
     const key = getUserKey();
-    profileHint.hidden = !key.startsWith('profile:');
-    profileHint.textContent = key.startsWith('profile:')
-      ? `Device profile id: ${key.slice(0, 20)}…`
+    const code = getSavedProfileCode() || getProfileCodeForInput();
+    profileHint.hidden = false;
+    profileHint.textContent = key
+      ? `Profile: ${code || '—'} · user_key ${key.slice(0, 24)}… · ${watchlistForUi().length} in Lineup`
       : '';
   }
   if (profileMsg && !profileMsg.textContent) {
@@ -1655,7 +1697,17 @@ async function toggleWatch(sJson) {
   if (existing) {
     localWatchlist = localWatchlist.filter(w => w.id !== existing.id);
     saveLocalWatchlist(localWatchlist);
-    await fetch(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+    try {
+      const res = await fetch(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || res.statusText);
+      }
+    } catch (e) {
+      console.warn('[toggleWatch] remove failed', e);
+      localWatchlist.push(existing);
+      saveLocalWatchlist(localWatchlist);
+    }
   } else {
     const payload = {
       user_key: userKey,
@@ -1681,8 +1733,13 @@ async function toggleWatch(sJson) {
       body: JSON.stringify(payload),
     });
     const body = await res.json().catch(() => ({}));
-    if (body.item) {
-      localWatchlist.push(body.item);
+    if (!res.ok) {
+      console.warn('[toggleWatch] add failed', body.error || body.watchlistLastError);
+      alert(body.error || 'Could not add to Lineup');
+    } else if (body.item) {
+      const idx = localWatchlist.findIndex(w => (w.session_key || w.key) === s.key);
+      if (idx >= 0) localWatchlist[idx] = body.item;
+      else localWatchlist.push(body.item);
       saveLocalWatchlist(localWatchlist);
     }
   }
@@ -1693,9 +1750,22 @@ async function toggleWatch(sJson) {
 
 async function removeWatch(id) {
   const userKey = getUserKey();
+  const existing = localWatchlist.find(w => w.id === id);
   localWatchlist = localWatchlist.filter(w => w.id !== id);
   saveLocalWatchlist(localWatchlist);
-  await fetch(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+  try {
+    const res = await fetch(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || res.statusText);
+    }
+  } catch (e) {
+    console.warn('[removeWatch] failed', e);
+    if (existing) {
+      localWatchlist.push(existing);
+      saveLocalWatchlist(localWatchlist);
+    }
+  }
   data.watchList = watchlistForUi();
   renderAll();
 }
@@ -1845,8 +1915,10 @@ initTimeSelects();
 (async function boot() {
   await initProfileUserKey();
   loadStatusCache();
+  watchlistLoadState = 'loading';
+  renderWatching();
+  await loadWatchlistFromServer();
   await refresh();
-  await syncWatchlistToServer();
   scheduleRefreshPoll();
 })();
 
