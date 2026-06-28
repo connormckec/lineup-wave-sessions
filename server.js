@@ -7,8 +7,29 @@ const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
 
+const pkg = require('./package.json');
+const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
+const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
+
 const app = express();
 app.use(express.json());
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('Surrogate-Control', 'no-store');
+  } else if (req.path === '/' || req.path === '/index.html') {
+    res.set('Cache-Control', 'no-cache');
+  } else if (/\.(png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(req.path)) {
+    res.set('Cache-Control', 'public, max-age=86400');
+  } else if (/\.(js|css)$/i.test(req.path)) {
+    res.set('Cache-Control', 'public, max-age=3600');
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT       = process.env.PORT || 3000;
@@ -2641,6 +2662,8 @@ function statusPayload(userKey = null, selectedDate = null, profileCode = null) 
     watchlistRowsLoaded: userKey ? userWatchlist.length : watchlistRowsLoaded,
     watchlistLastError,
     supabaseAvailable: !!supabase,
+    appVersion: APP_VERSION,
+    buildTime: BUILD_TIME,
     watchlistSideDebug: buildWatchlistSideDebug(userKey),
     waveSideDebug: {
       ambiguousCount: ambiguousSideMappings.length,

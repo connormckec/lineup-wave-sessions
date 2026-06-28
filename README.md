@@ -56,6 +56,16 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - Debug a single date: `GET /api/debug/date/YYYY-MM-DD` — session count, scrape runs, snapshots, and UI reason.
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
+### Browser cache and local state
+
+- **API routes** (`/api/*`) send `Cache-Control: no-store` — responses are never cached by the browser or service worker.
+- **Service worker** (`public/sw.js`) uses versioned cache `lineup-static-v2`; only static assets are cached. `/api/*` is never intercepted.
+- **`index.html`** is network-first so deploys land quickly on desktop PWA/Safari.
+- **localStorage session cache** is not loaded on startup — fresh Supabase data from `/api/status` wins. Sticky merge only runs during an active scrape.
+- **Settings → App state** shows build version, `user_key`, selected date, watchlist counts, and `dataSource`.
+- **Reset local app state** clears cached UI/selected date only; Supabase Lineup rows are kept.
+- App refetches on tab focus / visibility change (debounced 5s).
+
 ### Profile Sync Code (internal beta)
 
 Cross-device Lineup sync uses a **Profile Sync Code** instead of full login:
@@ -88,6 +98,8 @@ localStorage caches the watchlist as a fallback. On startup the app loads Lineup
 | `LOW_SLOTS_THRESHOLD` | `2` | Notify when watched sessions drop to this many slots or fewer |
 | `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead |
 | `DEBUG_WAVE_SIDE` | — | Set `1` to log every parsed wave side during scrapes |
+| `APP_VERSION` | `package.json` version | Exposed in `/api/status` for cross-device build checks |
+| `BUILD_TIME` | server boot ISO time | Exposed in `/api/status` |
 
 See [TESTING.md](TESTING.md) for verification steps.
 

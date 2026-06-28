@@ -398,6 +398,12 @@ input.field:focus{border-color:var(--accent)}
 .profile-code-display{
   font-size:11px;color:var(--muted);margin-top:8px;word-break:break-all;
 }
+.debug-grid{
+  font-size:11px;color:var(--sub);line-height:1.55;margin:8px 0 0;
+}
+.debug-grid dt{color:var(--muted);font-weight:600;margin-top:6px}
+.debug-grid dd{margin:0 0 0 8px;word-break:break-all}
+.debug-actions{margin-top:12px}
 @media (min-width:390px){
   #app-title{font-size:26px}
   .app-sublabel{font-size:11px}
@@ -498,6 +504,16 @@ input.field:focus{border-color:var(--accent)}
         </div>
         <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
       </div>
+      <div class="setup-divider"></div>
+      <div class="setup-block" id="debug-state-block">
+        <h3>App state</h3>
+        <p class="profile-hint">Compare build and data source across phone and desktop. Reset clears cached UI state only — your Supabase Lineup is not deleted.</p>
+        <dl class="debug-grid" id="debug-state-grid"></dl>
+        <div class="setup-actions debug-actions">
+          <button type="button" class="btn btn-outline" onclick="resetLocalAppState()">Reset local app state</button>
+        </div>
+        <p id="reset-state-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
+      </div>
     </div>
 
   </div>
@@ -551,7 +567,16 @@ const STORAGE = {
 };
 
 const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
+const SW_CACHE_VERSION = '2';
 let cachedUserKey = null;
+let lastFocusRefreshAt = 0;
+let serverWatchlistCount = null;
+
+const FETCH_NO_STORE = { cache: 'no-store' };
+
+async function fetchApi(url, options = {}) {
+  return fetch(url, { ...FETCH_NO_STORE, ...options, cache: 'no-store' });
+}
 
 function normalizeProfileCode(code) {
   return (code || '').trim().toLowerCase().replace(/\s+/g, '-');
@@ -632,13 +657,14 @@ async function loadWatchlistFromServer() {
   watchlistLoadState = 'loading';
   renderWatching();
   try {
-    const res = await fetch(`/api/watchlist?user_key=${encodeURIComponent(userKey)}`);
+    const res = await fetchApi(`/api/watchlist?user_key=${encodeURIComponent(userKey)}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || body.watchlistLastError || res.statusText);
     mergeWatchlistFromServer(asSessionArray(body.items));
     if (body.watchlistLastError) {
       console.warn('[loadWatchlist] server warning:', body.watchlistLastError);
     }
+    serverWatchlistCount = body.watchlistCount ?? asSessionArray(body.items).length;
     watchlistLoadState = 'ready';
     console.log(`[lineup] loaded ${watchlistForUi().length} watchlist row(s) for ${userKey.slice(0, 16)}…`);
     return watchlistForUi();
@@ -782,7 +808,7 @@ function isWatched(sessionKey) {
 async function pushLocalWatchlistToServer() {
   if (!localWatchlist.length) return;
   try {
-    const res = await fetch('/api/watchlist/sync', {
+    const res = await fetchApi('/api/watchlist/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -828,7 +854,7 @@ async function sendTestNotification() {
     return;
   }
   try {
-    const res = await fetch('/api/notify/test', {
+    const res = await fetchApi('/api/notify/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ntfy_topic: topic, user_key: getUserKey() }),
@@ -1074,11 +1100,17 @@ function isDateChecked(dateKey) {
   return checkedDatesSet().has(dateKey);
 }
 
-function mergeSessionsSticky(prev, incoming) {
+function mergeSessionsFromServer(prev, incoming, { scrapeInProgress = false, dataSource = null } = {}) {
   const prevList = asSessionArray(prev);
   const nextList = asSessionArray(incoming);
   if (!nextList.length) return prevList;
   if (!prevList.length) return nextList;
+
+  const fromSupabase = (dataSource || '').includes('supabase');
+  if (fromSupabase && !scrapeInProgress) {
+    return nextList;
+  }
+
   const byKey = new Map(prevList.map(s => [s.key, s]));
   for (const s of nextList) {
     byKey.set(s.key, { ...byKey.get(s.key), ...s });
@@ -1109,47 +1141,35 @@ function validateActiveDayKey() {
     saveActiveDayKey(activeDayKey);
     return;
   }
-  if (days.length && !days.includes(activeDayKey)) {
-    if (sessionCountForDate(activeDayKey) > 0) return;
-    if (!isDateChecked(activeDayKey)) return;
-    activeDayKey = tk;
-    saveActiveDayKey(activeDayKey);
+  if (!days.length) return;
+  if (days.includes(activeDayKey)) return;
+  if (sessionCountForDate(activeDayKey) > 0) return;
+  activeDayKey = tk;
+  saveActiveDayKey(activeDayKey);
+}
+
+function readStatusCacheFallback() {
+  try {
+    const raw = localStorage.getItem(STORAGE.statusCache);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
 }
 
 function loadStatusCache() {
-  try {
-    const raw = localStorage.getItem(STORAGE.statusCache);
-    loadActiveDayKey();
-    if (!raw) {
-      renderAll();
-      return;
-    }
-    const cached = JSON.parse(raw);
-    if (asSessionArray(cached.sessions).length) {
-      data = {
-        ...data,
-        ...cached,
-        sessions: asSessionArray(cached.sessions),
-        history: cached.history && typeof cached.history === 'object' ? cached.history : {},
-      };
-      if (asSessionArray(cached.watchlist).length) {
-        localWatchlist = asSessionArray(cached.watchlist);
-      }
-      if (cached.activeDayKey && cached.activeDayKey >= todayKey()) {
-        activeDayKey = cached.activeDayKey;
-      }
-      validateActiveDayKey();
-      renderAll();
-    }
-  } catch (e) {
-    console.warn('[cache] load failed', e);
-  }
+  loadActiveDayKey();
+  validateActiveDayKey();
+  renderAll();
 }
 
 function saveStatusCache() {
   try {
     localStorage.setItem(STORAGE.statusCache, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      appVersion: data.appVersion,
+      buildTime: data.buildTime,
       sessions: data.sessions,
       lastSuccessfulScrape: data.lastSuccessfulScrape,
       minutesSinceLastScrape: data.minutesSinceLastScrape,
@@ -1167,6 +1187,28 @@ function saveStatusCache() {
   } catch (e) {
     console.warn('[cache] save failed', e);
   }
+}
+
+async function resetLocalAppState() {
+  const msgEl = document.getElementById('reset-state-msg');
+  localStorage.removeItem(STORAGE.statusCache);
+  localStorage.removeItem(STORAGE.activeDayKey);
+  activeDayKey = todayKey();
+  saveActiveDayKey(activeDayKey);
+  data.sessions = [];
+  data.datesCheckedDuringScrape = [];
+  data.datesCheckedEmpty = [];
+  if (msgEl) {
+    msgEl.textContent = 'Resetting local cache and refetching…';
+    msgEl.style.color = 'var(--sub)';
+  }
+  await loadWatchlistFromServer();
+  await refresh();
+  if (msgEl) {
+    msgEl.textContent = 'Local app state cleared. Profile code and Lineup watches were kept.';
+    msgEl.style.color = '#00c9a7';
+  }
+  renderSetup();
 }
 
 function shiftActiveDay(delta) {
@@ -1333,9 +1375,9 @@ function scheduleRefreshPoll() {
   refreshPollTimer = setInterval(refresh, ms);
 }
 
-async function refresh() {
+async function refresh({ silent = false } = {}) {
   const btn = document.getElementById('refresh-btn');
-  btn.classList.add('spinning');
+  if (!silent) btn.classList.add('spinning');
   const prevSessions = asSessionArray(data.sessions);
   try {
     const params = new URLSearchParams({
@@ -1344,10 +1386,14 @@ async function refresh() {
     });
     const profileCode = getSavedProfileCode();
     if (profileCode) params.set('profile_code', profileCode);
-    const res = await fetch(`/api/status?${params}`);
+    const res = await fetchApi(`/api/status?${params}`);
     const payload = await res.json();
     const incoming = asSessionArray(payload.sessions);
-    const sessions = mergeSessionsSticky(prevSessions, incoming);
+    const sessions = mergeSessionsFromServer(prevSessions, incoming, {
+      scrapeInProgress: !!payload.scrapeInProgress,
+      dataSource: payload.dataSource || payload.source,
+    });
+    serverWatchlistCount = payload.watchlistCount ?? payload.watchList?.length ?? null;
     data = {
       ...payload,
       sessions,
@@ -1359,22 +1405,42 @@ async function refresh() {
     saveStatusCache();
     validateActiveDayKey();
     const withSlots = data.sessions.filter(s => s.slots != null).length;
-    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), lineup=${watchlistForUi().length}, user_key=${getUserKey().slice(0, 16)}…, source=${data.dataSource}`);
+    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), lineup=${watchlistForUi().length}, build=${data.appVersion}, source=${data.dataSource}`);
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
     updateDateNavButtons();
     scheduleRefreshPoll();
   } catch {
-    if (prevSessions.length) {
+    const cached = readStatusCacheFallback();
+    const cachedSessions = asSessionArray(cached?.sessions);
+    if (cachedSessions.length) {
+      data.sessions = cachedSessions;
+      renderAll();
+    } else if (prevSessions.length) {
       data.sessions = prevSessions;
       renderAll();
     }
     document.getElementById('status-text').innerHTML =
       '<span class="check-time">Connection error · showing saved data</span>';
   } finally {
-    btn.classList.remove('spinning');
+    if (!silent) btn.classList.remove('spinning');
   }
 }
+
+function scheduleFocusRefresh() {
+  const now = Date.now();
+  if (now - lastFocusRefreshAt < 5000) return;
+  lastFocusRefreshAt = now;
+  refresh({ silent: true });
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') scheduleFocusRefresh();
+});
+window.addEventListener('focus', scheduleFocusRefresh);
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) scheduleFocusRefresh();
+});
 
 function renderAll() {
   applyInternalBetaNav();
@@ -1636,6 +1702,36 @@ function renderWatching() {
   }).join('');
 }
 
+function renderDebugState() {
+  const grid = document.getElementById('debug-state-grid');
+  if (!grid) return;
+  const fmtTime = (iso) => {
+    if (!iso) return '—';
+    try {
+      return new Date(iso).toLocaleString();
+    } catch {
+      return iso;
+    }
+  };
+  const rows = [
+    ['App version', data.appVersion || '—'],
+    ['Build time', fmtTime(data.buildTime)],
+    ['SW cache', `lineup-static-v${SW_CACHE_VERSION}`],
+    ['Profile code', getSavedProfileCode() || getProfileCodeForInput() || '—'],
+    ['user_key', getUserKey() || '—'],
+    ['Selected date', activeDayKey || todayKey()],
+    ['Local watchlist', String(watchlistForUi().length)],
+    ['Server watchlist', serverWatchlistCount != null ? String(serverWatchlistCount) : '—'],
+    ['dataSource', data.dataSource || data.source || '—'],
+    ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
+    ['Session count', String(asSessionArray(data.sessions).length)],
+    ['currentSessionsCount', data.currentSessionsCount != null ? String(data.currentSessionsCount) : '—'],
+  ];
+  grid.innerHTML = rows.map(([k, v]) =>
+    `<dt>${k}</dt><dd>${String(v).replace(/</g, '&lt;')}</dd>`
+  ).join('');
+}
+
 function renderSetup() {
   const profileInput = document.getElementById('profile-code-input');
   const profileMsg = document.getElementById('profile-code-msg');
@@ -1664,7 +1760,10 @@ function renderSetup() {
     profileMsg.style.color = 'var(--sub)';
   }
 
-  if (!alertsEnabled()) return;
+  if (!alertsEnabled()) {
+    renderDebugState();
+    return;
+  }
 
   if (defaultTopicEl) defaultTopicEl.textContent = defaultTopic;
   if (subscribeHint) {
@@ -1686,9 +1785,8 @@ function renderSetup() {
       msgEl.style.color = 'var(--sub)';
     }
   }
+  renderDebugState();
 }
-
-async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
   const userKey = getUserKey();
   const topic = alertsEnabled() ? getNtfyTopic() : null;
@@ -1698,7 +1796,7 @@ async function toggleWatch(sJson) {
     localWatchlist = localWatchlist.filter(w => w.id !== existing.id);
     saveLocalWatchlist(localWatchlist);
     try {
-      const res = await fetch(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+      const res = await fetchApi(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || res.statusText);
@@ -1727,7 +1825,7 @@ async function toggleWatch(sJson) {
       dayLabel: s.dayLabel,
       wave: s.wave,
     };
-    const res = await fetch('/api/watchlist', {
+    const res = await fetchApi('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1754,7 +1852,7 @@ async function removeWatch(id) {
   localWatchlist = localWatchlist.filter(w => w.id !== id);
   saveLocalWatchlist(localWatchlist);
   try {
-    const res = await fetch(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+    const res = await fetchApi(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || res.statusText);
@@ -1923,9 +2021,11 @@ initTimeSelects();
 })();
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(err => {
-    console.warn('[sw] registration failed:', err);
-  });
+  navigator.serviceWorker.register(`/sw.js?v=${SW_CACHE_VERSION}`, { updateViaCache: 'none' })
+    .then((reg) => reg.update())
+    .catch(err => {
+      console.warn('[sw] registration failed:', err);
+    });
 }
 </script>
 </body>

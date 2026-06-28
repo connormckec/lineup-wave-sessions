@@ -2,6 +2,7 @@
   "name": "Lineup — Atlantic Park sessions",
   "short_name": "Lineup",
   "description": "Atlantic Park session availability",
+  "version": "1.0.0",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
