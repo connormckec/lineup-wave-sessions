@@ -66,8 +66,9 @@ const datesCheckedDuringScrape = new Set();
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let lastHistorySnapshotSavedAt = null;
 let lastLatestSnapshotSavedAt = null;
+let lastSnapshotRowsInsertedLastRun = 0;
 const HISTORY_SNAPSHOTS_ENABLED = process.env.HISTORY_SNAPSHOTS !== 'false';
-let scrapeLock = Promise.resolve();
+const PARK = 'atlantic_park';
 
 function initSupabaseClient() {
   supabaseInitError = null;
@@ -134,6 +135,48 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
   }
 }
 
+function currentRowToSession(row) {
+  const raw = row.raw && typeof row.raw === 'object' ? row.raw : {};
+  return {
+    ...raw,
+    key: row.session_key,
+    dateKey: row.iso_date || raw.dateKey,
+    isoDate: row.iso_date || raw.isoDate,
+    ts: row.start_ts ?? raw.ts,
+    time: row.start_time || raw.time,
+    date: row.display_date || raw.date,
+    weekday: row.weekday || raw.weekday,
+    waveSide: row.wave_side || raw.waveSide,
+    level: row.session_type || raw.level,
+    available: row.available,
+    slots: row.slots_available ?? raw.slots ?? null,
+    tier: row.source_tier ?? raw.tier,
+    lastScraped: row.last_scraped_at || raw.lastScraped,
+  };
+}
+
+function sessionToCurrentRow(s, sourceTier) {
+  const now = new Date().toISOString();
+  return {
+    park: PARK,
+    session_key: s.key,
+    iso_date: s.isoDate || s.dateKey || null,
+    start_ts: s.ts ?? null,
+    start_time: s.time || null,
+    display_date: s.date || null,
+    weekday: s.weekday || null,
+    wave_side: s.waveSide || null,
+    session_type: s.level || null,
+    available: s.available,
+    slots_available: s.slots ?? null,
+    status_label: availabilityStatusLabel(s),
+    source_tier: sourceTier,
+    raw: s,
+    last_seen_at: now,
+    last_scraped_at: now,
+  };
+}
+
 function asSessionArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -156,6 +199,7 @@ function getStatusFields() {
     : null;
   return {
     sessionsCount: sessions.length,
+    currentSessionsCount: sessions.length,
     source: dataSource,
     supabaseConfigured,
     supabaseInitError,
@@ -169,7 +213,142 @@ function getStatusFields() {
     totalSessionsTracked: sessions.length,
     latestSnapshotSavedAt: lastLatestSnapshotSavedAt,
     historySnapshotsEnabled: supabaseConfigured && HISTORY_SNAPSHOTS_ENABLED,
+    snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
   };
+}
+
+async function loadScrapeMetaFromSupabase() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase
+      .from('scrape_snapshots')
+      .select('scrape_meta, last_successful_scrape, last_scrape_attempt, last_scrape_error')
+      .eq('id', 'latest')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return;
+    applyLoadedSnapshot(null, data.scrape_meta, data.last_successful_scrape);
+    lastScrapeAttempt = data.last_scrape_attempt || lastScrapeAttempt;
+    lastScrapeError = data.last_scrape_error || null;
+  } catch (e) {
+    console.error('  Supabase scrape meta load failed:', e.message);
+  }
+}
+
+async function loadCurrentSessionsFromSupabase() {
+  if (!supabase) return false;
+  try {
+    const { data, error } = await supabase
+      .from('current_sessions')
+      .select('*')
+      .eq('park', PARK)
+      .order('start_ts', { ascending: true });
+    if (error) throw error;
+    if (!data?.length) {
+      console.log('  Supabase: no rows in current_sessions');
+      return false;
+    }
+
+    sessionsByKey.clear();
+    for (const row of data) {
+      const s = currentRowToSession(row);
+      if (s.key) sessionsByKey.set(s.key, s);
+    }
+    rebuildSessionsArray();
+    await loadScrapeMetaFromSupabase();
+
+    const latestScraped = data.reduce((max, row) => {
+      const t = row.last_scraped_at ? new Date(row.last_scraped_at).getTime() : 0;
+      return t > max ? t : max;
+    }, 0);
+    if (latestScraped) {
+      const fromRows = new Date(latestScraped).toISOString();
+      if (!lastSuccessfulScrape || new Date(fromRows) > new Date(lastSuccessfulScrape)) {
+        lastSuccessfulScrape = fromRows;
+        lastCheck = fromRows;
+      }
+    }
+
+    dataSource = 'supabase-current';
+    hasFreshScrapeThisBoot = false;
+
+    const age = lastSuccessfulScrape
+      ? Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000)
+      : '?';
+    console.log(`  Supabase: loaded ${sessions.length} current session(s) (last scrape ${age}m ago)`);
+    return true;
+  } catch (e) {
+    console.error('  Supabase current_sessions load failed:', e.message);
+    return false;
+  }
+}
+
+async function upsertCurrentSessionsToSupabase(scrapedSessions, sourceTier) {
+  if (!supabase) return 0;
+  const batch = asSessionArray(scrapedSessions);
+  if (!batch.length) return 0;
+
+  try {
+    const rows = batch.map(s => sessionToCurrentRow(s, sourceTier));
+    let upserted = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await supabase
+        .from('current_sessions')
+        .upsert(chunk, { onConflict: 'park,session_key' });
+      if (error) throw error;
+      upserted += chunk.length;
+    }
+    console.log(`  Supabase: upserted ${upserted} current_sessions row(s)`);
+    return upserted;
+  } catch (e) {
+    console.error('  Supabase current_sessions upsert failed:', e.message);
+    return 0;
+  }
+}
+
+async function beginScrapeRun(tier) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from('scrape_runs')
+      .insert({ park: PARK, tier: String(tier), started_at: new Date().toISOString() })
+      .select('id')
+      .single();
+    if (error) throw error;
+    return data?.id || null;
+  } catch (e) {
+    console.error('  Supabase scrape_runs insert failed:', e.message);
+    return null;
+  }
+}
+
+async function finishScrapeRun(runId, {
+  success,
+  sessionsFound = null,
+  datesCovered = null,
+  missingDates = null,
+  error = null,
+  errorStack = null,
+} = {}) {
+  if (!supabase || !runId) return;
+  try {
+    const { error: updateError } = await supabase
+      .from('scrape_runs')
+      .update({
+        finished_at: new Date().toISOString(),
+        success,
+        sessions_found: sessionsFound,
+        dates_covered: datesCovered,
+        missing_dates: missingDates,
+        error,
+        error_stack: errorStack,
+      })
+      .eq('id', runId);
+    if (updateError) throw updateError;
+  } catch (e) {
+    console.error('  Supabase scrape_runs update failed:', e.message);
+  }
 }
 
 async function loadLatestSnapshotFromSupabase() {
@@ -267,9 +446,9 @@ function availabilityStatusLabel(s) {
 }
 
 async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) {
-  if (!supabase || !HISTORY_SNAPSHOTS_ENABLED) return;
+  if (!supabase || !HISTORY_SNAPSHOTS_ENABLED) return 0;
   const batch = asSessionArray(scrapedSessions);
-  if (!batch.length) return;
+  if (!batch.length) return 0;
 
   try {
     const scrapedAt = new Date().toISOString();
@@ -284,7 +463,7 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) 
       }
       return {
         scraped_at: scrapedAt,
-        park: 'atlantic_park',
+        park: PARK,
         session_key: s.key,
         iso_date: s.isoDate || s.dateKey,
         start_ts: s.ts,
@@ -311,15 +490,24 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) 
 
     lastHistorySnapshotSavedAt = scrapedAt;
     console.log(`  Supabase: saved ${rows.length} availability snapshot row(s)`);
+    return rows.length;
   } catch (e) {
     console.error('  Supabase availability snapshots failed:', e.message);
+    return 0;
   }
 }
 
-function withScrapeLock(fn) {
-  const run = scrapeLock.then(fn, fn);
-  scrapeLock = run.catch(() => {});
-  return run;
+function tryAcquireScrapeLock(context = 'scrape') {
+  if (scrapeInProgress) {
+    console.log(`  ${context} skipped — scrape already running`);
+    return false;
+  }
+  scrapeInProgress = true;
+  return true;
+}
+
+function releaseScrapeLock() {
+  scrapeInProgress = false;
 }
 
 // ── Push notification via Ntfy.sh ────────────────────────────────────────────
@@ -1724,97 +1912,117 @@ function updateEffectiveWeeksCap(detectedWeeks) {
 
 
 async function runTierScrape(tier) {
-  return withScrapeLock(async () => {
-    const cfg = TIER_CONFIG[tier];
-    const { startWeek, endWeek } = weeksForTier(tier);
-    if (endWeek < startWeek || startWeek >= effectiveWeeksAhead) {
-      console.log(`[tier ${tier}] skipped — no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`);
-      return;
+  if (!tryAcquireScrapeLock(`tier ${tier}`)) return;
+
+  const cfg = TIER_CONFIG[tier];
+  const { startWeek, endWeek } = weeksForTier(tier);
+  if (endWeek < startWeek || startWeek >= effectiveWeeksAhead) {
+    console.log(`[tier ${tier}] skipped — no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`);
+    releaseScrapeLock();
+    return;
+  }
+
+  console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek})`);
+
+  lastScrapeAttempt = new Date().toISOString();
+  const scrapeRunId = await beginScrapeRun(tier);
+
+  if (tier === 1) {
+    checkCycle++;
+    slotChecksThisCycle = 0;
+  }
+
+  const slotStats = { cached: 0, rechecked: 0, byReason: {}, queueLogged: false };
+  const prevByKey = new Map(sessions.map(s => [s.key, s]));
+  let launched;
+  let coverage = null;
+
+  try {
+    launched = await launchBrowser();
+    const { page } = launched;
+    await openBookingPage(page);
+
+    const tierRequiredDates = expectedDatesForTier(tier);
+    const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
+      await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
+
+    if (datesSeen) {
+      for (const d of datesSeen) datesCheckedDuringScrape.add(d);
     }
 
-    console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek})`);
+    const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
+    const byKey = new Map(batch.map(s => [s.key, s]));
 
-    scrapeInProgress = true;
-    lastScrapeAttempt = new Date().toISOString();
-
-    if (tier === 1) {
-      checkCycle++;
-      slotChecksThisCycle = 0;
+    if (cfg.slotCounts) {
+      await fillSlotCounts(page, batch, byKey, prevByKey, slotStats);
+      applySlotCacheFallback(byKey);
     }
 
-    const slotStats = { cached: 0, rechecked: 0, byReason: {}, queueLogged: false };
-    const prevByKey = new Map(sessions.map(s => [s.key, s]));
-    let launched;
+    const merged = [...byKey.values()];
+    const updatedKeys = mergeBatchIntoStore(merged, tier, { preserveSlots: !cfg.slotCounts });
 
-    try {
-      launched = await launchBrowser();
-      const { page } = launched;
-      await openBookingPage(page);
-
-      const tierRequiredDates = expectedDatesForTier(tier);
-      const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
-        await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
-
-      if (datesSeen) {
-        for (const d of datesSeen) datesCheckedDuringScrape.add(d);
-      }
-
-      const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
-      const byKey = new Map(batch.map(s => [s.key, s]));
-
-      if (cfg.slotCounts) {
-        await fillSlotCounts(page, batch, byKey, prevByKey, slotStats);
-        applySlotCacheFallback(byKey);
-      }
-
-      const merged = [...byKey.values()];
-      const updatedKeys = mergeBatchIntoStore(merged, tier, { preserveSlots: !cfg.slotCounts });
-
-      if (cfg.slotCounts) {
-        syncSlotCacheAvailability(merged);
-        const reasonParts = Object.entries(slotStats.byReason).map(([k, n]) => `${n} ${k}`);
-        console.log(`  slot counts: ${slotStats.cached} from cache, ${slotStats.rechecked} re-checked${reasonParts.length ? ` (${reasonParts.join(', ')})` : ''}`);
-      }
-
-      console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
-      const coverage = computeDateCoverage();
-      console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days, ${coverage.coveragePercent}% dates checked)`);
-      await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
-
-      lastTierRun[tier] = new Date().toISOString();
-      lastSuccessfulScrape = new Date().toISOString();
-      lastCheck = lastSuccessfulScrape;
-      lastScrapeError = null;
-      lastScrapeErrorStack = null;
-      hasFreshScrapeThisBoot = true;
-      dataSource = 'memory';
-      await saveLatestSnapshotToSupabase();
-      await saveAvailabilitySnapshotsToSupabase(merged, tier);
-
-    } catch (e) {
-      recordScrapeError(e, `tier ${tier} scrape`);
-      await saveScrapeErrorToSupabase(lastScrapeError);
-    } finally {
-      scrapeInProgress = false;
-      if (launched?.browser) await launched.browser.close();
+    if (cfg.slotCounts) {
+      syncSlotCacheAvailability(merged);
+      const reasonParts = Object.entries(slotStats.byReason).map(([k, n]) => `${n} ${k}`);
+      console.log(`  slot counts: ${slotStats.cached} from cache, ${slotStats.rechecked} re-checked${reasonParts.length ? ` (${reasonParts.join(', ')})` : ''}`);
     }
-  });
+
+    console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
+    coverage = computeDateCoverage();
+    console.log(`  date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days, ${coverage.coveragePercent}% dates checked)`);
+    await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
+
+    lastTierRun[tier] = new Date().toISOString();
+    lastSuccessfulScrape = new Date().toISOString();
+    lastCheck = lastSuccessfulScrape;
+    lastScrapeError = null;
+    lastScrapeErrorStack = null;
+    hasFreshScrapeThisBoot = true;
+    dataSource = 'memory';
+
+    await upsertCurrentSessionsToSupabase(merged, tier);
+    lastSnapshotRowsInsertedLastRun = await saveAvailabilitySnapshotsToSupabase(merged, tier);
+    await saveLatestSnapshotToSupabase();
+
+    await finishScrapeRun(scrapeRunId, {
+      success: true,
+      sessionsFound: merged.length,
+      datesCovered: coverage.coveredDatesCount,
+      missingDates: coverage.missingDatesInScrapeWindow,
+    });
+
+  } catch (e) {
+    recordScrapeError(e, `tier ${tier} scrape`);
+    await saveScrapeErrorToSupabase(lastScrapeError);
+    await finishScrapeRun(scrapeRunId, {
+      success: false,
+      sessionsFound: sessions.length,
+      datesCovered: coverage?.coveredDatesCount ?? null,
+      missingDates: coverage?.missingDatesInScrapeWindow ?? null,
+      error: lastScrapeError,
+      errorStack: lastScrapeErrorStack,
+    });
+  } finally {
+    releaseScrapeLock();
+    if (launched?.browser) await launched.browser.close();
+  }
 }
 
 async function detectWeeksOnStartup() {
-  return withScrapeLock(async () => {
-    let launched;
-    try {
-      launched = await launchBrowser();
-      const detected = await detectAvailableWeeks(launched.page);
-      updateEffectiveWeeksCap(detected);
-    } catch (e) {
-      console.error('week detection failed:', e.message);
-      effectiveWeeksAhead = SCRAPE_WEEKS_AHEAD;
-    } finally {
-      if (launched?.browser) await launched.browser.close();
-    }
-  });
+  if (!tryAcquireScrapeLock('week detection')) return;
+
+  let launched;
+  try {
+    launched = await launchBrowser();
+    const detected = await detectAvailableWeeks(launched.page);
+    updateEffectiveWeeksCap(detected);
+  } catch (e) {
+    console.error('week detection failed:', e.message);
+    effectiveWeeksAhead = SCRAPE_WEEKS_AHEAD;
+  } finally {
+    releaseScrapeLock();
+    if (launched?.browser) await launched.browser.close();
+  }
 }
 
 // ── REST API ─────────────────────────────────────────────────────────────────
@@ -1856,6 +2064,8 @@ app.get('/api/debug/scrape', (_req, res) => {
   res.json({
     scrapeInProgress,
     sessionsCount: sessions.length,
+    currentSessionsCount: sessions.length,
+    snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
     lastScrapeAttempt,
     lastScrapeError,
     lastScrapeErrorStackPreview: stackPreview(lastScrapeErrorStack),
@@ -1867,6 +2077,117 @@ app.get('/api/debug/scrape', (_req, res) => {
     lastWeeksScraped,
     ...coverage,
   });
+});
+
+function aggregateAvailabilitySummary(rows) {
+  const byWeekday = {};
+  const bySessionType = {};
+  const byHour = {};
+  const openDays = {};
+  const sessionSeries = new Map();
+
+  for (const row of rows) {
+    const slots = row.slots_available;
+    if (slots == null) continue;
+
+    const weekday = row.weekday || 'Unknown';
+    const sessionType = row.session_type || 'Unknown';
+    const hour = (row.start_time || '').split(':')[0] || 'Unknown';
+    const isoDate = row.iso_date;
+
+    if (!byWeekday[weekday]) byWeekday[weekday] = { total: 0, count: 0 };
+    byWeekday[weekday].total += slots;
+    byWeekday[weekday].count += 1;
+
+    if (!bySessionType[sessionType]) bySessionType[sessionType] = { total: 0, count: 0 };
+    bySessionType[sessionType].total += slots;
+    bySessionType[sessionType].count += 1;
+
+    if (!byHour[hour]) byHour[hour] = { total: 0, count: 0 };
+    byHour[hour].total += slots;
+    byHour[hour].count += 1;
+
+    if (row.available && isoDate) {
+      openDays[isoDate] = (openDays[isoDate] || 0) + 1;
+    }
+
+    if (!sessionSeries.has(row.session_key)) sessionSeries.set(row.session_key, []);
+    sessionSeries.get(row.session_key).push({
+      scrapedAt: row.scraped_at,
+      slots,
+      sessionType,
+      isoDate,
+      startTime: row.start_time,
+    });
+  }
+
+  const average = (bucket) => Object.fromEntries(
+    Object.entries(bucket).map(([k, v]) => [k, v.count ? +(v.total / v.count).toFixed(2) : 0])
+  );
+
+  const mostOpenDays = Object.entries(openDays)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([date, openSessionCount]) => ({ date, openSessionCount }));
+
+  const fastestFilling = [];
+  for (const [sessionKey, points] of sessionSeries.entries()) {
+    if (points.length < 2) continue;
+    points.sort((a, b) => new Date(a.scrapedAt) - new Date(b.scrapedAt));
+    const first = points[0];
+    const last = points[points.length - 1];
+    const drop = first.slots - last.slots;
+    if (drop <= 0) continue;
+    const hours = Math.max(
+      (new Date(last.scrapedAt) - new Date(first.scrapedAt)) / 3_600_000,
+      0.01
+    );
+    fastestFilling.push({
+      sessionKey,
+      sessionType: first.sessionType,
+      isoDate: first.isoDate,
+      startTime: first.startTime,
+      slotsStart: first.slots,
+      slotsEnd: last.slots,
+      slotsDropped: drop,
+      dropPerHour: +(drop / hours).toFixed(2),
+      snapshotCount: points.length,
+    });
+  }
+  fastestFilling.sort((a, b) => b.dropPerHour - a.dropPerHour);
+
+  return {
+    snapshotCount: rows.length,
+    averageSlotsByWeekday: average(byWeekday),
+    averageSlotsBySessionType: average(bySessionType),
+    averageSlotsByHour: average(byHour),
+    mostOpenDays,
+    fastestFillingSessions: fastestFilling.slice(0, 10),
+  };
+}
+
+app.get('/api/analytics/availability-summary', async (_req, res) => {
+  if (!supabase) {
+    return res.json({ configured: false, message: 'Supabase not configured' });
+  }
+  try {
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const { data, error } = await supabase
+      .from('availability_snapshots')
+      .select('scraped_at, session_key, iso_date, start_time, weekday, session_type, available, slots_available')
+      .gte('scraped_at', since)
+      .not('slots_available', 'is', null)
+      .order('scraped_at', { ascending: true })
+      .limit(15000);
+    if (error) throw error;
+    res.json({
+      configured: true,
+      since,
+      ...aggregateAvailabilitySummary(asSessionArray(data)),
+    });
+  } catch (e) {
+    res.status(500).json({ configured: true, error: e.message });
+  }
 });
 
 app.get('/api/watchlist', (req, res) => {
@@ -1958,6 +2279,21 @@ app.delete('/api/watch/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+async function loadPersistedData() {
+  initSupabaseClient();
+  if (!supabase) return;
+  try {
+    const loadedCurrent = await loadCurrentSessionsFromSupabase();
+    if (!loadedCurrent) {
+      await loadLatestSnapshotFromSupabase();
+    }
+    await loadWatchlistFromSupabase();
+  } catch (e) {
+    supabaseInitError = supabaseInitError || e.message;
+    console.error('Supabase cache load failed:', e.message);
+  }
+}
+
 // ── Boot: tiered cron schedules ───────────────────────────────────────────────
 function bootstrapInBackground() {
   detectWeeksOnStartup()
@@ -1979,24 +2315,12 @@ cron.schedule('0 0 * * *', () => {
     .catch(console.error);
 });
 
-async function startBackgroundServices() {
-  initSupabaseClient();
-  if (supabase) {
-    try {
-      await loadLatestSnapshotFromSupabase();
-      await loadWatchlistFromSupabase();
-    } catch (e) {
-      supabaseInitError = supabaseInitError || e.message;
-      console.error('Supabase cache load failed:', e.message);
-    }
-  }
+async function startServer() {
+  await loadPersistedData();
   if (sessions.length) {
-    console.log(`Serving ${sessions.length} cached sessions (${dataSource}) while background scrape runs…`);
+    console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }
-  bootstrapInBackground();
-}
 
-function startServer() {
   app.listen(PORT, () => {
     console.log(`\nAP Session Watcher running on :${PORT}`);
     console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
@@ -2004,16 +2328,19 @@ function startServer() {
     console.log('Tier 3 (weeks 2–3):              every 6 hours');
     console.log('Tier 4 (weeks 4+):               daily at midnight');
     console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
+    if (supabaseConfigured) {
+      console.log('Supabase collector: current_sessions + availability_snapshots + scrape_runs');
+    }
     if (INTERNAL_BETA) {
       console.log(`Internal beta notifications enabled (default topic: ${INTERNAL_DEFAULT_NTFY_TOPIC})`);
     } else {
       console.log(TOPIC ? 'Ntfy fallback topic configured (personal testing)' : 'No NTFY_TOPIC fallback — users set topics in Setup');
     }
-    startBackgroundServices().catch((e) => {
-      console.error('Background startup error:', e.message);
-      bootstrapInBackground();
-    });
+    bootstrapInBackground();
   });
 }
 
-startServer();
+startServer().catch((e) => {
+  console.error('Server startup failed:', e.message);
+  process.exit(1);
+});

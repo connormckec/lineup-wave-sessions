@@ -848,6 +848,13 @@ let activeLevels  = new Set();
 let carrier       = localStorage.getItem('carrier') || '';
 let pickerDraft   = { dayKey: todayKey(), fromH: null, toH: null };
 let pickerOpen    = false;
+let refreshPollTimer = null;
+
+function scheduleRefreshPoll() {
+  if (refreshPollTimer) clearInterval(refreshPollTimer);
+  const ms = data?.scrapeInProgress ? 30_000 : 120_000;
+  refreshPollTimer = setInterval(refresh, ms);
+}
 
 async function refresh() {
   const btn = document.getElementById('refresh-btn');
@@ -867,6 +874,7 @@ async function refresh() {
     console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
+    scheduleRefreshPoll();
   } catch {
     document.getElementById('status-text').innerHTML =
       '<span class="check-time">Connection error</span>';
@@ -900,8 +908,12 @@ function renderStatusBar() {
     dataAgeMinutes,
     lastScrapeError,
     sessionsCount,
+    currentSessionsCount,
     lastSuccessfulScrape,
+    source,
   } = data;
+
+  const trackedCount = currentSessionsCount ?? sessionsCount ?? 0;
 
   const ageLabel = (mins) => {
     if (mins == null) return null;
@@ -911,18 +923,18 @@ function renderStatusBar() {
 
   let detail;
   if (scrapeInProgress) {
-    detail = 'refreshing…';
-  } else if (!sessionsCount && !lastSuccessfulScrape) {
+    detail = `checked ${ageLabel(dataAgeMinutes) || 'recently'} · refreshing…`;
+  } else if (!trackedCount && !lastSuccessfulScrape) {
     detail = 'waiting for first scrape';
-  } else if (lastScrapeError && sessionsCount > 0) {
+  } else if (lastScrapeError && trackedCount > 0) {
     detail = 'showing saved data · refresh failed';
-  } else if (isUsingCachedData) {
-    detail = `showing last data from ${ageLabel(dataAgeMinutes) || 'earlier'}`;
+  } else if (isUsingCachedData || source === 'supabase-current' || source === 'supabase-cache') {
+    detail = `showing saved data · checked ${ageLabel(dataAgeMinutes) || 'earlier'}`;
   } else {
     detail = `checked ${ageLabel(dataAgeMinutes) || 'just now'}`;
   }
 
-  if (!sessionsCount && !lastSuccessfulScrape) {
+  if (!trackedCount && !lastSuccessfulScrape) {
     txt.innerHTML = `<span class="check-time">${detail}</span>`;
     return;
   }
@@ -1335,7 +1347,7 @@ function copySms() {
 
 getUserKey();
 refresh().then(() => syncWatchlistToServer());
-setInterval(refresh, 120_000);
+scheduleRefreshPoll();
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(err => {

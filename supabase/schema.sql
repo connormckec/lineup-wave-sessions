@@ -1,4 +1,4 @@
--- Latest scrape cache for fast cold starts (existing)
+-- Operational scrape state (meta only — sessions live in current_sessions)
 create table if not exists scrape_snapshots (
   id text primary key,
   sessions jsonb not null default '[]'::jsonb,
@@ -9,7 +9,35 @@ create table if not exists scrape_snapshots (
   updated_at timestamptz not null default now()
 );
 
--- Historical availability for heat-map / analytics (append-only)
+-- Latest known state of every session (source of truth for live UI)
+create table if not exists current_sessions (
+  park text not null default 'atlantic_park',
+  session_key text not null,
+  iso_date date,
+  start_ts bigint,
+  start_time text,
+  display_date text,
+  weekday text,
+  wave_side text,
+  session_type text,
+  available boolean,
+  slots_available integer,
+  status_label text,
+  source_tier integer,
+  raw jsonb,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  last_scraped_at timestamptz not null default now(),
+  primary key (park, session_key)
+);
+
+create index if not exists current_sessions_iso_date_idx
+  on current_sessions (iso_date);
+
+create index if not exists current_sessions_last_scraped_at_idx
+  on current_sessions (last_scraped_at desc);
+
+-- Historical availability for heat-map / fill-rate analytics (append-only)
 create table if not exists availability_snapshots (
   id uuid primary key default gen_random_uuid(),
   scraped_at timestamptz not null default now(),
@@ -39,6 +67,27 @@ create index if not exists availability_snapshots_scraped_at_idx
 
 create index if not exists availability_snapshots_session_type_idx
   on availability_snapshots (session_type, iso_date);
+
+-- Audit log of every scrape attempt
+create table if not exists scrape_runs (
+  id uuid primary key default gen_random_uuid(),
+  park text not null default 'atlantic_park',
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  success boolean,
+  tier text,
+  sessions_found integer,
+  dates_covered integer,
+  missing_dates text[],
+  error text,
+  error_stack text
+);
+
+create index if not exists scrape_runs_started_at_idx
+  on scrape_runs (started_at desc);
+
+create index if not exists scrape_runs_success_idx
+  on scrape_runs (success, started_at desc);
 
 -- Per-user session watchlist for ntfy alerts
 create table if not exists watchlist_items (
