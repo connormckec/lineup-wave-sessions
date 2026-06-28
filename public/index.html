@@ -510,7 +510,9 @@ input.field:focus{border-color:var(--accent)}
         <p class="profile-hint">Compare build and data source across phone and desktop. Reset clears cached UI state only — your Supabase Lineup is not deleted.</p>
         <dl class="debug-grid" id="debug-state-grid"></dl>
         <div class="setup-actions debug-actions">
+          <button type="button" class="btn btn-outline" onclick="debugReloadSessions()">Debug reload sessions</button>
           <button type="button" class="btn btn-outline" onclick="resetLocalAppState()">Reset local app state</button>
+          <button type="button" class="btn btn-outline" onclick="resetLocalAppCache()">Reset local app cache</button>
         </div>
         <p id="reset-state-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
       </div>
@@ -567,12 +569,38 @@ const STORAGE = {
 };
 
 const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
-const SW_CACHE_VERSION = '2';
+const SW_CACHE_VERSION = '3';
 let cachedUserKey = null;
 let lastFocusRefreshAt = 0;
 let serverWatchlistCount = null;
+let uiLoading = true;
+let lastFetchError = null;
+let lastRenderError = null;
+let bootFailsafeTimer = null;
+const BOOT_FAILSAFE_MS = 5000;
 
 const FETCH_NO_STORE = { cache: 'no-store' };
+
+function finishLoading(state) {
+  uiLoading = false;
+  bootState = state || 'ready';
+  if (bootFailsafeTimer) {
+    clearTimeout(bootFailsafeTimer);
+    bootFailsafeTimer = null;
+  }
+}
+
+function startBootFailsafe() {
+  if (bootFailsafeTimer) clearTimeout(bootFailsafeTimer);
+  bootFailsafeTimer = setTimeout(() => {
+    if (!uiLoading) return;
+    lastFetchError = lastFetchError || 'Boot timed out after 5s';
+    console.error('[boot] failsafe timeout');
+    finishLoading('error');
+    showStatusMessage(`<span class="check-time">Load timed out · ${lastFetchError}</span>`);
+    safeRenderAll();
+  }, BOOT_FAILSAFE_MS);
+}
 
 async function fetchApi(url, options = {}, timeoutMs = 45000) {
   const controller = new AbortController();
@@ -591,19 +619,39 @@ async function fetchApi(url, options = {}, timeoutMs = 45000) {
 
 function extractSessionsFromPayload(payload) {
   if (!payload || typeof payload !== 'object') return [];
-  if (Array.isArray(payload.sessions)) return payload.sessions;
-  if (Array.isArray(payload.currentSessions)) return payload.currentSessions;
-  if (Array.isArray(payload.current_sessions)) return payload.current_sessions;
+  const candidates = [
+    payload.sessions,
+    payload.currentSessions,
+    payload.current_sessions,
+    payload.scrapeMeta?.sessions,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length) return c;
+  }
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c;
+  }
   return [];
 }
 
 function normalizeSessionRow(s) {
-  if (!s || !s.key) return null;
+  if (!s) return null;
+  const key = s.key || s.session_key;
+  if (!key) return null;
   const dateKey = s.dateKey || s.isoDate || s.iso_date || null;
+  const level = s.level || s.session_type || null;
+  const time = s.time || s.start_time || null;
+  const wave = s.wave != null ? +s.wave : null;
   return {
     ...s,
+    key,
+    session_key: key,
     dateKey: dateKey || s.dateKey,
     isoDate: s.isoDate || s.iso_date || dateKey,
+    level,
+    session_type: level,
+    time,
+    wave: Number.isFinite(wave) ? wave : s.wave,
   };
 }
 
@@ -629,12 +677,14 @@ function showStatusMessage(html) {
 
 function showBootError(err) {
   console.error('[boot]', err);
-  bootState = 'error';
-  showStatusMessage(`<span class="check-time">Failed to load sessions · ${err?.message || 'unknown error'}</span>`);
-  renderAll();
+  lastFetchError = err?.message || String(err);
+  finishLoading('error');
+  showStatusMessage(`<span class="check-time">Failed to load sessions · ${lastFetchError}</span>`);
+  safeRenderAll();
 }
 
 let bootState = 'loading';
+startBootFailsafe();
 
 function normalizeProfileCode(code) {
   return (code || '').trim().toLowerCase().replace(/\s+/g, '-');
@@ -982,6 +1032,7 @@ function asSessionArray(value) {
 }
 
 function isSurfSession(s) {
+  if (!s) return false;
   return !EXCLUDED_LEVELS.includes(s.level) && !EXCLUDED_WAVES.includes(s.wave);
 }
 
@@ -1227,24 +1278,38 @@ async function fetchSessionsPayload(params) {
   let payload = null;
   let sessions = [];
 
-  const statusRes = await fetchApi(`/api/status?${qs}`);
-  if (!statusRes.ok) {
-    throw new Error(`status HTTP ${statusRes.status}`);
-  }
-  payload = await statusRes.json();
-  sessions = normalizeSessions(extractSessionsFromPayload(payload));
+  try {
+    const statusRes = await fetchApi(`/api/status?${qs}`, {}, 20000);
+    if (!statusRes.ok) {
+      throw new Error(`status HTTP ${statusRes.status}`);
+    }
+    payload = await statusRes.json();
+    sessions = normalizeSessions(extractSessionsFromPayload(payload));
 
-  if (!sessions.length) {
-    console.warn('[fetch] /api/status returned 0 sessions — trying /api/sessions');
-    const sessionsRes = await fetchApi(`/api/sessions?${qs}`);
-    if (sessionsRes.ok) {
-      const alt = await sessionsRes.json();
-      const altSessions = normalizeSessions(extractSessionsFromPayload(alt));
-      if (altSessions.length) {
-        payload = { ...payload, ...alt };
-        sessions = altSessions;
+    if (!sessions.length && (payload.sessionsCount > 0 || payload.currentSessionsCount > 0)) {
+      console.warn('[fetch] status reports sessions but array empty after normalize — raw length',
+        extractSessionsFromPayload(payload).length);
+    }
+
+    if (!sessions.length) {
+      console.warn('[fetch] /api/status returned 0 sessions — trying /api/sessions');
+      try {
+        const sessionsRes = await fetchApi(`/api/sessions?${qs}`, {}, 15000);
+        if (sessionsRes.ok) {
+          const alt = await sessionsRes.json();
+          const altSessions = normalizeSessions(extractSessionsFromPayload(alt));
+          if (altSessions.length) {
+            payload = { ...payload, ...alt };
+            sessions = altSessions;
+          }
+        }
+      } catch (altErr) {
+        console.warn('[fetch] /api/sessions fallback failed', altErr);
       }
     }
+  } catch (err) {
+    lastFetchError = err?.message || String(err);
+    throw err;
   }
 
   return { payload, sessions };
@@ -1273,6 +1338,69 @@ function saveStatusCache() {
   } catch (e) {
     console.warn('[cache] save failed', e);
   }
+}
+
+async function resetLocalAppCache() {
+  const msgEl = document.getElementById('reset-state-msg');
+  if (msgEl) {
+    msgEl.textContent = 'Clearing service worker and local UI cache…';
+    msgEl.style.color = 'var(--sub)';
+  }
+  localStorage.removeItem(STORAGE.statusCache);
+  localStorage.removeItem(STORAGE.activeDayKey);
+  try {
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch (e) {
+    console.warn('[resetLocalAppCache]', e);
+  }
+  if (msgEl) {
+    msgEl.textContent = 'Cache cleared — reloading…';
+    msgEl.style.color = '#00c9a7';
+  }
+  location.reload();
+}
+
+async function debugReloadSessions() {
+  const msgEl = document.getElementById('reset-state-msg');
+  try {
+    const params = new URLSearchParams({
+      user_key: getUserKey(),
+      selected_date: activeDayKey || todayKey(),
+    });
+    const profileCode = getSavedProfileCode();
+    if (profileCode) params.set('profile_code', profileCode);
+    const { payload, sessions } = await fetchSessionsPayload(params);
+    console.log('[debugReload] first 3 sessions:', sessions.slice(0, 3));
+    console.log('[debugReload] counts', {
+      raw: extractSessionsFromPayload(payload).length,
+      normalized: sessions.length,
+      sessionsCount: payload.sessionsCount,
+      currentSessionsCount: payload.currentSessionsCount,
+      dataSource: payload.dataSource,
+    });
+    data = { ...data, ...payload, sessions };
+    finishLoading('ready');
+    safeRenderAll();
+    if (msgEl) {
+      msgEl.textContent = `Debug reload: ${sessions.length} sessions (see console).`;
+      msgEl.style.color = '#00c9a7';
+    }
+  } catch (e) {
+    lastFetchError = e?.message || String(e);
+    console.error('[debugReload]', e);
+    if (msgEl) {
+      msgEl.textContent = `Debug reload failed: ${lastFetchError}`;
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+  renderSetup();
 }
 
 async function resetLocalAppState() {
@@ -1490,16 +1618,24 @@ async function refresh({ silent = false } = {}) {
     mergeWatchlistFromServer(data.watchList);
     data.watchList = watchlistForUi();
     saveStatusCache();
-    validateActiveDayKey();
-    bootState = 'ready';
+    try {
+      validateActiveDayKey();
+    } catch (e) {
+      console.warn('[refresh] validateActiveDayKey', e);
+      activeDayKey = todayKey();
+      saveActiveDayKey(activeDayKey);
+    }
+    lastFetchError = null;
+    finishLoading('ready');
     logRenderDebug('refresh');
     if (!activeDayKey) activeDayKey = todayKey();
-    renderAll();
+    safeRenderAll();
     updateDateNavButtons();
     scheduleRefreshPoll();
   } catch (err) {
+    lastFetchError = err?.message || String(err);
     console.error('[refresh]', err);
-    bootState = prevSessions.length ? 'ready' : 'error';
+    finishLoading(prevSessions.length ? 'ready' : 'error');
     const cached = readStatusCacheFallback();
     const cachedSessions = normalizeSessions(cached?.sessions);
     if (cachedSessions.length) {
@@ -1508,9 +1644,9 @@ async function refresh({ silent = false } = {}) {
       data.sessions = prevSessions;
     }
     showStatusMessage(
-      `<span class="check-time">${data.sessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${err?.message || 'network error'}`}</span>`
+      `<span class="check-time">${data.sessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${lastFetchError}`}</span>`
     );
-    renderAll();
+    safeRenderAll();
   } finally {
     if (btn && !silent) btn.classList.remove('spinning');
   }
@@ -1531,12 +1667,26 @@ window.addEventListener('pageshow', (e) => {
   if (e.persisted) scheduleFocusRefresh();
 });
 
+function safeRenderAll() {
+  const steps = [
+    ['applyInternalBetaNav', () => applyInternalBetaNav()],
+    ['renderStatusBar', () => renderStatusBar()],
+    ['renderBrowse', () => renderBrowse()],
+    ['renderWatching', () => renderWatching()],
+    ['renderSetup', () => renderSetup()],
+  ];
+  for (const [name, fn] of steps) {
+    try {
+      fn();
+    } catch (err) {
+      lastRenderError = `${name}: ${err?.message || err}`;
+      console.error('[render]', lastRenderError, err);
+    }
+  }
+}
+
 function renderAll() {
-  applyInternalBetaNav();
-  renderStatusBar();
-  renderBrowse();
-  renderWatching();
-  renderSetup();
+  safeRenderAll();
 }
 
 function applyInternalBetaNav() {
@@ -1575,7 +1725,7 @@ function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
   if (!txt) return;
-  dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
+  if (dot) dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
 
   const {
     scrapeInProgress,
@@ -1616,8 +1766,13 @@ function renderStatusBar() {
     detail = `checked ${ageLabel(ageMins) || 'just now'}`;
   }
 
-  if (bootState === 'loading' && !loadedCount) {
+  if (uiLoading && !loadedCount) {
     txt.innerHTML = '<span class="check-time">Loading sessions…</span>';
+    return;
+  }
+
+  if (lastFetchError && !loadedCount && !lastSuccessfulScrape) {
+    txt.innerHTML = `<span class="check-time">Could not load · ${lastFetchError}</span>`;
     return;
   }
 
@@ -1636,37 +1791,54 @@ function renderStatusBar() {
 }
 
 function renderBrowse() {
-  document.getElementById('date-label').textContent = dateLabel(activeDayKey);
-  updateDateNavButtons();
+  const dateLabelEl = document.getElementById('date-label');
+  const waveChipsEl = document.getElementById('wave-chips');
+  const lessonsRowEl = document.getElementById('lessons-toggle-row');
+  const levelChipsEl = document.getElementById('level-chips');
+  const listEl = document.getElementById('session-list');
+  if (!listEl || !dateLabelEl) return;
 
-  document.getElementById('wave-chips').innerHTML = WAVE_FILTERS.map(f =>
-    `<button type="button" class="chip chip-sm${activeWave === f.wave ? ' on' : ''}" data-wave="${f.wave ?? ''}">${f.label}</button>`
-  ).join('');
+  dateLabelEl.textContent = dateLabel(activeDayKey);
+  try { updateDateNavButtons(); } catch (e) { console.warn('[renderBrowse] date nav', e); }
 
-  document.getElementById('lessons-toggle-row').innerHTML =
-    `<button type="button" class="lessons-link${showLessons ? ' on' : ''}" id="lessons-toggle">${showLessons ? 'Hide lessons' : 'Show lessons'}</button>`;
+  if (waveChipsEl) {
+    waveChipsEl.innerHTML = WAVE_FILTERS.map(f =>
+      `<button type="button" class="chip chip-sm${activeWave === f.wave ? ' on' : ''}" data-wave="${f.wave ?? ''}">${f.label}</button>`
+    ).join('');
+  }
+
+  if (lessonsRowEl) {
+    lessonsRowEl.innerHTML =
+      `<button type="button" class="lessons-link${showLessons ? ' on' : ''}" id="lessons-toggle">${showLessons ? 'Hide lessons' : 'Show lessons'}</button>`;
+  }
 
   let levelScope = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
   levelScope = levelScope.filter(matchesWaveFilter);
-  const levels = sortLevels([...new Set(levelScope.map(s => s.level))]);
+  const levels = sortLevels([...new Set(levelScope.map(s => s.level).filter(Boolean))]);
 
-  document.getElementById('level-chips').innerHTML = [
-    `<button type="button" class="chip chip-lvl${activeLevels.size === 0 ? ' on' : ''}" data-level="__all__">All</button>`,
-    ...levels.filter(l => LEVELS[l]).map(l => {
-      const c  = LEVELS[l];
-      const on = activeLevels.has(l);
-      return `<button type="button" class="chip chip-lvl${on ? ' on' : ''}" data-level="${encodeURIComponent(l)}" style="border-color:${on ? c.c : hexAlpha(c.c, .35)};color:${on ? c.c : 'var(--sub)'}">${c.s}</button>`;
-    }),
-  ].join('');
+  if (levelChipsEl) {
+    levelChipsEl.innerHTML = [
+      `<button type="button" class="chip chip-lvl${activeLevels.size === 0 ? ' on' : ''}" data-level="__all__">All</button>`,
+      ...levels.filter(l => LEVELS[l]).map(l => {
+        const c  = LEVELS[l];
+        const on = activeLevels.has(l);
+        return `<button type="button" class="chip chip-lvl${on ? ' on' : ''}" data-level="${encodeURIComponent(l)}" style="border-color:${on ? c.c : hexAlpha(c.c, .35)};color:${on ? c.c : 'var(--sub)'}">${c.s}</button>`;
+      }),
+    ].join('');
+  }
 
-  const listEl = document.getElementById('session-list');
-  if (bootState === 'loading' && !asSessionArray(data.sessions).length) {
+  if (uiLoading && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
     return;
   }
 
+  if (!asSessionArray(data.sessions).length && lastFetchError) {
+    listEl.innerHTML = `<div class="empty">Could not load sessions.<br>${lastFetchError}<br>Try Debug reload sessions in Settings.</div>`;
+    return;
+  }
+
   if (bootState === 'error' && !asSessionArray(data.sessions).length) {
-    listEl.innerHTML = '<div class="empty">Could not load sessions. Check connection or tap Reset local app state in Settings.</div>';
+    listEl.innerHTML = '<div class="empty">Could not load sessions. Check connection or tap Reset local app cache in Settings.</div>';
     return;
   }
 
@@ -1725,8 +1897,8 @@ function sessionCardHtml(s) {
   return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)">
     <div class="sc-accent" style="background:${accent}"></div>
     <div class="sc-body">
-      <div class="sc-time" style="color:${dimmed ? '#5d8aa8' : '#e8f4f8'}">${s.time.toUpperCase()}</div>
-      <div class="sc-level" style="color:${dimmed ? '#1a3a55' : cfg.c}">${s.level}</div>
+      <div class="sc-time" style="color:${dimmed ? '#5d8aa8' : '#e8f4f8'}">${(s.time || '').toUpperCase()}</div>
+      <div class="sc-level" style="color:${dimmed ? '#1a3a55' : cfg.c}">${s.level || s.session_type || 'Session'}</div>
       ${slotBarHtml(slots, s.level, cfg.c, dimmed, s)}
       <div class="sc-wave">${sideLabel}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
       ${booked ? `<div class="sc-booked">${booked}</div>` : ''}
@@ -1822,6 +1994,7 @@ function renderDebugState() {
       return iso;
     }
   };
+  const swActive = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
   const rows = [
     ['App version', data.appVersion || '—'],
     ['Build time', fmtTime(data.buildTime)],
@@ -1830,7 +2003,11 @@ function renderDebugState() {
     ['Sessions for date', String(sessionsForDateKey(activeDayKey).length)],
     ['dataSource', data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
-    ['Boot state', bootState],
+    ['lastFetchError', lastFetchError || '—'],
+    ['lastRenderError', lastRenderError || '—'],
+    ['uiLoading', uiLoading ? 'yes' : 'no'],
+    ['serviceWorker', swActive ? 'active' : 'inactive'],
+    ['userAgent', navigator.userAgent.slice(0, 80) + '…'],
   ];
   grid.innerHTML = rows.map(([k, v]) =>
     `<dt>${k}</dt><dd>${String(v).replace(/</g, '&lt;')}</dd>`
@@ -1892,6 +2069,8 @@ function renderSetup() {
   }
   renderDebugState();
 }
+
+async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
   const userKey = getUserKey();
   const topic = alertsEnabled() ? getNtfyTopic() : null;
@@ -2116,21 +2295,35 @@ document.getElementById('picker-to').addEventListener('change', (e) => {
 initTimeSelects();
 
 (async function boot() {
+  startBootFailsafe();
   try {
-    await initProfileUserKey();
-    loadStatusCache();
-    bootState = 'loading';
-    renderAll();
+    uiLoading = true;
+    try {
+      loadActiveDayKey();
+    } catch (e) {
+      console.warn('[boot] loadActiveDayKey', e);
+      activeDayKey = todayKey();
+    }
 
-    const watchlistPromise = loadWatchlistFromServer().catch((err) => {
+    const profilePromise = initProfileUserKey().catch((e) => {
+      console.warn('[boot] profile init failed', e);
+      const stored = localStorage.getItem(STORAGE.userKey);
+      if (stored) cachedUserKey = stored;
+    });
+
+    await Promise.race([
+      refresh({ silent: true }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Session fetch timeout 5s')), BOOT_FAILSAFE_MS)),
+    ]);
+
+    profilePromise.catch(() => {});
+    loadWatchlistFromServer().catch((err) => {
       console.warn('[boot] watchlist load failed', err);
       watchlistLoadState = localWatchlist.length ? 'ready' : 'error';
     });
 
-    await refresh({ silent: true });
-    await watchlistPromise;
-    bootState = 'ready';
-    renderAll();
+    finishLoading('ready');
+    safeRenderAll();
     scheduleRefreshPoll();
   } catch (err) {
     showBootError(err);

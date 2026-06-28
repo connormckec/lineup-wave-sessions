@@ -58,7 +58,8 @@ curl -s "https://YOUR-APP/api/status" | jq '{appVersion, buildTime, currentSessi
 4. If desktop shows stale selected date: **Settings → Reset local app state** — should refetch without wiping Lineup.
 5. DevTools → Application → Service Workers — confirm `/api/status` requests are **not** served from SW (network / no-store).
 6. Fresh app open should show sessions within a few seconds — not stuck on **Loading…** while `/api/status` returns `sessionsCount > 0`.
-7. Old cache `lineup-v1` should be gone after one visit; active cache is `lineup-static-v2`.
+7. If stuck, open DevTools Console — a script syntax error prevents all JS from running; use **Settings → Reset local app cache**.
+8. Old caches `lineup-v1` / `lineup-static-v2` are deleted on activate; active cache is `lineup-static-v3` (API and index.html not cached).
 
 ### Profile Sync Code (cross-device Lineup)
 

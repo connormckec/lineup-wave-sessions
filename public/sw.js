@@ -1,10 +1,8 @@
-/* Lineup service worker — static shell only; never cache API responses */
-const CACHE_VERSION = '2';
+/* Lineup service worker v3 — never cache API or index.html */
+const CACHE_VERSION = '3';
 const STATIC_CACHE = `lineup-static-v${CACHE_VERSION}`;
 
-const SHELL = [
-  '/',
-  '/index.html',
+const STATIC_ASSETS = [
   '/manifest.json',
   '/icon-192.png',
   '/icon-512.png',
@@ -29,7 +27,7 @@ function isStaticAsset(url) {
 self.addEventListener('install', (e) => {
   e.waitUntil(
     caches.open(STATIC_CACHE)
-      .then((cache) => cache.addAll(SHELL))
+      .then((cache) => cache.addAll(STATIC_ASSETS))
       .then(() => self.skipWaiting())
   );
 });
@@ -50,26 +48,9 @@ self.addEventListener('fetch', (e) => {
 
   const url = new URL(request.url);
 
-  // API: never intercept — browser goes straight to network with no-store headers
-  if (isApiRequest(url)) return;
+  // API + app shell: never intercept
+  if (isApiRequest(url) || isAppShell(url)) return;
 
-  // App shell: network-first so deploys land quickly
-  if (isAppShell(url)) {
-    e.respondWith(
-      fetch(request, { cache: 'no-store' })
-        .then((res) => {
-          if (res.ok) {
-            const copy = res.clone();
-            caches.open(STATIC_CACHE).then((cache) => cache.put(request, copy));
-          }
-          return res;
-        })
-        .catch(() => caches.match(request))
-    );
-    return;
-  }
-
-  // Versioned static assets: cache-first, refresh in background
   if (isStaticAsset(url)) {
     e.respondWith(
       caches.match(request).then((cached) => {
