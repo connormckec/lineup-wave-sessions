@@ -1232,6 +1232,9 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
 
   const failedDetailsSample = failedDetails.slice(0, 12).map(sessionDetailDiagnosticsFields);
   const unknownDetailsSample = unknownDetails.slice(0, 12).map(sessionDetailDiagnosticsFields);
+  const failedCookieOverlay = list.filter(s => effectiveDetailStatus(s) === 'failed_cookie_overlay');
+  const failedCookieOverlaySample = failedCookieOverlay.slice(0, 12).map(sessionDetailDiagnosticsFields);
+  const checkedOpenNoSlotsSample = checkedOpenNoSlots.slice(0, 12).map(sessionDetailDiagnosticsFields);
 
   const checkedButNoSlotsSample = [
     ...checkedOpenNoSlots,
@@ -1255,6 +1258,10 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     unknownDetailsCount: unknownDetails.length,
     failedDetailsSample,
     unknownDetailsSample,
+    failedCookieOverlayCount: failedCookieOverlay.length,
+    failedCookieOverlaySample,
+    checkedOpenNoSlotsCount: checkedOpenNoSlots.length,
+    checkedOpenNoSlotsSample,
     checkedButNoSlotsCount: checkedButNoSlotsSample.length,
     checkedButNoSlotsSample,
     lastBasicCheckAt: checkTimes.lastBasicCheckAt,
@@ -1954,6 +1961,7 @@ function isDetailSuccessStatus(status) {
 
 function parseDetailAvailabilityFromText(text) {
   if (!text) return null;
+  if (isCookieBannerText(text)) return null;
   const t = String(text).replace(/\s+/g, ' ').trim();
   const low = t.toLowerCase();
 
@@ -2044,17 +2052,52 @@ function inferDetailStatusFromPayload(details) {
   if (details.openNoCount) return 'checked_open_no_slots_visible';
   if (details.slots != null || details.capacity != null || details.price_text) return 'checked_with_slots';
   if (details.rawModalText && String(details.rawModalText).trim().length > 8) return 'failed_parse';
-  return 'unknown';
+  return 'failed_parse';
 }
 
-function preservePriorDetailFields(entry, prior) {
-  if (!prior) return;
-  for (const field of [
-    'slots', 'capacity', 'estimatedBooked', 'fillRate',
-    'priceText', 'priceMin', 'priceMax', 'currency', 'available',
-  ]) {
-    if (prior[field] != null && entry[field] == null) entry[field] = prior[field];
+function ensureDetailStatusRecorded(entry, fallback = 'failed_parse') {
+  const st = normalizeDetailStatus(entry?.detailStatus);
+  if (!st || st === 'unknown' || st === 'checking') {
+    entry.detailStatus = fallback;
+    if (!entry.detailError) entry.detailError = 'detail_status_missing_after_attempt';
   }
+}
+
+function sessionLookupContext(session) {
+  if (!session) return {};
+  const raw = session.raw && typeof session.raw === 'object' ? session.raw : {};
+  return {
+    ts: Number(session.ts),
+    wave: Number(session.wave),
+    key: session.key,
+    time: session.time,
+    level: session.level || session.session_type,
+    waveSide: session.waveSide,
+    isoDate: session.isoDate || session.dateKey,
+    tileText: session.tileText || session.detailRawTileText || raw.tileText || null,
+    tileColumnIndex: session.tileColumnIndex ?? raw.tileColumnIndex ?? null,
+    tileClassName: session.tileClassName ?? raw.tileClassName ?? null,
+  };
+}
+
+function isCookieBannerText(text) {
+  if (!text) return false;
+  const low = String(text).toLowerCase();
+  return (low.includes('cookie') && (low.includes('allow') || low.includes('refuse') || low.includes('consent')))
+    || low.includes('this website uses cookies')
+    || (low.includes('refuse cookies') && low.includes('allow cookies'));
+}
+
+function modalTextLooksLikeSessionDetail(text, session) {
+  if (!text || isCookieBannerText(text)) return false;
+  const low = text.toLowerCase();
+  if (/session level|from\s*:|qty|spot|book|packed|sold out|\$\d/i.test(text)) return true;
+  if (session?.level && low.includes(String(session.level).toLowerCase())) return true;
+  if (session?.time) {
+    const t = String(session.time).toLowerCase().replace(/\s+/g, ' ').trim();
+    if (t && t !== '?' && low.includes(t.replace(/\s/g, ''))) return true;
+  }
+  return text.trim().length > 40 && !isCookieBannerText(text);
 }
 
 function computeSessionMetrics(slots, capacity, level, { inferCapacityFromLevel = false } = {}) {
@@ -2232,17 +2275,19 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
   entry.lastDetailedCheckAt = now;
 
   if (status === 'unknown') {
-    entry.detailStatus = 'unknown';
+    entry.detailStatus = 'failed_parse';
     entry.detailError = details.detailError || details.parseReason || 'insufficient_detail_signal';
     preservePriorDetailFields(entry, priorSnapshot);
-    return { ok: false, category: 'unknown', status };
+    ensureDetailStatusRecorded(entry, 'failed_parse');
+    return { ok: false, category: 'failed', status: 'failed_parse' };
   }
 
   if (isDetailFailureStatus(status)) {
-    entry.detailStatus = status;
+    entry.detailStatus = normalizeDetailStatus(status) || status;
     entry.detailError = details.detailError || status;
     preservePriorDetailFields(entry, priorSnapshot);
-    return { ok: false, category: 'failed', status };
+    ensureDetailStatusRecorded(entry, entry.detailStatus);
+    return { ok: false, category: 'failed', status: entry.detailStatus };
   }
 
   if (details.available === false || status === 'checked_packed' || details.packed || details.slots === 0) {
@@ -2292,30 +2337,44 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
     ? 'checked_with_slots'
     : 'checked_open_no_slots_visible';
   entry.detailError = entry.detailWarning || null;
+  ensureDetailStatusRecorded(entry, entry.slots != null ? 'checked_with_slots' : 'checked_open_no_slots_visible');
   return {
     ok: sessionHasDetailedData(entry),
     category: entry.slots != null ? 'with_slots' : 'open_no_slots_visible',
   };
 }
 
+function preservePriorDetailFields(entry, prior) {
+  if (!prior) return;
+  for (const field of [
+    'slots', 'capacity', 'estimatedBooked', 'fillRate',
+    'priceText', 'priceMin', 'priceMax', 'currency', 'available',
+  ]) {
+    if (prior[field] != null && entry[field] == null) entry[field] = prior[field];
+  }
+}
+
 function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
   if (!entry) return { ok: false, category: 'failed' };
   const priorSnapshot = prior || { ...entry };
   const now = new Date().toISOString();
-  const status = failure?.detailStatus || failure?.failureType || 'failed_parse';
+  const status = normalizeDetailStatus(failure?.detailStatus || failure?.failureType) || 'failed_parse';
   entry.lastDetailedCheckAt = now;
   entry.detailStatus = status;
   entry.detailError = failure?.detailError || status;
   if (failure?.rawModalText) entry.detailRawText = truncateDetailText(failure.rawModalText);
   if (failure?.rawTileText) entry.detailRawTileText = truncateDetailText(failure.rawTileText);
   if (failure?.failedSelector) entry.detailFailedSelector = failure.failedSelector;
+  if (failure?.parseReason) entry.detailParseReason = failure.parseReason;
   preservePriorDetailFields(entry, priorSnapshot);
-  return { ok: false, category: 'failed', status: normalizeDetailStatus(status) || status };
+  ensureDetailStatusRecorded(entry, status);
+  return { ok: false, category: 'failed', status: entry.detailStatus };
 }
 
 function incrementDetailFailureStats(stats, status) {
   const st = normalizeDetailStatus(status) || status;
-  if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
+  if (st === 'failed_cookie_overlay') stats.sessionsFailedCookieOverlay = (stats.sessionsFailedCookieOverlay || 0) + 1;
+  else if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
   else if (st === 'failed_selector') stats.sessionsFailedSelector = (stats.sessionsFailedSelector || 0) + 1;
   else if (st === 'failed_timeout') stats.sessionsTimedOut = (stats.sessionsTimedOut || 0) + 1;
   else stats.sessionsFailed = (stats.sessionsFailed || 0) + 1;
@@ -2323,7 +2382,8 @@ function incrementDetailFailureStats(stats, status) {
 
 function sessionQualifiesForFailedFirstEnrich(s) {
   const st = effectiveDetailStatus(s);
-  if (['failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout', 'unknown'].includes(st)) return true;
+  if (['failed_cookie_overlay', 'failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout'].includes(st)) return true;
+  if (st === 'unknown' && (s.lastDetailedCheckAt || s.last_detailed_check_at)) return true;
   if (s.available !== false && !sessionHasDetailedData(s)) return true;
   return false;
 }
@@ -2331,12 +2391,13 @@ function sessionQualifiesForFailedFirstEnrich(s) {
 function sortSessionsForFailedFirstEnrich(sessions) {
   const score = (s) => {
     const st = effectiveDetailStatus(s);
-    if (st === 'failed_selector') return 0;
-    if (st === 'failed_parse') return 1;
-    if (st === 'failed_timeout' || st === 'failed_modal_open') return 2;
-    if (st === 'unknown') return 3;
-    if (!sessionHasDetailedData(s)) return 4;
-    return 5;
+    if (st === 'failed_cookie_overlay') return 0;
+    if (st === 'failed_selector') return 1;
+    if (st === 'failed_parse') return 2;
+    if (st === 'failed_timeout' || st === 'failed_modal_open') return 3;
+    if (st === 'unknown' && (s.lastDetailedCheckAt || s.last_detailed_check_at)) return 4;
+    if (!sessionHasDetailedData(s)) return 5;
+    return 6;
   };
   return [...asSessionArray(sessions)].sort((a, b) => {
     const diff = score(a) - score(b);
@@ -2370,9 +2431,17 @@ function normalizeDetailStatus(status) {
 
 function effectiveDetailStatus(s) {
   const raw = normalizeDetailStatus(s?.detailStatus || s?.detail_status);
-  if (raw) return raw;
-  if (!s?.lastDetailedCheckAt && !s?.last_detailed_check_at) return 'unknown';
-  return 'unknown';
+  if (raw && raw !== 'unknown') return raw;
+  const attempted = !!(s?.lastDetailedCheckAt || s?.last_detailed_check_at);
+  if (!attempted) return 'unknown';
+  if (s?.slots === 0 && s?.available === false) return 'checked_packed';
+  if (s?.slots != null) return 'checked_with_slots';
+  const err = String(s?.detailError || s?.detail_error || '').toLowerCase();
+  if (err.includes('cookie')) return 'failed_cookie_overlay';
+  if (err.includes('tile not found') || err.includes('selector')) return 'failed_selector';
+  if (err.includes('timeout')) return 'failed_timeout';
+  if (err.includes('modal never')) return 'failed_modal_open';
+  return 'failed_parse';
 }
 
 function isDetailUnknownStatus(status) {
@@ -2396,6 +2465,8 @@ function reasonForDetailStatus(s) {
       return err || 'modal_open_session_open_no_slot_count';
     case 'failed_selector':
       return err || 'booking_tile_or_modal_selector_missing';
+    case 'failed_cookie_overlay':
+      return err || 'cookie_consent_overlay_blocked_modal';
     case 'failed_modal_open':
       return err || 'tile_clicked_modal_never_appeared';
     case 'failed_parse':
@@ -2618,9 +2689,10 @@ function extractDetailsFromNetworkCapture(captured, ts) {
   return null;
 }
 
-async function getSessionDetailsWithFallback(page, ts, wave, networkCapture) {
-  const label = `${ts}_${wave}`;
-  const fromNetwork = networkCapture ? extractDetailsFromNetworkCapture(networkCapture, ts) : null;
+async function getSessionDetailsWithFallback(page, session, networkCapture) {
+  const ctx = sessionLookupContext(session);
+  const label = ctx.key || `${ctx.ts}_${ctx.wave}`;
+  const fromNetwork = networkCapture ? extractDetailsFromNetworkCapture(networkCapture, ctx.ts) : null;
   if (fromNetwork && (fromNetwork.slots != null || fromNetwork.capacity != null || fromNetwork.price_text)) {
     console.log(`  [details ${label}] from network response`);
     fromNetwork.detailStatus = fromNetwork.slots === 0
@@ -2629,7 +2701,7 @@ async function getSessionDetailsWithFallback(page, ts, wave, networkCapture) {
     fromNetwork.parseReason = 'network_json';
     return fromNetwork;
   }
-  return getSessionModalDetails(page, ts, wave);
+  return getSessionModalDetails(page, session);
 }
 
 async function navigateToSessionDate(page, isoDate) {
@@ -2811,6 +2883,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     sessionsFailed: 0,
     sessionsFailedParse: 0,
     sessionsFailedSelector: 0,
+    sessionsFailedCookieOverlay: 0,
     sessionsTimedOut: 0,
     errors: [],
   };
@@ -2852,7 +2925,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
         sessionsNeedingDetailAfterBasic.delete(s.key);
 
         try {
-          const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
+          const details = await getSessionDetailsWithFallback(page, s, networkCapture);
           if (!details || isDetailFailureStatus(normalizeDetailStatus(details.detailStatus || details.failureType))) {
             const err = details?.detailError || details?.detailStatus || 'no_details';
             stats.errors.push({ session_key: s.key, error: err, detail_status: details?.detailStatus || 'failed_parse' });
@@ -3728,6 +3801,75 @@ function buildWatchRow(body) {
 
 const MAX_SLOT_CLICKS = 30;
 const MODAL_SELECTORS = ['.modal.in', '.modal.show', '.modal', '[class*="modal-dialog"]', '[class*="popup"]', '[class*="booking"]', '.popover'];
+
+async function dismissCookieBanner(page) {
+  try {
+    const clicked = await page.evaluate(() => {
+      const acceptPatterns = [
+        /^allow cookies$/i, /^accept all$/i, /^accept cookies$/i, /^accept$/i,
+        /^agree$/i, /^i agree$/i, /^got it$/i, /^ok$/i,
+      ];
+      const refusePatterns = [/^refuse cookies$/i, /^reject all$/i, /^reject$/i, /^decline$/i];
+      const buttons = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+      for (const btn of buttons) {
+        const t = (btn.innerText || btn.textContent || btn.value || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (acceptPatterns.some(re => re.test(t)) || refusePatterns.some(re => re.test(t))) {
+          btn.click();
+          return t;
+        }
+      }
+      const banner = document.querySelector('[class*="cookie"], [id*="cookie"], [class*="consent"], [id*="consent"]');
+      if (banner) {
+        const innerBtn = banner.querySelector('button, a, [role="button"]');
+        if (innerBtn) {
+          innerBtn.click();
+          return (innerBtn.innerText || innerBtn.textContent || 'cookie_banner_button').trim();
+        }
+      }
+      return null;
+    });
+    if (clicked) {
+      console.log(`  [cookie] dismissed via "${clicked}"`);
+      await page.waitForTimeout(500);
+      await page.waitForFunction(() => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        const hasBanner = body.includes('this website uses cookies')
+          && (body.includes('allow cookies') || body.includes('refuse cookies'));
+        const overlay = document.querySelector('[class*="cookie" i], [id*="cookie" i], [class*="consent" i]');
+        if (!overlay) return !hasBanner;
+        const style = window.getComputedStyle(overlay);
+        return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || !hasBanner;
+      }, { timeout: 4000 }).catch(() => {});
+      return true;
+    }
+  } catch (e) {
+    console.log(`  [cookie] dismiss skipped: ${e.message}`);
+  }
+  return false;
+}
+
+async function readModalText(page, modal) {
+  return modal.evaluate(() => {
+    const el = document.querySelector('.modal.in, .modal.show, .modal, [role="dialog"]') || document.body;
+    const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    const qty = document.querySelector('input.qty-info');
+    const maxAttr = qty?.getAttribute('max');
+    const maxQty = maxAttr ? parseInt(maxAttr, 10) : null;
+    return { text, maxQty: Number.isFinite(maxQty) && maxQty > 0 ? maxQty : null };
+  });
+}
+
+function cookieOverlayFailure(rawTileText, rawModalText) {
+  return {
+    detailStatus: 'failed_cookie_overlay',
+    failureType: 'failed_cookie_overlay',
+    detailError: 'cookie consent overlay blocked session modal',
+    parseReason: 'cookie_banner_text',
+    rawTileText,
+    rawModalText: truncateDetailText(rawModalText, 1500),
+  };
+}
 const PLUS_SELECTORS = [
   '.btn-plus',
   'button.btn-plus',
@@ -3964,42 +4106,124 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
   return null;
 }
 
-async function findSessionTile(page, ts, wave, label) {
+async function findSessionTile(page, session, label) {
+  const ctx = sessionLookupContext(session);
+  const ts = ctx.ts;
+  const wave = ctx.wave;
+
   const selectors = [
     `div[class*="booking-agenda-clickable_${ts}_${wave}"]`,
     `[class*="booking-agenda-clickable_${ts}_${wave}"]`,
     `div.dynamic-cal-booking-ts[class*="_${ts}_${wave}"]`,
   ];
-  for (const sel of selectors) {
-    const tile = await page.$(sel);
-    if (tile) return { tile, selector: sel };
+  if (ctx.tileClassName) {
+    const safeClass = ctx.tileClassName.split(/\s+/).find(c => c.includes('booking-agenda-clickable'));
+    if (safeClass) selectors.unshift(`div.${safeClass.replace(/([^\w-])/g, '\\$1')}`);
   }
+
+  for (const sel of selectors) {
+    const tile = await page.$(sel).catch(() => null);
+    if (tile) return { tile, selector: sel, method: 'css_selector' };
+  }
+
   try {
-    const handle = await page.evaluateHandle(({ ts: t, wave: w }) => {
-      const re = new RegExp(`booking-agenda-clickable_${t}_${w}(?:\\D|$)`);
-      for (const el of document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
-        if (re.test(el.className)) return el;
+    const handle = await page.evaluateHandle(({ ctx: c }) => {
+      const normTime = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const normLevel = (l) => String(l || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const normSide = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const normText = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+      const targetTime = normTime(c.time);
+      const targetLevel = normLevel(c.level);
+      const targetSide = normSide(c.waveSide);
+      const targetTileText = normText(c.tileText);
+      const targetIso = c.isoDate;
+
+      function columnIndex(el) {
+        const td = el.closest('td');
+        return td ? td.cellIndex : null;
       }
-      return null;
-    }, { ts, wave });
+
+      function columnHeader(el) {
+        const td = el.closest('td');
+        if (!td) return '';
+        const table = td.closest('table');
+        const headerRow = table?.querySelector('thead tr') || table?.querySelector('tr');
+        return normText(headerRow?.cells?.[td.cellIndex]?.textContent);
+      }
+
+      const candidates = [];
+      for (const el of document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
+        const cls = el.className || '';
+        const title = el.dataset.originalTitle || '';
+        const wm = cls.match(/booking-agenda-clickable_(\d+)_(\d+)/);
+        if (!wm) continue;
+        const elTs = +wm[1];
+        const elWave = +wm[2];
+        const lm = title.match(/Session level\s*:<\/b>\s*([^<]+)/i);
+        const fm = title.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
+        const elLevel = lm ? normLevel(lm[1]) : '';
+        const elTime = fm ? normTime(fm[1]) : '';
+        const elText = normText((el.innerText || el.textContent || title).replace(/<[^>]+>/g, ' '));
+        const elIso = (() => {
+          try {
+            return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(elTs * 1000));
+          } catch { return null; }
+        })();
+
+        let score = 0;
+        if (Number.isFinite(c.ts) && elTs === c.ts) score += 100;
+        else if (Number.isFinite(c.ts) && Math.abs(elTs - c.ts) <= 60) score += 40;
+        if (Number.isFinite(c.wave) && elWave === c.wave) score += 50;
+        if (targetTime && elTime && targetTime === elTime) score += 45;
+        else if (targetTime && elTime && targetTime.replace(/\s/g, '') === elTime.replace(/\s/g, '')) score += 35;
+        if (targetLevel && elLevel && (targetLevel === elLevel || elLevel.includes(targetLevel) || targetLevel.includes(elLevel))) score += 35;
+        if (targetIso && elIso && targetIso === elIso) score += 25;
+        if (targetSide) {
+          const hdr = columnHeader(el);
+          if (hdr.includes(targetSide) || elText.includes(targetSide)) score += 30;
+        }
+        if (targetTileText && elText) {
+          if (elText === targetTileText) score += 50;
+          else if (elText.includes(targetTileText) || targetTileText.includes(elText)) score += 30;
+        }
+        if (c.tileClassName && cls === c.tileClassName) score += 80;
+        if (c.tileColumnIndex != null && columnIndex(el) === c.tileColumnIndex) score += 20;
+        if (cls.includes(`_${c.ts}_${c.wave}`)) score += 60;
+
+        if (score >= 80) candidates.push({ el, score, elTs, elWave, elTime, elLevel });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0]?.el || null;
+    }, { ctx });
+
     const el = handle.asElement();
     if (el) {
-      console.log(`  [getSessionModalDetails ${label}] tile found via DOM scan`);
-      return { tile: el, selector: 'dom_scan_dynamic_cal' };
+      const meta = await el.evaluate(node => ({
+        className: node.className,
+        text: (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+      }));
+      console.log(`  [getSessionModalDetails ${label}] tile found via scored DOM scan (class="${meta.className.slice(0, 60)}")`);
+      return { tile: el, selector: 'scored_dom_scan', method: 'scored_dom_scan', tilePreview: meta.text };
     }
     await handle.dispose();
   } catch (e) {
-    console.log(`  [getSessionModalDetails ${label}] DOM scan failed: ${e.message}`);
+    console.log(`  [getSessionModalDetails ${label}] scored DOM scan failed: ${e.message}`);
   }
-  return { tile: null, selector: selectors[0] };
+
+  return { tile: null, selector: selectors[0], method: 'not_found' };
 }
 
-async function getSessionModalDetails(page, ts, wave) {
-  const label = `${ts}_${wave}`;
+async function getSessionModalDetails(page, session, { cookieRetryAllowed = true } = {}) {
+  const ctx = sessionLookupContext(session);
+  const label = ctx.key || `${ctx.ts}_${ctx.wave}`;
   console.log(`\n[getSessionModalDetails ${label}] starting`);
 
+  await dismissCookieBanner(page);
+
   try {
-    const { tile, selector: tileSel } = await findSessionTile(page, ts, wave, label);
+    const { tile, selector: tileSel, method: tileMethod } = await findSessionTile(page, session, label);
     if (!tile) {
       console.log(`  [getSessionModalDetails ${label}] tile not found (${tileSel})`);
       return {
@@ -4007,13 +4231,14 @@ async function getSessionModalDetails(page, ts, wave) {
         failureType: 'failed_selector',
         detailError: `tile not found (${tileSel})`,
         failedSelector: tileSel,
-        rawTileText: null,
+        rawTileText: ctx.tileText || null,
         rawModalText: null,
+        parseReason: 'tile_not_found',
       };
     }
 
-    const rawTileText = await tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => '');
-    console.log(`  [getSessionModalDetails ${label}] tile found, text="${rawTileText.slice(0, 80)}"`);
+    const rawTileText = await tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => ctx.tileText || '');
+    console.log(`  [getSessionModalDetails ${label}] tile found via ${tileMethod}, text="${rawTileText.slice(0, 80)}"`);
 
     const tileParsed = parseDetailAvailabilityFromText(rawTileText);
     if (tileParsed?.packed) {
@@ -4054,18 +4279,22 @@ async function getSessionModalDetails(page, ts, wave) {
     let rawModalText = '';
     let capacityFromModal = null;
     try {
-      const meta = await modal.evaluate(() => {
-        const el = document.querySelector('.modal.in, .modal.show, .modal, [role="dialog"]') || document.body;
-        const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
-        const qty = document.querySelector('input.qty-info');
-        const maxAttr = qty?.getAttribute('max');
-        const maxQty = maxAttr ? parseInt(maxAttr, 10) : null;
-        return { text, maxQty: Number.isFinite(maxQty) && maxQty > 0 ? maxQty : null };
-      });
+      const meta = await readModalText(page, modal);
       rawModalText = meta.text || '';
       capacityFromModal = meta.maxQty;
     } catch (pe) {
       console.log(`  [getSessionModalDetails ${label}] modal text read skipped: ${pe.message}`);
+    }
+
+    if (isCookieBannerText(rawModalText)) {
+      console.log(`  [getSessionModalDetails ${label}] cookie overlay detected in modal text`);
+      await closeModal(page, label);
+      if (cookieRetryAllowed) {
+        await dismissCookieBanner(page);
+        await page.waitForTimeout(400);
+        return getSessionModalDetails(page, session, { cookieRetryAllowed: false });
+      }
+      return cookieOverlayFailure(rawTileText, rawModalText);
     }
 
     const modalParsed = parseDetailAvailabilityFromText(rawModalText);
@@ -4130,11 +4359,18 @@ async function getSessionModalDetails(page, ts, wave) {
     }
 
     console.log(`  [getSessionModalDetails ${label}] could not parse slots from modal`);
-    const failStatus = rawModalText && rawModalText.trim().length > 8 ? 'failed_parse' : 'unknown';
+    if (isCookieBannerText(rawModalText)) {
+      if (cookieRetryAllowed) {
+        await dismissCookieBanner(page);
+        return getSessionModalDetails(page, session, { cookieRetryAllowed: false });
+      }
+      return cookieOverlayFailure(rawTileText, rawModalText);
+    }
+
     return {
-      detailStatus: failStatus,
-      failureType: failStatus === 'failed_parse' ? 'failed_parse' : undefined,
-      detailError: failStatus === 'failed_parse'
+      detailStatus: 'failed_parse',
+      failureType: 'failed_parse',
+      detailError: rawModalText && rawModalText.trim().length > 8
         ? 'modal opened but slot count could not be parsed'
         : 'modal opened with insufficient text to classify',
       rawTileText,
@@ -4153,14 +4389,15 @@ async function getSessionModalDetails(page, ts, wave) {
       detailStatus: isTimeout ? 'failed_timeout' : 'failed_parse',
       failureType: isTimeout ? 'failed_timeout' : 'failed_parse',
       detailError: e.message,
-      rawTileText: null,
+      rawTileText: ctx.tileText || null,
       rawModalText: null,
     };
   }
 }
 
-async function getSlotCount(page, ts, wave) {
-  const details = await getSessionModalDetails(page, ts, wave);
+async function getSlotCount(page, ts, wave, session = null) {
+  const s = session || { ts, wave, key: `${ts}_${wave}` };
+  const details = await getSessionModalDetails(page, s);
   return details?.slots ?? null;
 }
 
@@ -4308,6 +4545,7 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
     const weekday = d.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
     const dayLabel = displayDate;
     const sideInfo = resolveWaveSide(el, wave, level, t);
+    const td = el.closest('td');
     out.push({
       key, ts, wave, level,
       available : !cls.includes('expired_timeslot'),
@@ -4322,6 +4560,8 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
       waveSideSource: sideInfo.waveSideSource,
       sideParseRaw: sideInfo.sideParseRaw,
       tileText  : sideInfo.tileText,
+      tileClassName: cls,
+      tileColumnIndex: td ? td.cellIndex : null,
       waveSideAmbiguous: sideInfo.waveSideAmbiguous,
       sideKey   : `${ts}_${sideInfo.waveSide.toLowerCase().replace(/\s+/g, '-')}`,
       sessionType: level,
@@ -4576,7 +4816,7 @@ async function fillSlotCounts(page, batch, byKey, prevByKey, stats, { networkCap
       continue;
     }
 
-    const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
+    const details = await getSessionDetailsWithFallback(page, s, networkCapture);
     const prior = { ...entry, ...(prevByKey.get(s.key) || {}) };
     try {
       if (details && !isDetailFailureStatus(normalizeDetailStatus(details.detailStatus || details.failureType))) {
@@ -5097,6 +5337,7 @@ async function buildEnrichmentDebugPayload() {
 async function openBookingPage(page) {
   await page.goto(BOOKING, { waitUntil: 'networkidle', timeout: 30_000 });
   await page.waitForSelector('.dynamic-cal-booking-ts', { timeout: 15_000 });
+  await dismissCookieBanner(page);
 }
 
 async function detectAvailableWeeks(page) {
@@ -5843,6 +6084,7 @@ app.post('/api/admin/enrich-date', async (req, res) => {
         sessionsCheckedOpenNoSlotsVisible: 0,
         sessionsFailedParse: 0,
         sessionsFailedSelector: 0,
+        sessionsFailedCookieOverlay: 0,
         sessionsTimedOut: 0,
         sessionsFailed: 0,
         topErrors: [],
@@ -5865,6 +6107,7 @@ app.post('/api/admin/enrich-date', async (req, res) => {
       sessionsCheckedOpenNoSlotsVisible: result.sessionsCheckedOpenNoSlotsVisible ?? result.sessionsCheckedNoSlotsVisible ?? 0,
       sessionsFailedParse: result.sessionsFailedParse ?? 0,
       sessionsFailedSelector: result.sessionsFailedSelector ?? 0,
+      sessionsFailedCookieOverlay: result.sessionsFailedCookieOverlay ?? 0,
       sessionsTimedOut: result.sessionsTimedOut ?? 0,
       sessionsFailed: result.sessionsFailed ?? 0,
       topErrors: buildTopDetailErrors(result.errors),
