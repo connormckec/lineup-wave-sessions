@@ -13,6 +13,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';
+const INTERNAL_BETA = process.env.INTERNAL_BETA_NOTIFICATIONS === 'true';
+const INTERNAL_DEFAULT_NTFY_TOPIC = 'ap-surf-connor-2026';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
@@ -425,14 +427,28 @@ async function recordNotificationEvent(watch, session, eventType, message, resul
   }
 }
 
+function resolveNtfyTopicForWatch(watch) {
+  const userTopic = (watch?.ntfy_topic || '').trim();
+  if (userTopic) return userTopic;
+  if (!INTERNAL_BETA) return null;
+  return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
+}
+
+function resolveNtfyTopicForRequest(requestTopic) {
+  const userTopic = (requestTopic || '').trim();
+  if (userTopic) return userTopic;
+  if (!INTERNAL_BETA) return TOPIC.trim() || null;
+  return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
+}
+
 async function maybeSendWatchAlert(watch, session, eventType, { urgent = false } = {}) {
-  const topic = (watch.ntfy_topic || '').trim() || TOPIC;
+  const topic = resolveNtfyTopicForWatch(watch);
   if (!topic) {
     console.log(`  [alert skip] no ntfy topic for ${watch.session_key} (${eventType})`);
     return;
   }
-  if (topic === TOPIC && !watch.ntfy_topic) {
-    console.log(`  [alert] using fallback NTFY_TOPIC for ${watch.user_key}`);
+  if (!watch.ntfy_topic?.trim() && INTERNAL_BETA) {
+    console.log(`  [alert] internal beta fallback topic for ${watch.user_key.slice(0, 8)}…`);
   }
 
   const dedupeKey = alertDedupeKey(watch.user_key, watch.session_key, eventType);
@@ -1608,6 +1624,8 @@ function statusPayload(userKey = null) {
     lastCheck: lastSuccessfulScrape || lastCheck,
     ntfyOk: !!TOPIC,
     ntfyFallbackConfigured: !!TOPIC,
+    internalBetaNotifications: INTERNAL_BETA,
+    internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
     watchlistCount: activeWatchItems().length,
     ...dateCoverage,
     scrapeMeta: {
@@ -1699,7 +1717,7 @@ app.delete('/api/watchlist/:id', async (req, res) => {
 });
 
 app.post('/api/notify/test', async (req, res) => {
-  const topic = (req.body?.ntfy_topic || '').trim() || TOPIC;
+  const topic = resolveNtfyTopicForRequest(req.body?.ntfy_topic);
   if (!topic) return res.status(400).json({ error: 'ntfy_topic required' });
   const result = await sendNtfy(
     topic,
@@ -1774,7 +1792,11 @@ function startServer() {
     console.log('Tier 3 (weeks 2–3):              every 6 hours');
     console.log('Tier 4 (weeks 4+):               daily at midnight');
     console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
-    console.log(TOPIC ? `Ntfy fallback topic configured (personal testing)` : 'No NTFY_TOPIC fallback — users set topics in Setup');
+    if (INTERNAL_BETA) {
+      console.log(`Internal beta notifications enabled (default topic: ${INTERNAL_DEFAULT_NTFY_TOPIC})`);
+    } else {
+      console.log(TOPIC ? 'Ntfy fallback topic configured (personal testing)' : 'No NTFY_TOPIC fallback — users set topics in Setup');
+    }
     startBackgroundServices().catch((e) => {
       console.error('Background startup error:', e.message);
       bootstrapInBackground();

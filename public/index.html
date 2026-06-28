@@ -77,6 +77,18 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
   width:28px;height:2px;background:var(--accent);border-radius:1px;
 }
 .nav-btn svg{width:21px;height:21px;stroke-width:1.8;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+.nav-btn.nav-beta{color:var(--accent);font-weight:600}
+.nav-btn .nav-beta-dot{display:none}
+.nav-btn.nav-beta .nav-beta-dot{
+  display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--accent);margin-left:4px;vertical-align:top;
+  box-shadow:0 0 6px rgba(0,201,167,.55);
+}
+.ntfy-beta-hint{
+  font-size:12px;color:var(--accent);margin:0 0 10px;line-height:1.45;
+  padding:10px 12px;border-radius:8px;background:rgba(0,201,167,.08);
+  border:1px solid rgba(0,201,167,.25);
+}
 .wbadge{min-width:18px;height:18px;background:var(--accent);color:var(--bg);border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;font-family:var(--font-display)}
 
 /* ── Chips ── */
@@ -361,6 +373,7 @@ input.field:focus{border-color:var(--accent)}
       <div class="setup-block">
         <h3>Push Notifications</h3>
         <p>Install the free <strong>Ntfy</strong> app, subscribe to your own private topic, then save it here.</p>
+        <p id="ntfy-beta-hint" class="ntfy-beta-hint" hidden></p>
         <div class="lbl">Your ntfy topic</div>
         <input class="field" type="text" id="ntfy-topic-input" placeholder="my-secret-ap-topic" autocomplete="off">
         <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:8px 0 0"></p>
@@ -423,7 +436,7 @@ input.field:focus{border-color:var(--accent)}
     </button>
     <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      Setup
+      Alerts<span class="nav-beta-dot" aria-hidden="true"></span>
     </button>
   </nav>
 
@@ -466,7 +479,24 @@ function getUserKey() {
   return key;
 }
 
+function hasSavedNtfyTopic() {
+  return !!(localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
+}
+
 function getNtfyTopic() {
+  const saved = (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
+  if (saved) return saved;
+  if (data.internalBetaNotifications && data.internalDefaultNtfyTopic) {
+    return data.internalDefaultNtfyTopic;
+  }
+  return '';
+}
+
+function getNtfyTopicForInput() {
+  if (hasSavedNtfyTopic()) return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
+  if (data.internalBetaNotifications && data.internalDefaultNtfyTopic) {
+    return data.internalDefaultNtfyTopic;
+  }
   return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
 }
 
@@ -535,11 +565,11 @@ function saveNtfyTopic() {
 
 async function sendTestNotification() {
   const topic = getNtfyTopic();
-  if (!topic) {
+  const msgEl = document.getElementById('ntfy-topic-msg');
+  if (!topic && !data.internalBetaNotifications) {
     alert('Enter and save your ntfy topic first.');
     return;
   }
-  const msgEl = document.getElementById('ntfy-topic-msg');
   try {
     const res = await fetch('/api/notify/test', {
       method: 'POST',
@@ -803,7 +833,12 @@ function slotBarHtml(slots, level, levelColor, dimmed) {
   return `<div class="slot-bar">${dots}</div>`;
 }
 
-let data          = { sessions: [], watchList: [], history: {}, lastCheck: null, ntfyOk: false, scrapeMeta: {} };
+let data          = {
+  sessions: [], watchList: [], history: {}, lastCheck: null,
+  ntfyOk: false, scrapeMeta: {},
+  internalBetaNotifications: false,
+  internalDefaultNtfyTopic: null,
+};
 let activeDayKey  = todayKey();
 let activeWave    = null;
 let showLessons   = false;
@@ -841,10 +876,17 @@ async function refresh() {
 }
 
 function renderAll() {
+  applyInternalBetaNav();
   renderStatusBar();
   renderBrowse();
   renderWatching();
   renderSetup();
+}
+
+function applyInternalBetaNav() {
+  const nav = document.getElementById('nav-setup');
+  if (!nav) return;
+  nav.classList.toggle('nav-beta', !!data.internalBetaNotifications);
 }
 
 function renderStatusBar() {
@@ -1028,13 +1070,31 @@ function renderWatching() {
 function renderSetup() {
   const input = document.getElementById('ntfy-topic-input');
   const msgEl = document.getElementById('ntfy-topic-msg');
+  const betaHint = document.getElementById('ntfy-beta-hint');
+  const defaultTopic = data.internalDefaultNtfyTopic || 'ap-surf-connor-2026';
+
+  if (betaHint) {
+    if (data.internalBetaNotifications) {
+      betaHint.hidden = false;
+      betaHint.textContent = `In the ntfy app, subscribe to this exact topic: ${defaultTopic}`;
+    } else {
+      betaHint.hidden = true;
+    }
+  }
+
   if (input && document.activeElement !== input) {
-    input.value = getNtfyTopic();
+    input.value = getNtfyTopicForInput();
   }
   if (msgEl) {
-    if (getNtfyTopic()) {
+    if (hasSavedNtfyTopic()) {
       msgEl.textContent = 'Topic saved on this device. Subscribe to the same topic in ntfy.';
       msgEl.style.color = '#00c9a7';
+    } else if (data.internalBetaNotifications && getNtfyTopic()) {
+      msgEl.textContent = 'Using internal beta default — tap Save topic to persist a custom value.';
+      msgEl.style.color = 'var(--sub)';
+    } else if (getNtfyTopic()) {
+      msgEl.textContent = 'Topic ready — tap Save topic to persist on this device.';
+      msgEl.style.color = 'var(--sub)';
     } else {
       msgEl.textContent = 'Enter your private ntfy topic and tap Save.';
       msgEl.style.color = 'var(--sub)';
