@@ -39,7 +39,12 @@ curl -s "http://localhost:3000/api/status?selected_date=2026-06-29" | jq '{selec
 10. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
 11. Price appears on cards when modal scrape captured it.
 
-### Browser cache / cross-device consistency
+### Browser cache / boot
+
+- Sessions load **before** watchlist on startup — Lineup fetch cannot block Browse rendering.
+- `/api/status` response is normalized (`sessions`, `currentSessions`, `isoDate`/`dateKey`) before render.
+- If `/api/status` returns zero sessions, client retries `/api/sessions`.
+- Stuck on **Loading…** → check Settings **App state** for boot state and session counts; use **Reset local app state** if needed.
 
 1. Open Railway URL on desktop and phone — **Settings → App state** should show the same **App version** and **Build time** (after deploy propagates).
 2. Compare session counts:
@@ -52,7 +57,8 @@ curl -s "https://YOUR-APP/api/status" | jq '{appVersion, buildTime, currentSessi
 3. Hard refresh desktop (Cmd+Shift+R) — future dates should match phone.
 4. If desktop shows stale selected date: **Settings → Reset local app state** — should refetch without wiping Lineup.
 5. DevTools → Application → Service Workers — confirm `/api/status` requests are **not** served from SW (network / no-store).
-6. Old cache `lineup-v1` should be gone after one visit; active cache is `lineup-static-v2`.
+6. Fresh app open should show sessions within a few seconds — not stuck on **Loading…** while `/api/status` returns `sessionsCount > 0`.
+7. Old cache `lineup-v1` should be gone after one visit; active cache is `lineup-static-v2`.
 
 ### Profile Sync Code (cross-device Lineup)
 

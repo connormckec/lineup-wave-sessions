@@ -574,9 +574,67 @@ let serverWatchlistCount = null;
 
 const FETCH_NO_STORE = { cache: 'no-store' };
 
-async function fetchApi(url, options = {}) {
-  return fetch(url, { ...FETCH_NO_STORE, ...options, cache: 'no-store' });
+async function fetchApi(url, options = {}, timeoutMs = 45000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...FETCH_NO_STORE,
+      ...options,
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
+
+function extractSessionsFromPayload(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  if (Array.isArray(payload.sessions)) return payload.sessions;
+  if (Array.isArray(payload.currentSessions)) return payload.currentSessions;
+  if (Array.isArray(payload.current_sessions)) return payload.current_sessions;
+  return [];
+}
+
+function normalizeSessionRow(s) {
+  if (!s || !s.key) return null;
+  const dateKey = s.dateKey || s.isoDate || s.iso_date || null;
+  return {
+    ...s,
+    dateKey: dateKey || s.dateKey,
+    isoDate: s.isoDate || s.iso_date || dateKey,
+  };
+}
+
+function normalizeSessions(list) {
+  return asSessionArray(list).map(normalizeSessionRow).filter(Boolean);
+}
+
+function sessionsForDateKey(dateKey, list) {
+  if (!dateKey) return [];
+  return surfSessions(list).filter(s => dateKeyFromSession(s) === dateKey);
+}
+
+function logRenderDebug(label) {
+  const count = asSessionArray(data.sessions).length;
+  const forDate = sessionsForDateKey(activeDayKey).length;
+  console.log(`[${label}] sessions=${count} selectedDate=${activeDayKey} forDate=${forDate} source=${data.dataSource || data.source || '?'}`);
+}
+
+function showStatusMessage(html) {
+  const txt = document.getElementById('status-text');
+  if (txt) txt.innerHTML = html;
+}
+
+function showBootError(err) {
+  console.error('[boot]', err);
+  bootState = 'error';
+  showStatusMessage(`<span class="check-time">Failed to load sessions · ${err?.message || 'unknown error'}</span>`);
+  renderAll();
+}
+
+let bootState = 'loading';
 
 function normalizeProfileCode(code) {
   return (code || '').trim().toLowerCase().replace(/\s+/g, '-');
@@ -1049,6 +1107,7 @@ function browseCountLabel(visible) {
 function dateKeyFromSession(s) {
   if (s.dateKey) return s.dateKey;
   if (s.isoDate) return s.isoDate;
+  if (s.iso_date) return s.iso_date;
   if (!s.ts) return '';
   return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date(s.ts * 1000));
 }
@@ -1161,7 +1220,34 @@ function readStatusCacheFallback() {
 function loadStatusCache() {
   loadActiveDayKey();
   validateActiveDayKey();
-  renderAll();
+}
+
+async function fetchSessionsPayload(params) {
+  const qs = params.toString();
+  let payload = null;
+  let sessions = [];
+
+  const statusRes = await fetchApi(`/api/status?${qs}`);
+  if (!statusRes.ok) {
+    throw new Error(`status HTTP ${statusRes.status}`);
+  }
+  payload = await statusRes.json();
+  sessions = normalizeSessions(extractSessionsFromPayload(payload));
+
+  if (!sessions.length) {
+    console.warn('[fetch] /api/status returned 0 sessions — trying /api/sessions');
+    const sessionsRes = await fetchApi(`/api/sessions?${qs}`);
+    if (sessionsRes.ok) {
+      const alt = await sessionsRes.json();
+      const altSessions = normalizeSessions(extractSessionsFromPayload(alt));
+      if (altSessions.length) {
+        payload = { ...payload, ...alt };
+        sessions = altSessions;
+      }
+    }
+  }
+
+  return { payload, sessions };
 }
 
 function saveStatusCache() {
@@ -1377,8 +1463,8 @@ function scheduleRefreshPoll() {
 
 async function refresh({ silent = false } = {}) {
   const btn = document.getElementById('refresh-btn');
-  if (!silent) btn.classList.add('spinning');
-  const prevSessions = asSessionArray(data.sessions);
+  if (btn && !silent) btn.classList.add('spinning');
+  const prevSessions = normalizeSessions(data.sessions);
   try {
     const params = new URLSearchParams({
       user_key: getUserKey(),
@@ -1386,13 +1472,14 @@ async function refresh({ silent = false } = {}) {
     });
     const profileCode = getSavedProfileCode();
     if (profileCode) params.set('profile_code', profileCode);
-    const res = await fetchApi(`/api/status?${params}`);
-    const payload = await res.json();
-    const incoming = asSessionArray(payload.sessions);
-    const sessions = mergeSessionsFromServer(prevSessions, incoming, {
+
+    const { payload, sessions: incomingRaw } = await fetchSessionsPayload(params);
+    const incoming = normalizeSessions(incomingRaw);
+    const sessions = normalizeSessions(mergeSessionsFromServer(prevSessions, incoming, {
       scrapeInProgress: !!payload.scrapeInProgress,
       dataSource: payload.dataSource || payload.source,
-    });
+    }));
+
     serverWatchlistCount = payload.watchlistCount ?? payload.watchList?.length ?? null;
     data = {
       ...payload,
@@ -1404,26 +1491,28 @@ async function refresh({ silent = false } = {}) {
     data.watchList = watchlistForUi();
     saveStatusCache();
     validateActiveDayKey();
-    const withSlots = data.sessions.filter(s => s.slots != null).length;
-    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), lineup=${watchlistForUi().length}, build=${data.appVersion}, source=${data.dataSource}`);
+    bootState = 'ready';
+    logRenderDebug('refresh');
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
     updateDateNavButtons();
     scheduleRefreshPoll();
-  } catch {
+  } catch (err) {
+    console.error('[refresh]', err);
+    bootState = prevSessions.length ? 'ready' : 'error';
     const cached = readStatusCacheFallback();
-    const cachedSessions = asSessionArray(cached?.sessions);
+    const cachedSessions = normalizeSessions(cached?.sessions);
     if (cachedSessions.length) {
       data.sessions = cachedSessions;
-      renderAll();
     } else if (prevSessions.length) {
       data.sessions = prevSessions;
-      renderAll();
     }
-    document.getElementById('status-text').innerHTML =
-      '<span class="check-time">Connection error · showing saved data</span>';
+    showStatusMessage(
+      `<span class="check-time">${data.sessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${err?.message || 'network error'}`}</span>`
+    );
+    renderAll();
   } finally {
-    if (!silent) btn.classList.remove('spinning');
+    if (btn && !silent) btn.classList.remove('spinning');
   }
 }
 
@@ -1485,6 +1574,7 @@ function onBellClick(sJson) {
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
+  if (!txt) return;
   dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
 
   const {
@@ -1500,7 +1590,8 @@ function renderStatusBar() {
     dataSource,
   } = data;
 
-  const trackedCount = currentSessionsCount ?? sessionsCount ?? asSessionArray(data.sessions).length;
+  const loadedCount = asSessionArray(data.sessions).length;
+  const trackedCount = loadedCount || (currentSessionsCount ?? sessionsCount ?? 0);
   const ageMins = minutesSinceLastScrape ?? dataAgeMinutes;
   const src = source || dataSource;
 
@@ -1523,6 +1614,15 @@ function renderStatusBar() {
     detail = `showing saved data · checked ${ageLabel(ageMins) || 'earlier'}`;
   } else {
     detail = `checked ${ageLabel(ageMins) || 'just now'}`;
+  }
+
+  if (bootState === 'loading' && !loadedCount) {
+    txt.innerHTML = '<span class="check-time">Loading sessions…</span>';
+    return;
+  }
+
+  if (bootState === 'error' && !loadedCount && !lastSuccessfulScrape) {
+    return;
   }
 
   if (!trackedCount && !lastSuccessfulScrape) {
@@ -1559,9 +1659,18 @@ function renderBrowse() {
     }),
   ].join('');
 
-  let filtered = visibleBrowseSessions();
-
   const listEl = document.getElementById('session-list');
+  if (bootState === 'loading' && !asSessionArray(data.sessions).length) {
+    listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
+    return;
+  }
+
+  if (bootState === 'error' && !asSessionArray(data.sessions).length) {
+    listEl.innerHTML = '<div class="empty">Could not load sessions. Check connection or tap Reset local app state in Settings.</div>';
+    return;
+  }
+
+  let filtered = visibleBrowseSessions();
   if (!filtered.length) {
     const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
     const debug = data.selectedDateDebug?.selectedDate === activeDayKey ? data.selectedDateDebug : null;
@@ -1716,16 +1825,12 @@ function renderDebugState() {
   const rows = [
     ['App version', data.appVersion || '—'],
     ['Build time', fmtTime(data.buildTime)],
-    ['SW cache', `lineup-static-v${SW_CACHE_VERSION}`],
-    ['Profile code', getSavedProfileCode() || getProfileCodeForInput() || '—'],
-    ['user_key', getUserKey() || '—'],
     ['Selected date', activeDayKey || todayKey()],
-    ['Local watchlist', String(watchlistForUi().length)],
-    ['Server watchlist', serverWatchlistCount != null ? String(serverWatchlistCount) : '—'],
+    ['Sessions loaded', String(asSessionArray(data.sessions).length)],
+    ['Sessions for date', String(sessionsForDateKey(activeDayKey).length)],
     ['dataSource', data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
-    ['Session count', String(asSessionArray(data.sessions).length)],
-    ['currentSessionsCount', data.currentSessionsCount != null ? String(data.currentSessionsCount) : '—'],
+    ['Boot state', bootState],
   ];
   grid.innerHTML = rows.map(([k, v]) =>
     `<dt>${k}</dt><dd>${String(v).replace(/</g, '&lt;')}</dd>`
@@ -2011,13 +2116,25 @@ document.getElementById('picker-to').addEventListener('change', (e) => {
 initTimeSelects();
 
 (async function boot() {
-  await initProfileUserKey();
-  loadStatusCache();
-  watchlistLoadState = 'loading';
-  renderWatching();
-  await loadWatchlistFromServer();
-  await refresh();
-  scheduleRefreshPoll();
+  try {
+    await initProfileUserKey();
+    loadStatusCache();
+    bootState = 'loading';
+    renderAll();
+
+    const watchlistPromise = loadWatchlistFromServer().catch((err) => {
+      console.warn('[boot] watchlist load failed', err);
+      watchlistLoadState = localWatchlist.length ? 'ready' : 'error';
+    });
+
+    await refresh({ silent: true });
+    await watchlistPromise;
+    bootState = 'ready';
+    renderAll();
+    scheduleRefreshPoll();
+  } catch (err) {
+    showBootError(err);
+  }
 })();
 
 if ('serviceWorker' in navigator) {
