@@ -166,6 +166,17 @@ localStorage caches the watchlist as a fallback. On startup the app loads Lineup
 
 See [TESTING.md](TESTING.md) for verification steps.
 
+### Collector scheduler
+
+```bash
+curl -s http://localhost:3000/api/debug/collector | jq '{scrapeScheduleEnabled,lastTier1Scrape,minutesSinceLastTier1,recommendedAction,recentScrapeRuns}'
+curl -s -X POST http://localhost:3000/api/admin/run-tier1 | jq
+```
+
+After deploy, within 5–10 minutes `lastTier1Scrape` should be set and `scrapeScheduleEnabled` should be `true`.
+
+---
+
 ### Railway / background collector health
 
 The scraper must run continuously — **disable Railway Serverless/App Sleep** on this service. If the process sleeps, `lastScrapeAttempt` in `/api/status` will go stale and availability snapshots stop accumulating.

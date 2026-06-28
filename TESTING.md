@@ -87,6 +87,21 @@ curl -s "http://localhost:3000/api/sessions?date=$(curl -s http://localhost:3000
 
 ---
 
+## Collector scheduler verification
+
+```bash
+curl -s http://localhost:3000/api/debug/collector | jq
+curl -s -X POST http://localhost:3000/api/admin/run-tier1 | jq
+```
+
+1. `scrapeScheduleEnabled` must be `true` after server boot.
+2. Within 15s of boot, initial Tier 1 should start (`initialScrapeScheduled: true`).
+3. Within 5–10 minutes, `lastTier1Scrape` should not be null.
+4. `recentScrapeRuns` should show tier 1/2/3 attempts in Supabase.
+5. Manual `POST /api/admin/run-tier1` returns `completed` with `sessionsFound > 0` when booking site is reachable.
+
+---
+
 ## Today/tomorrow detail reliability
 
 ```bash

@@ -41,7 +41,7 @@ const INTERNAL_DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
-const CHECK_MINS      = parseInt(process.env.CHECK_EVERY_MINS || '5', 10);
+const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5', 10) || 5);
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
 const DETAIL_ENRICH_MAX_PER_RUN = parseInt(process.env.DETAIL_ENRICH_MAX_PER_RUN || '25', 10);
@@ -59,9 +59,13 @@ const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
 
 let lastTier1DurationMs = null;
+let lastTier2DurationMs = null;
+let lastTier3DurationMs = null;
 let lastApiSessionsDurationMs = null;
 let lastSupabaseDateQueryMs = null;
 let scrapeMetaCachedAt = 0;
+const lastTierDurationMs = { 1: null, 2: null, 3: null, 4: null };
+const lastTierError = { 1: null, 2: null, 3: null, 4: null };
 const SCRAPE_META_TTL_MS = 60_000;
 const API_SESSIONS_DURATION_SAMPLES = [];
 
@@ -224,7 +228,20 @@ let lastSnapshotRowsInsertedLastRun = 0;
 const HISTORY_SNAPSHOTS_ENABLED = process.env.HISTORY_SNAPSHOTS !== 'false';
 const PARK = 'atlantic_park';
 const serverStartedAt = new Date().toISOString();
-const scrapeScheduleEnabled = true;
+let backgroundCollectorEnabled = process.env.BACKGROUND_COLLECTOR_ENABLED !== 'false';
+let scrapeScheduleEnabled = false;
+const collectorState = {
+  schedulerStartedAt: null,
+  initialScrapeScheduled: false,
+  tier1Interval: `*/${CHECK_MINS} * * * *`,
+  tier2Interval: '*/30 * * * *',
+  tier3Interval: '0 */6 * * *',
+  tier1NextRunAt: null,
+  tier2NextRunAt: null,
+  tier3NextRunAt: null,
+  skippedRuns: [],
+  cronTasks: {},
+};
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
 const MAX_SIDE_PARSE_LOGS = 40;
@@ -957,7 +974,8 @@ async function buildCoverageDebugPayload() {
     lastTier3Scrape: lastTierRun[3],
     lastFullCoverageScrape,
     scrapeInProgress,
-    backgroundCollectorEnabled: scrapeScheduleEnabled,
+    backgroundCollectorEnabled,
+    scrapeScheduleEnabled: !!scrapeScheduleEnabled,
     inMemorySessionsCount: sessionsByKey.size,
     inMemoryDatesCount: Object.keys(currentSessionsByDateMap()).length,
   };
@@ -1396,8 +1414,8 @@ function getStatusFields() {
     lastTier3Scrape: lastTierRun[3],
     lastTier4Scrape: lastTierRun[4],
     datesCheckedEmpty: [...datesCheckedEmpty].sort(),
-    scrapeScheduleEnabled,
-    backgroundCollectorEnabled: scrapeScheduleEnabled,
+    scrapeScheduleEnabled: !!scrapeScheduleEnabled,
+    backgroundCollectorEnabled,
     backfillRecommended: isBackfillRecommended(),
     fallbackAvailable: fallbackAvailableCached,
     serverStartedAt,
@@ -4279,7 +4297,7 @@ async function detectAvailableWeeks(page) {
 
 function updateEffectiveWeeksCap(detectedWeeks) {
   weeksAvailableOnSite = detectedWeeks;
-  effectiveWeeksAhead = Math.min(SCRAPE_WEEKS_AHEAD, detectedWeeks);
+  effectiveWeeksAhead = Math.max(1, Math.min(SCRAPE_WEEKS_AHEAD, detectedWeeks || SCRAPE_WEEKS_AHEAD));
   console.log(`  booking calendar: ${detectedWeeks} week(s) available on site`);
   console.log(`  SCRAPE_WEEKS_AHEAD=${SCRAPE_WEEKS_AHEAD} → effective lookahead ${effectiveWeeksAhead} week(s)`);
   if (effectiveWeeksAhead < SCRAPE_WEEKS_AHEAD) {
@@ -4289,14 +4307,44 @@ function updateEffectiveWeeksCap(detectedWeeks) {
 
 
 async function runTierScrape(tier) {
-  if (!tryAcquireScrapeLock(`tier ${tier}`)) return;
+  const report = {
+    tier,
+    started: true,
+    completed: false,
+    skipped: false,
+    skipReason: null,
+    sessionsFound: 0,
+    rowsUpserted: 0,
+    snapshotsInserted: 0,
+    durationMs: 0,
+    errors: [],
+  };
+
+  if (!tryAcquireScrapeLock(`tier ${tier}`)) {
+    report.skipped = true;
+    report.skipReason = 'scrape_in_progress';
+    report.started = false;
+    console.log(`[tier ${tier}] skipped — scrape already running`);
+    collectorState.skippedRuns.push({ tier, at: new Date().toISOString(), reason: 'scrape_in_progress' });
+    if (collectorState.skippedRuns.length > 30) collectorState.skippedRuns.shift();
+    const skipRunId = await beginScrapeRun(tier);
+    await finishScrapeRun(skipRunId, { success: false, error: 'skipped: scrape_in_progress' });
+    return report;
+  }
 
   const cfg = TIER_CONFIG[tier];
   const { startWeek, endWeek } = weeksForTier(tier);
   if (endWeek < startWeek || startWeek >= effectiveWeeksAhead) {
-    console.log(`[tier ${tier}] skipped — no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`);
+    const reason = `no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`;
+    console.log(`[tier ${tier}] skipped — ${reason}`);
+    report.skipped = true;
+    report.skipReason = reason;
+    collectorState.skippedRuns.push({ tier, at: new Date().toISOString(), reason });
+    if (collectorState.skippedRuns.length > 30) collectorState.skippedRuns.shift();
+    const skipRunId = await beginScrapeRun(tier);
+    await finishScrapeRun(skipRunId, { success: false, error: `skipped: ${reason}` });
     releaseScrapeLock();
-    return;
+    return report;
   }
 
   const tierStarted = Date.now();
@@ -4314,6 +4362,8 @@ async function runTierScrape(tier) {
   const prevByKey = new Map(sessions.map(s => [s.key, s]));
   let launched;
   let coverage = null;
+  let rowsUpserted = 0;
+  let snapshotsInserted = 0;
 
   try {
     launched = await launchBrowser();
@@ -4352,7 +4402,12 @@ async function runTierScrape(tier) {
     await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
     lastTierRun[tier] = new Date().toISOString();
-    if (tier === 1) lastTier1DurationMs = Date.now() - tierStarted;
+    const durationMs = Date.now() - tierStarted;
+    lastTierDurationMs[tier] = durationMs;
+    lastTierError[tier] = null;
+    if (tier === 1) lastTier1DurationMs = durationMs;
+    if (tier === 2) lastTier2DurationMs = durationMs;
+    if (tier === 3) lastTier3DurationMs = durationMs;
     lastSuccessfulScrape = new Date().toISOString();
     lastCheck = lastSuccessfulScrape;
     lastScrapeError = null;
@@ -4360,12 +4415,13 @@ async function runTierScrape(tier) {
     hasFreshScrapeThisBoot = true;
     dataSource = supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback';
 
-    await upsertCurrentSessionsToSupabase(merged, tier, { scrapeKind: cfg.slotCounts ? 'detailed' : 'basic' });
-    lastSnapshotRowsInsertedLastRun = await saveAvailabilitySnapshotsToSupabase(
+    rowsUpserted = await upsertCurrentSessionsToSupabase(merged, tier, { scrapeKind: cfg.slotCounts ? 'detailed' : 'basic' });
+    snapshotsInserted = await saveAvailabilitySnapshotsToSupabase(
       merged,
       tier,
       { snapshotType: cfg.slotCounts ? 'detailed' : 'basic' },
     );
+    lastSnapshotRowsInsertedLastRun = snapshotsInserted;
     if (!cfg.slotCounts) {
       const needing = merged.filter(s => sessionQualifiesForDetailEnrichment(s));
       if (needing.length) {
@@ -4400,8 +4456,19 @@ async function runTierScrape(tier) {
       coveragePercent: coverage.coveragePercent,
     });
 
+    report.completed = true;
+    report.sessionsFound = merged.length;
+    report.rowsUpserted = rowsUpserted;
+    report.snapshotsInserted = snapshotsInserted;
+    report.durationMs = lastTierDurationMs[tier];
+    updateTierNextRunEstimate(tier);
+
   } catch (e) {
     recordScrapeError(e, `tier ${tier} scrape`);
+    lastTierError[tier] = lastScrapeError;
+    report.errors.push({ error: lastScrapeError });
+    report.durationMs = Date.now() - tierStarted;
+    lastTierDurationMs[tier] = report.durationMs;
     await saveScrapeErrorToSupabase(lastScrapeError);
     await finishScrapeRun(scrapeRunId, {
       success: false,
@@ -4413,12 +4480,29 @@ async function runTierScrape(tier) {
     });
   } finally {
     releaseScrapeLock();
-    if (launched?.browser) await launched.browser.close();
+    if (launched?.browser) await launched.browser.close().catch(() => {});
   }
+
+  return report;
+}
+
+let weekDetectionInProgress = false;
+
+function tryAcquireWeekDetectionLock() {
+  if (weekDetectionInProgress || scrapeInProgress) {
+    console.log('  week detection skipped — scrape or detection already running');
+    return false;
+  }
+  weekDetectionInProgress = true;
+  return true;
+}
+
+function releaseWeekDetectionLock() {
+  weekDetectionInProgress = false;
 }
 
 async function detectWeeksOnStartup() {
-  if (!tryAcquireScrapeLock('week detection')) return;
+  if (!tryAcquireWeekDetectionLock()) return;
 
   let launched;
   try {
@@ -4427,10 +4511,22 @@ async function detectWeeksOnStartup() {
     updateEffectiveWeeksCap(detected);
   } catch (e) {
     console.error('week detection failed:', e.message);
-    effectiveWeeksAhead = SCRAPE_WEEKS_AHEAD;
+    effectiveWeeksAhead = Math.max(1, SCRAPE_WEEKS_AHEAD);
   } finally {
-    releaseScrapeLock();
-    if (launched?.browser) await launched.browser.close();
+    releaseWeekDetectionLock();
+    if (launched?.browser) await launched.browser.close().catch(() => {});
+  }
+}
+
+async function detectWeeksOnStartupWithTimeout(timeoutMs = 90_000) {
+  try {
+    await Promise.race([
+      detectWeeksOnStartup(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('week detection timeout')), timeoutMs)),
+    ]);
+  } catch (e) {
+    console.warn('  week detection:', e.message);
+    effectiveWeeksAhead = Math.max(1, SCRAPE_WEEKS_AHEAD);
   }
 }
 
@@ -4624,7 +4720,8 @@ async function buildBootDebugPayload(selectedDate = null) {
     serverStartedAt,
     isColdStartLikely: !hasFreshScrapeThisBoot && (Date.now() - new Date(serverStartedAt).getTime()) < 300_000,
     timeSinceServerStartMs: Date.now() - new Date(serverStartedAt).getTime(),
-    backgroundCollectorEnabled: scrapeScheduleEnabled,
+    backgroundCollectorEnabled,
+    scrapeScheduleEnabled: !!scrapeScheduleEnabled,
     lastTier1DurationMs,
     lastApiSessionsDurationMs,
     lastSupabaseDateQueryMs,
@@ -4888,44 +4985,47 @@ app.post('/api/admin/enrich-date', async (req, res) => {
 
 app.get('/api/debug/collector', async (_req, res) => {
   try {
-    const msSinceStart = Date.now() - new Date(serverStartedAt).getTime();
-    const minutesSinceStart = Math.round(msSinceStart / 60_000);
-    const minutesSinceTier1 = lastTierRun[1]
-      ? Math.round((Date.now() - new Date(lastTierRun[1]).getTime()) / 60_000)
-      : null;
-    const minutesSinceTier2 = lastTierRun[2]
-      ? Math.round((Date.now() - new Date(lastTierRun[2]).getTime()) / 60_000)
-      : null;
-    const likelySleepingOrRestarted = !hasFreshScrapeThisBoot
-      && minutesSinceTier1 != null
-      && minutesSinceTier1 > CHECK_MINS * 3;
-
-    res.json({
-      serverStartedAt,
-      minutesSinceServerStart: minutesSinceStart,
-      backgroundCollectorEnabled: scrapeScheduleEnabled,
-      scrapeInProgress,
-      detailEnrichmentInProgress,
-      lastSuccessfulScrape,
-      lastTier1Scrape: lastTierRun[1],
-      minutesSinceLastTier1: minutesSinceTier1,
-      lastTier1DurationMs,
-      lastTier2Scrape: lastTierRun[2],
-      minutesSinceLastTier2: minutesSinceTier2,
-      lastTier3Scrape: lastTierRun[3],
-      lastTier4Scrape: lastTierRun[4],
-      likelySleepingOrRestarted,
-      railwayNote: 'Disable Railway Serverless/App Sleep for continuous scraping and fast boot.',
-      lastApiSessionsDurationMs,
-      lastSupabaseDateQueryMs,
-      averageApiSessionsDurationMs: API_SESSIONS_DURATION_SAMPLES.length
-        ? Math.round(API_SESSIONS_DURATION_SAMPLES.reduce((a, b) => a + b, 0) / API_SESSIONS_DURATION_SAMPLES.length)
-        : null,
-    });
+    const payload = await buildCollectorDebugPayload();
+    res.json(payload);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+async function adminRunTierHandler(tier, req, res) {
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+  try {
+    if (scrapeInProgress && !wait) {
+      return res.json({
+        tier,
+        started: false,
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
+      });
+    }
+    if (wait && scrapeInProgress) {
+      await new Promise((resolve) => {
+        const poll = setInterval(() => {
+          if (!scrapeInProgress) { clearInterval(poll); resolve(); }
+        }, 1000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 120_000);
+      });
+    }
+    const report = await runTierScrape(tier);
+    res.json({
+      tier,
+      ...report,
+      message: report.completed ? 'completed' : (report.skipped ? 'skipped' : 'failed'),
+    });
+  } catch (e) {
+    res.status(500).json({ tier, error: e.message, errors: [{ error: e.message }] });
+  }
+}
+
+app.post('/api/admin/run-tier1', (req, res) => adminRunTierHandler(1, req, res));
+app.post('/api/admin/run-tier2', (req, res) => adminRunTierHandler(2, req, res));
+app.post('/api/admin/run-tier3', (req, res) => adminRunTierHandler(3, req, res));
 
 app.get('/api/debug/scrape', (_req, res) => {
   const coverage = computeDateCoverage();
@@ -5200,31 +5300,230 @@ async function loadPersistedData() {
   }
 }
 
-// ── Boot: tiered cron schedules ───────────────────────────────────────────────
-function bootstrapInBackground() {
-  detectWeeksOnStartup()
-    .then(() => runTierScrape(1))
-    .then(() => {
-      setTimeout(() => runTierScrape(2).catch(console.error), 30_000);
-      setTimeout(() => runTierScrape(3).catch(console.error), 45_000);
-      setTimeout(() => runTierScrape(4).catch(console.error), 120_000);
-    })
-    .catch(console.error);
+function tierIntervalMinutes(tier) {
+  if (tier === 1) return CHECK_MINS;
+  if (tier === 2) return 30;
+  if (tier === 3) return 360;
+  return 1440;
 }
 
-cron.schedule(`*/${CHECK_MINS} * * * *`, () => runTierScrape(1).catch(console.error));
-cron.schedule(`*/${CHECK_MINS} * * * *`, () => {
-  setTimeout(() => runDetailEnrichmentByPriority(1).catch(console.error), ENRICHMENT_P1_OFFSET_MS);
-});
-cron.schedule('*/30 * * * *', () => runTierScrape(2).catch(console.error));
-cron.schedule(`*/${ENRICHMENT_TIER2_EVERY_MINS} * * * *`, () => runDetailEnrichmentByPriority(2).catch(console.error));
-cron.schedule('0 */6 * * *', () => runTierScrape(3).catch(console.error));
-cron.schedule('0 */12 * * *', () => runDetailEnrichmentByPriority(3).catch(console.error));
-cron.schedule('0 0 * * *', () => {
-  detectWeeksOnStartup()
-    .then(() => runTierScrape(4))
-    .catch(console.error);
-});
+function updateTierNextRunEstimate(tier) {
+  const mins = tierIntervalMinutes(tier);
+  const base = lastTierRun[tier] ? new Date(lastTierRun[tier]).getTime() : Date.now();
+  const next = new Date(base + mins * 60_000).toISOString();
+  if (tier === 1) collectorState.tier1NextRunAt = next;
+  if (tier === 2) collectorState.tier2NextRunAt = next;
+  if (tier === 3) collectorState.tier3NextRunAt = next;
+}
+
+function scheduleCronSafe(expression, handler, label) {
+  if (!cron.validate(expression)) {
+    console.error(`  Invalid cron expression for ${label}: ${expression}`);
+    return null;
+  }
+  const task = cron.schedule(expression, handler, { scheduled: true, timezone: BOOKING_TZ });
+  console.log(`  Scheduling ${label}: ${expression}`);
+  return task;
+}
+
+function runTierScrapeAsync(tier, { reason = 'scheduled' } = {}) {
+  console.log(`[collector] Tier ${tier} trigger (${reason})`);
+  runTierScrape(tier)
+    .then((report) => {
+      if (report.skipped) {
+        console.log(`[collector] Tier ${tier} skipped: ${report.skipReason}`);
+      } else if (report.completed) {
+        console.log(`[collector] Tier ${tier} completed in ${report.durationMs}ms — ${report.sessionsFound} sessions, ${report.rowsUpserted} upserted, ${report.snapshotsInserted} snapshots`);
+      } else if (report.errors?.length) {
+        console.error(`[collector] Tier ${tier} failed:`, report.errors[0]?.error);
+      }
+    })
+    .catch((e) => console.error(`[collector] Tier ${tier} error:`, e.message));
+}
+
+async function buildCollectorDebugPayload() {
+  const msSinceStart = Date.now() - new Date(serverStartedAt).getTime();
+  const minutesSinceTier1 = lastTierRun[1]
+    ? Math.round((Date.now() - new Date(lastTierRun[1]).getTime()) / 60_000)
+    : null;
+  const minutesSinceTier2 = lastTierRun[2]
+    ? Math.round((Date.now() - new Date(lastTierRun[2]).getTime()) / 60_000)
+    : null;
+  const minutesSinceTier3 = lastTierRun[3]
+    ? Math.round((Date.now() - new Date(lastTierRun[3]).getTime()) / 60_000)
+    : null;
+
+  let recentScrapeRuns = [];
+  let availabilitySnapshotsByDateLast24h = {};
+  if (supabase) {
+    try {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { data: runs } = await supabase
+        .from('scrape_runs')
+        .select('id, tier, started_at, finished_at, success, sessions_found, error')
+        .order('started_at', { ascending: false })
+        .limit(15);
+      recentScrapeRuns = runs || [];
+
+      const { data: snaps } = await supabase
+        .from('availability_snapshots')
+        .select('iso_date')
+        .gte('scraped_at', since);
+      for (const row of snaps || []) {
+        const dk = String(row.iso_date).slice(0, 10);
+        availabilitySnapshotsByDateLast24h[dk] = (availabilitySnapshotsByDateLast24h[dk] || 0) + 1;
+      }
+    } catch (e) {
+      console.warn('  collector debug query failed:', e.message);
+    }
+  }
+
+  let recommendedAction = 'none';
+  if (!scrapeScheduleEnabled) {
+    recommendedAction = 'Scheduler not started — check server logs for cron errors';
+  } else if (lastTierRun[1] == null && minutesSinceTier1 == null && msSinceStart > 10 * 60_000) {
+    recommendedAction = 'Tier 1 never ran — POST /api/admin/run-tier1 or check Playwright/Chromium logs';
+  } else if (minutesSinceTier1 != null && minutesSinceTier1 > CHECK_MINS * 3) {
+    recommendedAction = 'Tier 1 stale — verify Railway App Sleep is disabled and run POST /api/admin/run-tier1';
+  } else if (isCurrentSessionsSparse()) {
+    recommendedAction = 'Coverage sparse — Tier 2 should run soon; POST /api/admin/run-tier2 if needed';
+  }
+
+  return {
+    serverStartedAt,
+    minutesSinceServerStart: Math.round(msSinceStart / 60_000),
+    backgroundCollectorEnabled,
+    scrapeScheduleEnabled: !!scrapeScheduleEnabled,
+    schedulerStartedAt: collectorState.schedulerStartedAt,
+    tier1IntervalConfigured: collectorState.tier1Interval,
+    tier2IntervalConfigured: collectorState.tier2Interval,
+    tier3IntervalConfigured: collectorState.tier3Interval,
+    tier1NextRunAt: collectorState.tier1NextRunAt,
+    tier2NextRunAt: collectorState.tier2NextRunAt,
+    tier3NextRunAt: collectorState.tier3NextRunAt,
+    initialScrapeScheduled: collectorState.initialScrapeScheduled,
+    lastTier1Scrape: lastTierRun[1],
+    minutesSinceLastTier1: minutesSinceTier1,
+    lastTier2Scrape: lastTierRun[2],
+    minutesSinceLastTier2: minutesSinceTier2,
+    lastTier3Scrape: lastTierRun[3],
+    minutesSinceLastTier3: minutesSinceTier3,
+    lastTier1DurationMs,
+    lastTier2DurationMs,
+    lastTier3DurationMs,
+    lastTier1Error: lastTierError[1],
+    lastTier2Error: lastTierError[2],
+    lastTier3Error: lastTierError[3],
+    scrapeInProgress,
+    weekDetectionInProgress,
+    lastScrapeError,
+    lastSuccessfulScrape,
+    effectiveWeeksAhead,
+    skippedRunsRecent: collectorState.skippedRuns.slice(-10),
+    recentScrapeRuns,
+    currentSessionsByDate: currentSessionsByDateMap(),
+    availabilitySnapshotsByDateLast24h,
+    likelySleepingOrRestarted: scrapeScheduleEnabled && lastTierRun[1] == null && msSinceStart > CHECK_MINS * 4 * 60_000,
+    railwayNote: 'Disable Railway Serverless/App Sleep for continuous scraping.',
+    recommendedAction,
+    lastApiSessionsDurationMs,
+    lastSupabaseDateQueryMs,
+  };
+}
+
+function startBackgroundCollector() {
+  if (!backgroundCollectorEnabled) {
+    scrapeScheduleEnabled = false;
+    console.log('Background collector disabled (BACKGROUND_COLLECTOR_ENABLED=false)');
+    return;
+  }
+
+  if (collectorState.schedulerStartedAt) {
+    console.log('Background collector already started');
+    return;
+  }
+
+  collectorState.schedulerStartedAt = new Date().toISOString();
+  collectorState.tier1Interval = `*/${CHECK_MINS} * * * *`;
+  collectorState.tier2Interval = '*/30 * * * *';
+  collectorState.tier3Interval = '0 */6 * * *';
+
+  console.log('\n── Background collector enabled ──');
+  console.log(`  Scheduling Tier 1 every ${CHECK_MINS} minutes (today/tomorrow + slots)`);
+  console.log('  Scheduling Tier 2 every 30 minutes (next 7 days)');
+  console.log('  Scheduling Tier 3 every 6 hours (weeks 2–3)');
+
+  collectorState.cronTasks.tier1 = scheduleCronSafe(
+    collectorState.tier1Interval,
+    () => runTierScrapeAsync(1, { reason: 'cron_tier1' }),
+    'Tier 1',
+  );
+  collectorState.cronTasks.tier2 = scheduleCronSafe(
+    collectorState.tier2Interval,
+    () => runTierScrapeAsync(2, { reason: 'cron_tier2' }),
+    'Tier 2',
+  );
+  collectorState.cronTasks.tier3 = scheduleCronSafe(
+    collectorState.tier3Interval,
+    () => runTierScrapeAsync(3, { reason: 'cron_tier3' }),
+    'Tier 3',
+  );
+  collectorState.cronTasks.tier4 = scheduleCronSafe(
+    '0 0 * * *',
+    () => {
+      detectWeeksOnStartupWithTimeout().then(() => runTierScrapeAsync(4, { reason: 'cron_tier4' })).catch(console.error);
+    },
+    'Tier 4 daily',
+  );
+  collectorState.cronTasks.enrichP1 = scheduleCronSafe(
+    collectorState.tier1Interval,
+    () => setTimeout(() => runDetailEnrichmentByPriority(1).catch(console.error), ENRICHMENT_P1_OFFSET_MS),
+    'Detail enrichment P1',
+  );
+  collectorState.cronTasks.enrichP2 = scheduleCronSafe(
+    `*/${ENRICHMENT_TIER2_EVERY_MINS} * * * *`,
+    () => runDetailEnrichmentByPriority(2).catch(console.error),
+    'Detail enrichment P2',
+  );
+  collectorState.cronTasks.enrichP3 = scheduleCronSafe(
+    '0 */12 * * *',
+    () => runDetailEnrichmentByPriority(3).catch(console.error),
+    'Detail enrichment P3',
+  );
+
+  scrapeScheduleEnabled = !!(collectorState.cronTasks.tier1 && collectorState.cronTasks.tier2 && collectorState.cronTasks.tier3);
+  if (!scrapeScheduleEnabled) {
+    console.error('  Background collector FAILED to schedule — check cron expressions');
+    return;
+  }
+
+  updateTierNextRunEstimate(1);
+  updateTierNextRunEstimate(2);
+  updateTierNextRunEstimate(3);
+
+  collectorState.initialScrapeScheduled = true;
+  console.log('  Initial scrape scheduled — Tier 1 in 15s, week detection in parallel');
+
+  setTimeout(() => runTierScrapeAsync(1, { reason: 'startup_tier1' }), 15_000);
+
+  setTimeout(() => {
+    detectWeeksOnStartupWithTimeout().catch(console.error);
+  }, 5_000);
+
+  setTimeout(() => {
+    if (isCurrentSessionsSparse()) {
+      console.log('  Coverage sparse — scheduling startup Tier 2 in 60s');
+      runTierScrapeAsync(2, { reason: 'startup_tier2_sparse' });
+    }
+  }, 60_000);
+
+  console.log('── Background collector ready ──\n');
+}
+
+// ── Boot: tiered cron schedules ───────────────────────────────────────────────
+function bootstrapInBackground() {
+  startBackgroundCollector();
+}
 
 async function startServer() {
   await loadPersistedData();
@@ -5234,14 +5533,7 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`\nAP Session Watcher running on :${PORT}`);
-    console.log(`Tier 1 (today/tomorrow + slots): every ${CHECK_MINS} min`);
-    console.log(`Detail enrichment P1 (watched/today/selected/48h): every ${CHECK_MINS} min (offset ${Math.round(ENRICHMENT_P1_OFFSET_MS / 1000)}s)`);
-    console.log('Tier 2 (this week):              every 30 min');
-    console.log(`Detail enrichment P2 (next 7 days): every ${ENRICHMENT_TIER2_EVERY_MINS} min`);
-    console.log('Tier 3 (weeks 2–3):              every 6 hours');
-    console.log(`Detail enrichment P3 (weeks 2–3): every ${ENRICHMENT_TIER3_STALE_HOURS} hours`);
-    console.log('Tier 4 (weeks 4+):               daily at midnight');
-    console.log(`Lookahead: ${SCRAPE_WEEKS_AHEAD} weeks (capped by site availability)`);
+    console.log(`Express ready — API responds immediately; collector starts in background`);
     if (supabaseConfigured) {
       console.log('Supabase collector: current_sessions + availability_snapshots + scrape_runs');
     }
