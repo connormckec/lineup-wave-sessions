@@ -47,8 +47,10 @@ Profile codes derive a stable `user_key` client-side (`profile:` + SHA-256). Wat
 2. Confirm header is compact, date heading is centered and not clipped.
 3. Wave/level chips scroll horizontally with no page-level horizontal scroll.
 4. Bottom nav sits above Safari home indicator / PWA safe area.
-5. Session cards: readable text, tappable bell (44px), no overlap with bottom nav when scrolled to end.
-6. Add to Home Screen → launch standalone → confirm safe areas still look correct.
+5. Session cards: status shows compact spot count (e.g. `1 spot left`) without ellipses; optional second line (`Closing out`).
+6. Header open count matches the visible filtered list for the selected date.
+7. Lineup cards include **Book at Atlantic Park** link opening the official booking page.
+8. Add to Home Screen → launch standalone → confirm safe areas still look correct.
 
 ### Background scrapes
 

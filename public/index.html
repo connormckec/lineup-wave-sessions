@@ -289,14 +289,21 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .sc-wave{font-size:12px;color:var(--sub);margin-top:4px;font-family:var(--font-body);font-weight:500}
 .sc-price{font-size:11px;color:var(--muted);margin-top:2px}
-.sc-booked{font-size:11px;color:var(--sub);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sc-booked{font-size:11px;color:var(--sub);margin-top:2px;line-height:1.35}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
-.sc-right{display:flex;align-items:center;gap:8px;flex-shrink:0;padding-right:2px}
+.sc-right{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
+.sc-actions{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
 .cond-badge{
-  font-family:var(--font-display);font-size:10px;font-weight:700;
-  letter-spacing:.05em;text-transform:uppercase;
-  white-space:nowrap;text-align:right;line-height:1.25;
-  max-width:76px;overflow:hidden;text-overflow:ellipsis;
+  font-family:var(--font-display);font-weight:700;
+  letter-spacing:.03em;text-align:center;line-height:1.25;
+  max-width:none;overflow:visible;white-space:normal;
+}
+.cond-compact{display:block}
+.cond-full{display:none;font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+.cond-primary{display:block;font-size:12px;font-weight:700;line-height:1.2}
+.cond-sub{
+  display:block;margin-top:2px;font-size:9px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.06em;opacity:.88;line-height:1.2;
 }
 .bell-btn{
   width:44px;height:44px;border-radius:50%;
@@ -320,8 +327,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .wc-meta{font-size:12px;color:var(--sub);margin-top:3px;font-weight:500}
 .wc-status{
   font-family:var(--font-display);font-size:13px;font-weight:700;
-  letter-spacing:.05em;text-transform:uppercase;margin-top:2px;
+  letter-spacing:.03em;margin-top:2px;
 }
+.wc-foot{margin-top:8px;display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.wc-book{margin-top:0}
 .rm-btn{
   background:transparent;border:1px solid var(--border);color:var(--sub);
   border-radius:8px;padding:5px 12px;font-size:11px;cursor:pointer;
@@ -393,11 +402,13 @@ input.field:focus{border-color:var(--accent)}
   #app-title{font-size:26px}
   .app-sublabel{font-size:11px}
   #status-meta{font-size:13px;padding:10px 0 12px}
-  .cond-badge{font-size:11px;max-width:96px}
   .sc-level{font-size:15px}
+  .cond-primary{font-size:12px}
 }
 @media (min-width:768px){
-  .cond-badge{max-width:none}
+  .cond-compact{display:none}
+  .cond-full{display:block}
+  .sc-actions,.sc-right{min-width:88px}
 }
 </style>
 </head>
@@ -941,29 +952,54 @@ function visibleOpenSessions() {
   return visibleBrowseSessions().filter(s => s.available);
 }
 
-function browseCountLabel(openCount) {
+function browseCountLabel(visible) {
   const tk = todayKey();
   const dateWord = activeDayKey === tk
     ? 'today'
     : (activeDayKey === tomorrowKey() ? 'tomorrow' : dateLabel(activeDayKey));
+  const openCount = visible.filter(s => s.available).length;
+  const total = visible.length;
+
+  let countPart;
+  if (openCount > 0) {
+    countPart = `${openCount} open session${openCount === 1 ? '' : 's'}`;
+  } else if (total > 0) {
+    countPart = `${total} session${total === 1 ? '' : 's'} · none open`;
+  } else {
+    countPart = '0 sessions';
+  }
 
   if (activeLevels.size === 1) {
     const level = [...activeLevels][0];
-    return `${openCount} ${level} session${openCount === 1 ? '' : 's'} ${dateWord}`;
+    const levelOpen = visible.filter(s => s.available && activeLevels.has(s.level)).length;
+    const levelTotal = visible.filter(s => activeLevels.has(s.level)).length;
+    if (levelOpen > 0) {
+      return `${levelOpen} ${level} session${levelOpen === 1 ? '' : 's'} ${dateWord}`;
+    }
+    if (levelTotal > 0) {
+      return `${levelTotal} ${level} session${levelTotal === 1 ? '' : 's'} ${dateWord} · none open`;
+    }
   }
   if (activeWave === 1) {
-    return `${openCount} Left Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+    const wOpen = visible.filter(s => s.available && s.wave === 1).length;
+    const wTotal = visible.filter(s => s.wave === 1).length;
+    if (wOpen > 0) return `${wOpen} Left Wave session${wOpen === 1 ? '' : 's'} ${dateWord}`;
+    if (wTotal > 0) return `${wTotal} Left Wave session${wTotal === 1 ? '' : 's'} ${dateWord} · none open`;
   }
   if (activeWave === 2) {
-    return `${openCount} Right Wave session${openCount === 1 ? '' : 's'} ${dateWord}`;
+    const wOpen = visible.filter(s => s.available && s.wave === 2).length;
+    const wTotal = visible.filter(s => s.wave === 2).length;
+    if (wOpen > 0) return `${wOpen} Right Wave session${wOpen === 1 ? '' : 's'} ${dateWord}`;
+    if (wTotal > 0) return `${wTotal} Right Wave session${wTotal === 1 ? '' : 's'} ${dateWord} · none open`;
   }
-  return `${openCount} open session${openCount === 1 ? '' : 's'} ${dateWord}`;
+  return `${countPart} ${dateWord}`;
 }
 
 function dateKeyFromSession(s) {
   if (s.dateKey) return s.dateKey;
-  const d = new Date(s.ts * 1000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  if (s.isoDate) return s.isoDate;
+  if (!s.ts) return '';
+  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date(s.ts * 1000));
 }
 
 function dateLabel(dateKey) {
@@ -1164,20 +1200,59 @@ function hexAlpha(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
-function surfCondition(s, hist) {
-  const slots = s.slots ?? hist.slots;
-  const suffix = slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '';
+function formatSpotCountShort(slots) {
+  if (slots == null) return null;
+  if (slots === 1) return '1 spot left';
+  return `${slots} spots left`;
+}
 
+function sessionConditionDisplay(s, hist) {
+  const slots = s.slots ?? hist?.slots;
   if (!s.available) {
-    return { text: 'PACKED', color: '#5d8aa8', slots };
+    return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots };
   }
   if (slots == null) {
-    return { text: 'OPEN', color: '#00c9a7', slots: null };
+    return { primary: 'Open', sub: null, desktop: 'Open', color: '#00c9a7', slots: null };
   }
-  if (slots >= 10) return { text: `FIRING 🔥${suffix}`, color: '#00c9a7', slots };
-  if (slots >= 5)  return { text: `OPEN${suffix}`, color: '#00c9a7', slots };
-  if (slots >= 3)  return { text: `GETTING CROWDED${suffix}`, color: '#ffd166', slots };
-  return { text: `CLOSING OUT ⚡${suffix}`, color: '#ff6b35', slots };
+  const primary = formatSpotCountShort(slots);
+  let sub = null;
+  let desktop = primary;
+  let color = '#00c9a7';
+  if (slots >= 10) {
+    sub = 'Firing';
+    desktop = `${primary} · Firing`;
+  } else if (slots >= 5) {
+    desktop = primary;
+  } else if (slots >= 3) {
+    sub = 'Getting crowded';
+    desktop = `${primary} · Getting crowded`;
+    color = '#ffd166';
+  } else {
+    sub = 'Closing out';
+    desktop = `${primary} · Closing out`;
+    color = '#ff6b35';
+  }
+  return { primary, sub, desktop, color, slots };
+}
+
+function conditionBadgeHtml(display) {
+  const subHtml = display.sub ? `<span class="cond-sub">${display.sub}</span>` : '';
+  return `<div class="cond-badge" style="color:${display.color}">
+    <span class="cond-compact"><span class="cond-primary">${display.primary}</span>${subHtml}</span>
+    <span class="cond-full">${display.desktop || display.primary}</span>
+  </div>`;
+}
+
+function surfCondition(s, hist) {
+  const display = sessionConditionDisplay(s, hist);
+  const slots = display.slots;
+  const suffix = slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '';
+  if (!s.available) return { text: 'PACKED', color: display.color, slots };
+  if (slots == null) return { text: 'OPEN', color: display.color, slots: null };
+  if (slots >= 10) return { text: `FIRING 🔥${suffix}`, color: display.color, slots };
+  if (slots >= 5) return { text: `OPEN${suffix}`, color: display.color, slots };
+  if (slots >= 3) return { text: `GETTING CROWDED${suffix}`, color: display.color, slots };
+  return { text: `CLOSING OUT ⚡${suffix}`, color: display.color, slots };
 }
 
 
@@ -1345,8 +1420,8 @@ function renderStatusBar() {
     return;
   }
 
-  const openCount = visibleOpenSessions().length;
-  const countLabel = browseCountLabel(openCount);
+  const visible = visibleBrowseSessions();
+  const countLabel = browseCountLabel(visible);
   txt.innerHTML = `<span class="open-count">${countLabel}</span><span class="check-time"> · ${detail}</span>`;
 }
 
@@ -1410,7 +1485,7 @@ function sessionCardHtml(s) {
   const watched = isWatched(s.key);
   const hist    = data.history[s.key] || {};
   const slots   = s.slots ?? hist.slots;
-  const cond    = surfCondition(s, hist);
+  const display = sessionConditionDisplay(s, hist);
   const dimmed  = !s.available;
   const tint    = hexAlpha(cfg.c, dimmed ? .04 : .12);
   const accent  = dimmed ? '#1f3a55' : cfg.c;
@@ -1437,8 +1512,8 @@ function sessionCardHtml(s) {
       ${price ? `<div class="sc-price">${price}</div>` : ''}
       <a class="book-link" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
     </div>
-    <div class="sc-right">
-      <div class="cond-badge" style="color:${cond.color}">${cond.text}</div>
+    <div class="sc-actions">
+      ${conditionBadgeHtml(display)}
       <button class="bell-btn${watched ? ' on' : ''}${alertsEnabled() ? '' : ' bell-soon'}"
         onclick="onBellClick('${sJson}')"
         aria-label="${alertsEnabled() ? (watched ? 'Stop watching' : 'Watch') + ' this session' : 'Alerts coming soon'}"
@@ -1470,22 +1545,24 @@ function renderWatching() {
     const hist = data.history[sessionKey] || {};
     const slots = live?.slots ?? w.slots ?? hist.slots;
     const side = w.waveSide || w.wave_side || (live ? (live.waveSide || waveLabel(live.wave)) : waveLabel(w.wave));
-    const booked = live ? formatBookedLine(live, hist) : (slots != null ? `${slots} spot${slots === 1 ? '' : 's'}` : '');
+    const booked = live ? formatBookedLine(live, hist) : (slots != null ? formatSpotCountShort(slots) : '');
     const price = live ? formatPrice(live) : (w.priceText ? w.priceText : '');
-    let statusHtml = '<div class="wc-status" style="color:var(--sub)">AWAITING CHECK...</div>';
+    let statusHtml = '<div class="wc-status" style="color:var(--sub)">Awaiting check…</div>';
 
     if (live) {
-      const cond = surfCondition(live, hist);
+      const display = sessionConditionDisplay(live, hist);
       if (live.available) {
-        statusHtml = `<div class="wc-status" style="color:${cond.color}">${cond.text}</div>`;
+        statusHtml = conditionBadgeHtml(display);
       } else {
-        statusHtml = '<div class="wc-status" style="color:#5d8aa8">PACKED — ON WATCH</div>';
+        statusHtml = conditionBadgeHtml({ primary: 'Packed', sub: 'On watch', desktop: 'Packed · on watch', color: '#5d8aa8' });
       }
     }
 
-    const slotsText = booked ? ` · ${booked}` : (slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '');
+    const slotsText = booked ? ` · ${booked}` : '';
     const priceText = price ? ` · ${price}` : '';
     const dateLine = w.dayLabel || w.date || w.iso_date || '';
+    // Deep-link hook: append ?date= when Atlantic Park supports session-specific URLs
+    const bookUrl = BOOKING_URL;
 
     return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
@@ -1495,7 +1572,10 @@ function renderWatching() {
         </div>
         <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>
-      ${statusHtml}
+      <div class="wc-foot">
+        ${statusHtml}
+        <a class="book-link wc-book" href="${bookUrl}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
+      </div>
     </div>`;
   }).join('');
 }
