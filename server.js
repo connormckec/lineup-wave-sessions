@@ -84,6 +84,100 @@ let dataSource = 'memory';
 let supabaseConfigured = false;
 let supabase = null;
 let supabaseInitError = null;
+
+const REQUIRED_SUPABASE_TABLES = [
+  'current_sessions',
+  'scrape_snapshots',
+  'availability_snapshots',
+  'scrape_runs',
+  'watchlist_items',
+  'notification_events',
+];
+
+let supabaseSchemaHealth = {
+  checkedAt: null,
+  tables: {},
+  missingTables: [],
+  currentSessionsAvailable: false,
+};
+
+function isMissingTableError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const code = err?.code || '';
+  return code === 'PGRST205'
+    || code === '42P01'
+    || msg.includes('could not find the table')
+    || msg.includes('schema cache')
+    || (msg.includes('relation') && msg.includes('does not exist'));
+}
+
+function formatSchemaError(tableName) {
+  return `Missing Supabase table ${tableName}. Run supabase/schema.sql in the Supabase SQL editor.`;
+}
+
+async function probeSupabaseTable(tableName) {
+  if (!supabase) return { exists: false, error: 'Supabase client not configured' };
+  try {
+    const { error } = await supabase
+      .from(tableName)
+      .select('*', { head: true, count: 'exact' })
+      .limit(1);
+    if (error) {
+      if (isMissingTableError(error)) {
+        return { exists: false, error: formatSchemaError(tableName), code: error.code || null };
+      }
+      return { exists: false, error: error.message, code: error.code || null };
+    }
+    return { exists: true };
+  } catch (e) {
+    return { exists: false, error: e.message };
+  }
+}
+
+async function auditSupabaseSchema() {
+  if (!supabase) {
+    supabaseSchemaHealth = {
+      checkedAt: new Date().toISOString(),
+      tables: {},
+      missingTables: REQUIRED_SUPABASE_TABLES.slice(),
+      currentSessionsAvailable: false,
+    };
+    return supabaseSchemaHealth;
+  }
+
+  const tables = {};
+  const missingTables = [];
+  for (const table of REQUIRED_SUPABASE_TABLES) {
+    const result = await probeSupabaseTable(table);
+    tables[table] = result;
+    if (!result.exists) missingTables.push(table);
+  }
+
+  supabaseSchemaHealth = {
+    checkedAt: new Date().toISOString(),
+    tables,
+    missingTables,
+    currentSessionsAvailable: !!tables.current_sessions?.exists,
+  };
+
+  if (missingTables.length) {
+    console.error(`  Supabase schema audit: missing table(s): ${missingTables.join(', ')}`);
+    console.error('  → Run supabase/schema.sql in the Supabase SQL editor for this project.');
+  } else {
+    console.log('  Supabase schema audit: all required tables present');
+  }
+
+  return supabaseSchemaHealth;
+}
+
+function schemaHealthPayload() {
+  return {
+    ...supabaseSchemaHealth,
+    schemaActionRequired: supabaseSchemaHealth.missingTables.includes('current_sessions')
+      ? formatSchemaError('current_sessions')
+      : null,
+  };
+}
 let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
@@ -199,6 +293,10 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
 }
 
 function normalizeDataSource(src) {
+  if (!src) return supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback';
+  const s = String(src);
+  if (s.includes('scrape_snapshots')) return 'supabase/scrape_snapshots_fallback';
+  if (s.includes('schema-missing') || s.includes('schema fallback')) return s;
   if (src === 'supabase/current_sessions' || src === 'supabase-current' || src === 'supabase-cache' || src === 'supabase') {
     return 'supabase/current_sessions';
   }
@@ -231,11 +329,23 @@ function isoDateFromRow(row) {
 }
 
 async function loadSessionsForDateFromSupabase(isoDate) {
-  if (!isoDate) return [];
+  if (!isoDate) {
+    return { sessions: [], dataSource: 'none', schemaError: null };
+  }
+
   if (!supabase) {
     await ensureSessionsForStatus();
-    return sessionsForDate(isoDate);
+    return {
+      sessions: sessionsForDate(isoDate),
+      dataSource: normalizeDataSource(dataSource),
+      schemaError: null,
+    };
   }
+
+  if (!supabaseSchemaHealth.currentSessionsAvailable && supabaseSchemaHealth.checkedAt) {
+    return loadSessionsForDateFallback(isoDate, formatSchemaError('current_sessions'));
+  }
+
   try {
     const { data, error } = await supabase
       .from('current_sessions')
@@ -243,18 +353,63 @@ async function loadSessionsForDateFromSupabase(isoDate) {
       .eq('park', PARK)
       .eq('iso_date', isoDate)
       .order('start_ts', { ascending: true });
-    if (error) throw error;
+    if (error) {
+      if (isMissingTableError(error)) {
+        supabaseSchemaHealth.currentSessionsAvailable = false;
+        if (!supabaseSchemaHealth.missingTables.includes('current_sessions')) {
+          supabaseSchemaHealth.missingTables.push('current_sessions');
+        }
+        return loadSessionsForDateFallback(isoDate, formatSchemaError('current_sessions'));
+      }
+      throw error;
+    }
+
+    supabaseSchemaHealth.currentSessionsAvailable = true;
     const rows = asSessionArray(data);
     const dateSessions = rows.map(currentRowToSession).filter(s => s?.key);
     for (const s of dateSessions) {
       sessionsByKey.set(s.key, s);
     }
     rebuildSessionsArray();
-    return dateSessions;
+    return {
+      sessions: dateSessions,
+      dataSource: 'supabase/current_sessions',
+      schemaError: null,
+    };
   } catch (e) {
+    if (isMissingTableError(e)) {
+      return loadSessionsForDateFallback(isoDate, formatSchemaError('current_sessions'));
+    }
     console.error(`  Supabase current_sessions load for ${isoDate} failed:`, e.message);
     throw e;
   }
+}
+
+async function loadSessionsForDateFallback(isoDate, schemaError) {
+  let dateSessions = sessionsForDate(isoDate);
+  let src = normalizeDataSource(dataSource);
+
+  if (!dateSessions.length) {
+    const loaded = await loadLatestSnapshotFromSupabase();
+    if (loaded) {
+      dateSessions = sessionsForDate(isoDate);
+      if (dateSessions.length) src = 'supabase/scrape_snapshots_fallback';
+    }
+  }
+
+  if (dateSessions.length) {
+    return {
+      sessions: dateSessions,
+      dataSource: schemaError ? `${src}; schema fallback` : src,
+      schemaError: schemaError || null,
+    };
+  }
+
+  return {
+    sessions: [],
+    dataSource: schemaError ? 'schema-missing' : src,
+    schemaError: schemaError || null,
+  };
 }
 
 function dateCoverageForIsoDate(isoDate) {
@@ -282,7 +437,29 @@ async function buildSessionsForDatePayload(isoDate) {
   if (!persistedDatesChecked.size && supabase) {
     await loadScrapeMetaFromSupabase();
   }
-  const dateSessions = await loadSessionsForDateFromSupabase(isoDate);
+
+  const { sessions: dateSessions, dataSource: src, schemaError } =
+    await loadSessionsForDateFromSupabase(isoDate);
+
+  if (schemaError && !dateSessions.length) {
+    return {
+      isoDate,
+      sessions: [],
+      sessionsCount: 0,
+      dataSource: 'schema-missing',
+      lastSuccessfulScrape,
+      lastCheckedForDate: null,
+      wasDateChecked: false,
+      isScrapeInProgress: scrapeInProgress,
+      hasSavedSessions: false,
+      statusReason: 'schema_error',
+      error: schemaError,
+      schemaError,
+      dateCoverage: dateCoverageForIsoDate(isoDate),
+      schemaHealth: schemaHealthPayload(),
+    };
+  }
+
   const hasSaved = dateSessions.length > 0;
   const wasChecked = hasSaved || persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate);
   const statusReason = statusReasonForDate(isoDate, dateSessions);
@@ -290,14 +467,17 @@ async function buildSessionsForDatePayload(isoDate) {
     isoDate,
     sessions: dateSessions,
     sessionsCount: dateSessions.length,
-    dataSource: supabase ? 'supabase/current_sessions' : normalizeDataSource(dataSource),
+    dataSource: src,
     lastSuccessfulScrape,
     lastCheckedForDate: wasChecked ? (lastSuccessfulScrape || lastTierRun[1] || lastTierRun[2] || null) : null,
     wasDateChecked: wasChecked,
     isScrapeInProgress: scrapeInProgress,
     hasSavedSessions: hasSaved,
     statusReason,
+    schemaError: schemaError || null,
+    error: schemaError || null,
     dateCoverage: dateCoverageForIsoDate(isoDate),
+    schemaHealth: schemaHealthPayload(),
   };
 }
 
@@ -483,6 +663,12 @@ function getStatusFields() {
     datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     scrapeScheduleEnabled,
     serverStartedAt,
+    schemaHealth: schemaHealthPayload(),
+    schemaMissingTables: supabaseSchemaHealth.missingTables,
+    schemaActionRequired: supabaseSchemaHealth.missingTables.includes('current_sessions')
+      ? formatSchemaError('current_sessions')
+      : null,
+    currentSessionsTableAvailable: supabaseSchemaHealth.currentSessionsAvailable,
   };
 }
 
@@ -540,13 +726,31 @@ async function loadScrapeMetaFromSupabase() {
 
 async function loadCurrentSessionsFromSupabase({ reloadMeta = true } = {}) {
   if (!supabase) return false;
+
+  if (!supabaseSchemaHealth.currentSessionsAvailable && supabaseSchemaHealth.checkedAt) {
+    console.warn('  Supabase: current_sessions unavailable — using scrape_snapshots fallback');
+    return loadLatestSnapshotFromSupabase();
+  }
+
   try {
     const { data, error } = await supabase
       .from('current_sessions')
       .select('*')
       .eq('park', PARK)
       .order('start_ts', { ascending: true });
-    if (error) throw error;
+    if (error) {
+      if (isMissingTableError(error)) {
+        supabaseSchemaHealth.currentSessionsAvailable = false;
+        if (!supabaseSchemaHealth.missingTables.includes('current_sessions')) {
+          supabaseSchemaHealth.missingTables.push('current_sessions');
+        }
+        console.error(`  ${formatSchemaError('current_sessions')}`);
+        return loadLatestSnapshotFromSupabase({ fallback: true });
+      }
+      throw error;
+    }
+
+    supabaseSchemaHealth.currentSessionsAvailable = true;
     if (!data?.length) {
       console.log('  Supabase: no rows in current_sessions');
       return false;
@@ -581,6 +785,10 @@ async function loadCurrentSessionsFromSupabase({ reloadMeta = true } = {}) {
     console.log(`  Supabase: loaded ${sessionsByKey.size} current session(s) (${sessions.length} in serve window, last scrape ${age}m ago)`);
     return true;
   } catch (e) {
+    if (isMissingTableError(e)) {
+      console.error(`  ${formatSchemaError('current_sessions')}`);
+      return loadLatestSnapshotFromSupabase({ fallback: true });
+    }
     console.error('  Supabase current_sessions load failed:', e.message);
     return false;
   }
@@ -656,7 +864,7 @@ async function finishScrapeRun(runId, {
   }
 }
 
-async function loadLatestSnapshotFromSupabase() {
+async function loadLatestSnapshotFromSupabase({ fallback = false } = {}) {
   if (!supabase) return false;
   try {
     const { data, error } = await supabase
@@ -673,7 +881,7 @@ async function loadLatestSnapshotFromSupabase() {
     applyLoadedSnapshot(data.sessions, data.scrape_meta, data.last_successful_scrape);
     lastScrapeAttempt = data.last_scrape_attempt || null;
     lastScrapeError = data.last_scrape_error || null;
-    dataSource = 'supabase';
+    dataSource = fallback ? 'supabase/scrape_snapshots_fallback' : 'supabase';
     hasFreshScrapeThisBoot = false;
 
     const age = lastSuccessfulScrape
@@ -2796,6 +3004,17 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
+app.get('/api/schema/health', async (_req, res) => {
+  if (supabase && !supabaseSchemaHealth.checkedAt) {
+    await auditSupabaseSchema();
+  }
+  res.json({
+    supabaseConfigured,
+    supabaseInitError,
+    ...schemaHealthPayload(),
+  });
+});
+
 app.get('/api/sessions', async (req, res) => {
   const isoDate = normalizeIsoDateParam(req.query.date || req.query.iso_date || req.query.isoDate);
 
@@ -2805,19 +3024,22 @@ app.get('/api/sessions', async (req, res) => {
       res.json(payload);
     } catch (e) {
       console.error(`/api/sessions?date=${isoDate} error:`, e.message);
-      res.status(500).json({
+      const schemaErr = isMissingTableError(e) ? formatSchemaError('current_sessions') : null;
+      res.status(schemaErr ? 503 : 500).json({
         isoDate,
         sessions: [],
         sessionsCount: 0,
-        dataSource: supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback',
+        dataSource: schemaErr ? 'schema-missing' : (supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback'),
         lastSuccessfulScrape,
         lastCheckedForDate: null,
         wasDateChecked: false,
         isScrapeInProgress: scrapeInProgress,
         hasSavedSessions: false,
-        statusReason: 'error',
-        error: e.message,
+        statusReason: schemaErr ? 'schema_error' : 'error',
+        error: schemaErr || e.message,
+        schemaError: schemaErr,
         dateCoverage: dateCoverageForIsoDate(isoDate),
+        schemaHealth: schemaHealthPayload(),
       });
     }
     return;
@@ -3169,6 +3391,7 @@ async function loadPersistedData() {
   initSupabaseClient();
   if (!supabase) return;
   try {
+    await auditSupabaseSchema();
     const loadedCurrent = await loadCurrentSessionsFromSupabase();
     if (!loadedCurrent) {
       await loadLatestSnapshotFromSupabase();

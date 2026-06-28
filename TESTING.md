@@ -1,5 +1,41 @@
 # Testing
 
+## Schema / data contract verification
+
+Run this after deploying or when you see “Could not find the table 'public.current_sessions'”.
+
+1. **Apply schema** — paste full [`supabase/schema.sql`](supabase/schema.sql) into Supabase SQL editor → Run.
+2. **Confirm table** — Supabase Table Editor → `current_sessions` exists.
+3. **Schema health**:
+
+```bash
+curl -s http://localhost:3000/api/schema/health | jq '{missingTables, currentSessionsAvailable, schemaActionRequired}'
+```
+
+4. **Status**:
+
+```bash
+curl -s http://localhost:3000/api/status | jq '{dataSource, currentSessionsTableAvailable, schemaMissingTables, schemaActionRequired, currentSessionsCount}'
+```
+
+5. **Selected date** (replace date as needed):
+
+```bash
+curl -s "http://localhost:3000/api/sessions?date=2026-06-28" | jq '{isoDate, sessionsCount, dataSource, statusReason, error, schemaError}'
+```
+
+6. **Open app** — Browse should show sessions, empty states (“Not checked yet”), or **Database schema missing. Run supabase/schema.sql.** — not an infinite “Loading…” or raw PostgREST error.
+
+If `current_sessions` is missing and no snapshot fallback exists, `/api/sessions` returns HTTP 503 with:
+
+```json
+{ "error": "Missing Supabase table current_sessions. Run supabase/schema.sql in the Supabase SQL editor.", "statusReason": "schema_error" }
+```
+
+See [`AUDIT.md`](AUDIT.md) for the full table/column/API contract.
+
+---
+
 ## Supabase availability collector
 
 ### Prerequisites

@@ -581,6 +581,29 @@ const BOOT_FAILSAFE_MS = 5000;
 
 const FETCH_NO_STORE = { cache: 'no-store' };
 
+function isSchemaMissingMessage(msg) {
+  const s = String(msg || '').toLowerCase();
+  return s.includes('missing supabase table')
+    || s.includes('schema.sql')
+    || s.includes('schema cache')
+    || s.includes('schema-missing')
+    || s.includes('schema_error');
+}
+
+function formatApiError(payloadOrMessage, err) {
+  const msg = typeof payloadOrMessage === 'string'
+    ? payloadOrMessage
+    : (payloadOrMessage?.error
+      || payloadOrMessage?.schemaError
+      || payloadOrMessage?.schemaActionRequired
+      || err?.message
+      || '');
+  if (isSchemaMissingMessage(msg)) {
+    return 'Database schema missing. Run supabase/schema.sql in the Supabase SQL editor.';
+  }
+  return msg || 'Could not load sessions';
+}
+
 function finishLoading(state) {
   uiLoading = false;
   bootState = state || 'ready';
@@ -714,7 +737,29 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     if (token !== selectedDateFetchToken) return;
 
     if (!res.ok) {
-      throw new Error(payload.error || `HTTP ${res.status}`);
+      throw new Error(formatApiError(payload));
+    }
+
+    if (payload.statusReason === 'schema_error' || payload.schemaError) {
+      selectedDateSessions = normalizeSessions(payload.sessions || []);
+      selectedDateMeta = {
+        statusReason: 'schema_error',
+        sessionsCount: payload.sessionsCount ?? selectedDateSessions.length,
+        dataSource: payload.dataSource || 'schema-missing',
+        wasDateChecked: payload.wasDateChecked,
+        hasSavedSessions: payload.hasSavedSessions ?? selectedDateSessions.length > 0,
+        isScrapeInProgress: !!payload.isScrapeInProgress,
+        isLoading: false,
+        lastFetchError: formatApiError(payload),
+        endpoint,
+      };
+      if (selectedDateSessions.length) {
+        const byKey = new Map(asSessionArray(data.sessions).map(s => [s.key, s]));
+        for (const s of selectedDateSessions) byKey.set(s.key, s);
+        data.sessions = [...byKey.values()];
+      }
+      console.warn('[dateSessions] schema missing', { date: dateKey, dataSource: selectedDateMeta.dataSource });
+      return;
     }
 
     const sessions = normalizeSessions(payload.sessions || []);
@@ -744,10 +789,10 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     });
   } catch (err) {
     if (token !== selectedDateFetchToken) return;
-    selectedDateMeta.lastFetchError = err?.message || String(err);
+    selectedDateMeta.lastFetchError = formatApiError(err?.message || String(err));
     selectedDateMeta.isLoading = false;
     if (!selectedDateSessions.length) {
-      selectedDateMeta.statusReason = 'error';
+      selectedDateMeta.statusReason = isSchemaMissingMessage(selectedDateMeta.lastFetchError) ? 'schema_error' : 'error';
     }
     console.error('[dateSessions]', dateKey, err);
   } finally {
@@ -1935,8 +1980,13 @@ function renderBrowse() {
     return;
   }
 
+  if (!selectedDateSessions.length && selectedDateMeta.statusReason === 'schema_error') {
+    listEl.innerHTML = '<div class="empty">Database schema missing. Run supabase/schema.sql in the Supabase SQL editor.</div>';
+    return;
+  }
+
   if (!selectedDateSessions.length && selectedDateMeta.statusReason === 'error') {
-    listEl.innerHTML = `<div class="empty">Could not load sessions.<br>${selectedDateMeta.lastFetchError || lastFetchError || 'Unknown error'}<br>Try Debug reload sessions in Settings.</div>`;
+    listEl.innerHTML = `<div class="empty">${formatApiError(selectedDateMeta.lastFetchError)}<br>Try Debug reload sessions in Settings.</div>`;
     return;
   }
 
@@ -1956,8 +2006,10 @@ function renderBrowse() {
       msg = 'No sessions found for this date';
     } else if (reason === 'not_checked') {
       msg = 'Not checked yet';
+    } else if (reason === 'schema_error') {
+      msg = formatApiError(selectedDateMeta.lastFetchError);
     } else if (reason === 'error') {
-      msg = selectedDateMeta.lastFetchError || 'Could not load sessions';
+      msg = formatApiError(selectedDateMeta.lastFetchError);
     } else if (selectedDateMeta.isLoading) {
       msg = 'Loading sessions…';
     } else if (activeDayKey === todayKey()) {
@@ -2104,6 +2156,10 @@ function renderDebugState() {
     ['Status reason', selectedDateMeta.statusReason || '—'],
     ['dataSource', selectedDateMeta.dataSource || data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
+    ['schemaHealth', data.schemaHealth?.missingTables?.length
+      ? `missing: ${data.schemaHealth.missingTables.join(', ')}`
+      : (data.schemaHealth?.checkedAt ? 'ok' : '—')],
+    ['schemaActionRequired', data.schemaActionRequired || data.schemaHealth?.schemaActionRequired || '—'],
     ['lastFetchError', selectedDateMeta.lastFetchError || lastFetchError || '—'],
     ['lastRenderError', lastRenderError || '—'],
     ['Date loading', selectedDateMeta.isLoading ? 'yes' : 'no'],

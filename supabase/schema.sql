@@ -1,3 +1,13 @@
+-- Lineup / Atlantic Park Surf Dashboard — Supabase schema
+-- Safe to run repeatedly in the Supabase SQL editor (idempotent).
+--
+-- Step 1: Paste this entire file into Supabase → SQL → New query → Run.
+-- Step 2: Confirm tables in Table Editor (especially current_sessions).
+-- Step 3: Hit GET /api/schema/health and GET /api/sessions?date=YYYY-MM-DD on your server.
+--
+-- NOT used by the app (do not create unless you add features later):
+--   date_coverage, session_enrichment_queue
+
 -- Operational scrape state (meta only — sessions live in current_sessions)
 create table if not exists scrape_snapshots (
   id text primary key,
@@ -133,17 +143,6 @@ create table if not exists watchlist_items (
   active boolean not null default true
 );
 
-alter table watchlist_items add column if not exists alert_when_selling_fast boolean not null default true;
-alter table watchlist_items add column if not exists fast_drop_threshold integer not null default 3;
-alter table watchlist_items add column if not exists alert_last_call boolean not null default true;
-alter table watchlist_items add column if not exists last_call_minutes_before integer not null default 120;
-alter table watchlist_items add column if not exists watched_at timestamptz;
-alter table watchlist_items add column if not exists initial_available boolean;
-alter table watchlist_items add column if not exists initial_slots_available integer;
-alter table watchlist_items add column if not exists last_seen_available boolean;
-alter table watchlist_items add column if not exists last_seen_slots_available integer;
-alter table watchlist_items add column if not exists last_seen_at timestamptz;
-
 create unique index if not exists watchlist_items_user_session_idx
   on watchlist_items (user_key, session_key);
 
@@ -169,16 +168,21 @@ create table if not exists notification_events (
   event_reason text
 );
 
-alter table notification_events add column if not exists previous_available boolean;
-alter table notification_events add column if not exists current_available boolean;
-alter table notification_events add column if not exists previous_slots integer;
-alter table notification_events add column if not exists current_slots integer;
-alter table notification_events add column if not exists event_reason text;
-
 create index if not exists notification_events_session_idx
   on notification_events (session_key, created_at desc);
 
--- Migrations for existing deployments
+-- Column migrations for existing deployments (safe when tables exist from above)
+alter table watchlist_items add column if not exists alert_when_selling_fast boolean not null default true;
+alter table watchlist_items add column if not exists fast_drop_threshold integer not null default 3;
+alter table watchlist_items add column if not exists alert_last_call boolean not null default true;
+alter table watchlist_items add column if not exists last_call_minutes_before integer not null default 120;
+alter table watchlist_items add column if not exists watched_at timestamptz;
+alter table watchlist_items add column if not exists initial_available boolean;
+alter table watchlist_items add column if not exists initial_slots_available integer;
+alter table watchlist_items add column if not exists last_seen_available boolean;
+alter table watchlist_items add column if not exists last_seen_slots_available integer;
+alter table watchlist_items add column if not exists last_seen_at timestamptz;
+
 alter table current_sessions add column if not exists capacity integer;
 alter table current_sessions add column if not exists estimated_booked integer;
 alter table current_sessions add column if not exists fill_rate numeric;
@@ -193,6 +197,12 @@ alter table availability_snapshots add column if not exists price_max numeric;
 alter table availability_snapshots add column if not exists currency text default 'USD';
 
 alter table scrape_runs add column if not exists coverage_percent integer;
+
+alter table notification_events add column if not exists previous_available boolean;
+alter table notification_events add column if not exists current_available boolean;
+alter table notification_events add column if not exists previous_slots integer;
+alter table notification_events add column if not exists current_slots integer;
+alter table notification_events add column if not exists event_reason text;
 
 -- scrape_meta jsonb in scrape_snapshots may include:
 --   datesCheckedDuringScrape text[] — ISO dates the scraper has visited

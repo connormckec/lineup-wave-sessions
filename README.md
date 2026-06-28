@@ -37,8 +37,11 @@ Open http://localhost:3000 to browse sessions and add watches.
 ### Supabase setup
 
 1. Create a Supabase project.
-2. Run the full SQL in [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL editor.
+2. Run the full SQL in [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL editor (idempotent — safe to re-run).
 3. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your environment (server only — never expose to the frontend).
+4. Verify: `GET /api/schema/health` → `missingTables: []`.
+
+If the schema was not applied, the app still boots but Browse shows **Database schema missing. Run supabase/schema.sql.** See [`AUDIT.md`](AUDIT.md).
 
 On startup the server loads saved sessions from `current_sessions` before accepting requests. The UI treats Supabase as source of truth: saved sessions render immediately, background scrapes refresh in place, and failed scrapes never wipe visible data.
 
