@@ -1,6 +1,10 @@
-# AP Session Watcher
+# Lineup
 
-Monitors [Atlantic Park Surf](https://booking.atlanticparksurf.com/activity-agenda) session availability, collects historical availability data in Supabase, and sends push notifications via [ntfy.sh](https://ntfy.sh) when watched sessions change.
+Atlantic Park session availability dashboard — monitors [Atlantic Park Surf](https://booking.atlanticparksurf.com/activity-agenda) sessions, collects historical availability in Supabase, and sends demo watchlist alerts via ntfy when enabled.
+
+## Branding (demo pass)
+
+The UI uses the **Lineup** wordmark with the circular wave mark from `public/brand/lineup-logo-source.png`. App icons are generated from that source; the checkerboard matte is a temporary placeholder until we export a true transparent mark.
 
 ## Architecture
 

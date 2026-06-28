@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <link rel="manifest" href="/manifest.json">
-<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Lineup">
@@ -34,8 +36,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Header ── */
 #header{padding:18px 16px 0;background:var(--bg);flex-shrink:0}
-.header-row{display:flex;justify-content:space-between;align-items:flex-start}
-#app-title{font-family:var(--font-display);font-size:28px;font-weight:800;letter-spacing:.08em;color:#fff;text-transform:uppercase;line-height:1}
+.header-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.header-brand{display:flex;align-items:center;gap:10px;min-width:0}
+.header-mark{width:36px;height:36px;border-radius:50%;flex-shrink:0;object-fit:cover}
+.header-copy{min-width:0}
+#app-title{font-family:var(--font-display);font-size:26px;font-weight:800;letter-spacing:.1em;color:#fff;text-transform:uppercase;line-height:1}
+.app-sublabel{margin-top:3px;font-size:11px;font-weight:500;letter-spacing:.06em;color:var(--sub);text-transform:none;line-height:1.2}
 .wave-divider{margin:10px -16px 0;height:14px;overflow:hidden;position:relative}
 .wave-divider svg{display:block;width:200%;height:14px;animation:wave-drift 6s linear infinite}
 .wave-divider path{fill:none;stroke:var(--border);stroke-width:1.5;stroke-linecap:round}
@@ -340,7 +346,13 @@ input.field:focus{border-color:var(--accent)}
 
   <header id="header">
     <div class="header-row">
-      <h1 id="app-title">AP Sessions</h1>
+      <div class="header-brand">
+        <img src="/brand/lineup-mark-72.png" alt="" class="header-mark" width="36" height="36">
+        <div class="header-copy">
+          <h1 id="app-title">Lineup</h1>
+          <p class="app-sublabel">Atlantic Park sessions</p>
+        </div>
+      </div>
       <button id="refresh-btn" onclick="refresh()" aria-label="Refresh sessions">
         <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
       </button>
