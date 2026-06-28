@@ -1286,6 +1286,7 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     minutesSinceTier1Scrape: minutesSinceTier1,
     lastTier1DurationMs,
     latestDetailEnrichmentErrors: enrichmentMetrics.recentErrors.slice(-5),
+    ...cookieDiagnosticsPayload(),
   };
 }
 
@@ -2443,12 +2444,7 @@ function incrementDetailFailureStats(stats, status) {
 }
 
 function attachCookieDiagnosticsToStats(stats) {
-  const cookie = cookieDiagnosticsSnapshot();
-  stats.cookieDismissAttempted = cookie.cookieDismissAttempted;
-  stats.cookieDismissSucceeded = cookie.cookieDismissSucceeded;
-  stats.cookieBannerStillVisible = cookie.cookieBannerStillVisible;
-  stats.cookieClickMethod = cookie.cookieClickMethod;
-  stats.modalTextAfterCookieDismissSample = cookie.modalTextAfterCookieDismissSample;
+  Object.assign(stats, cookieDiagnosticsPayload());
   return stats;
 }
 
@@ -4165,7 +4161,29 @@ let cookieDismissDiagnostics = {
   cookieBannerStillVisible: false,
   cookieClickMethod: null,
   modalTextAfterCookieDismissSample: null,
+  lastAttempt: null,
+  attempts: [],
 };
+
+function emptyCookieAttemptDiagnostics() {
+  return {
+    bannerElementTag: null,
+    bannerElementClass: null,
+    bannerElementId: null,
+    buttonCandidates: [],
+    clickedCandidate: null,
+    beforeText: null,
+    afterText: null,
+    didTextDisappear: false,
+    didElementDetach: false,
+    activeElementAfterClick: null,
+    iframeCount: 0,
+    shadowHostCandidates: [],
+    frameUsed: 'main',
+    method: null,
+    failureReason: null,
+  };
+}
 
 function resetCookieDismissDiagnostics() {
   cookieDismissDiagnostics = {
@@ -4174,11 +4192,31 @@ function resetCookieDismissDiagnostics() {
     cookieBannerStillVisible: false,
     cookieClickMethod: null,
     modalTextAfterCookieDismissSample: null,
+    lastAttempt: null,
+    attempts: [],
+  };
+}
+
+function cookieDiagnosticsPayload() {
+  const snap = cookieDiagnosticsSnapshot();
+  return {
+    cookieDismissAttempted: snap.cookieDismissAttempted,
+    cookieDismissSucceeded: snap.cookieDismissSucceeded,
+    cookieBannerStillVisible: snap.cookieBannerStillVisible,
+    cookieClickMethod: snap.cookieClickMethod,
+    modalTextAfterCookieDismissSample: snap.modalTextAfterCookieDismissSample,
+    cookieDismissLastAttempt: snap.lastAttempt,
+    cookieDismissAttempts: snap.attempts,
   };
 }
 
 function cookieDiagnosticsSnapshot() {
-  return { ...cookieDismissDiagnostics };
+  return { ...cookieDismissDiagnostics, attempts: [...(cookieDismissDiagnostics.attempts || [])] };
+}
+
+function recordCookieAttempt(attempt) {
+  cookieDismissDiagnostics.lastAttempt = attempt;
+  cookieDismissDiagnostics.attempts = [...(cookieDismissDiagnostics.attempts || []), attempt].slice(-5);
 }
 
 async function setupBookingBrowserContext(context) {
@@ -4193,6 +4231,7 @@ async function isCookieBannerVisible(page) {
     const selectors = [
       '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
       '[class*="gdpr" i]', '[id*="gdpr" i]', '[class*="cc-" i]', '.cc-window', '#cookie-law-info-bar',
+      '[class*="CookieConsent" i]', '#CybotCookiebotDialog', '#onetrust-banner-sdk',
     ];
     for (const sel of selectors) {
       for (const el of document.querySelectorAll(sel)) {
@@ -4218,7 +4257,7 @@ async function waitForCookieBannerGone(page, timeout = 6000) {
     if (!hasBannerText) return true;
     const selectors = [
       '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
-      '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar',
+      '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar', '#CybotCookiebotDialog', '#onetrust-banner-sdk',
     ];
     for (const sel of selectors) {
       for (const el of document.querySelectorAll(sel)) {
@@ -4236,137 +4275,552 @@ async function waitForCookieBannerGone(page, timeout = 6000) {
   }, { timeout }).catch(() => {});
 }
 
-async function clickCookieConsentButton(page) {
-  const playwrightAttempts = [
-    {
-      method: 'playwright_role_allow_cookies',
-      run: async () => page.getByRole('button', { name: /allow cookies/i }).first(),
-    },
-    {
-      method: 'playwright_role_accept_all',
-      run: async () => page.getByRole('button', { name: /accept all cookies?/i }).first(),
-    },
-    {
-      method: 'playwright_role_accept',
-      run: async () => page.getByRole('button', { name: /^accept$/i }).first(),
-    },
-    {
-      method: 'playwright_text_allow_cookies',
-      run: async () => page.getByText(/\ballow cookies\b/i).first(),
-    },
-    {
-      method: 'playwright_locator_allow_cookies',
-      run: async () => page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
-        .filter({ hasText: /\ballow cookies\b/i }).first(),
-    },
-    {
-      method: 'playwright_role_refuse_cookies',
-      run: async () => page.getByRole('button', { name: /refuse cookies/i }).first(),
-    },
-    {
-      method: 'playwright_locator_refuse_cookies',
-      run: async () => page.locator('button, a, [role="button"]')
-        .filter({ hasText: /\brefuse cookies\b/i }).first(),
-    },
-    {
-      method: 'playwright_css_cookie_banner_button',
-      run: async () => page.locator('[class*="cookie" i] button, [id*="cookie" i] button, [class*="consent" i] button, .cc-btn, .cc-allow, .cc-dismiss').first(),
-    },
-  ];
+async function collectCookieBannerContext(frame, frameLabel = 'main') {
+  return frame.evaluate((label) => {
+    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+    const low = (t) => norm(t).toLowerCase();
+    const bodyText = norm(document.body?.innerText || '').slice(0, 600);
 
-  for (const attempt of playwrightAttempts) {
-    try {
-      const locator = await attempt.run();
-      if (await locator.isVisible({ timeout: 600 }).catch(() => false)) {
-        await locator.click({ timeout: 4000, force: true });
-        return attempt.method;
+    function directText(el) {
+      let t = '';
+      for (const node of el.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) t += node.textContent;
       }
+      return norm(t);
+    }
+
+    function elementMeta(el) {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const text = norm(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+      const ownText = directText(el) || text;
+      return {
+        tag: el.tagName.toLowerCase(),
+        className: typeof el.className === 'string' ? el.className : null,
+        id: el.id || null,
+        text: text.slice(0, 140),
+        ownText: ownText.slice(0, 80),
+        visible: style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && parseFloat(style.opacity || '1') > 0.05
+          && rect.width > 0
+          && rect.height > 0,
+        enabled: !el.disabled,
+        boundingBox: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        ariaLabel: el.getAttribute('aria-label'),
+        role: el.getAttribute('role'),
+        cursor: style.cursor,
+        href: el.getAttribute('href'),
+      };
+    }
+
+    function isClickableTag(el) {
+      const tag = el.tagName.toLowerCase();
+      if (['button', 'a', 'input'].includes(tag)) return true;
+      if (el.getAttribute('role') === 'button') return true;
+      if (el.hasAttribute('onclick')) return true;
+      return window.getComputedStyle(el).cursor === 'pointer';
+    }
+
+    function isAllowLabel(text) {
+      const t = low(text);
+      return /\ballow cookies\b/.test(t) || /\baccept all\b/.test(t)
+        || /\baccept cookies\b/.test(t) || t === 'accept' || t === 'agree' || t === 'ok';
+    }
+
+    function isRefuseLabel(text) {
+      const t = low(text);
+      return /\brefuse cookies\b/.test(t) || /\breject all\b/.test(t) || t === 'decline';
+    }
+
+    function findBannerElement(root) {
+      const selectors = [
+        '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
+        '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar', '#CybotCookiebotDialog',
+        '#onetrust-banner-sdk', '[class*="CookieConsent" i]',
+      ];
+      for (const sel of selectors) {
+        for (const el of root.querySelectorAll(sel)) {
+          const meta = elementMeta(el);
+          const text = low(meta.text);
+          if (!meta.visible || meta.boundingBox.width < 40) continue;
+          if (text.includes('cookie') || text.includes('consent') || text.includes('this website uses')) {
+            return el;
+          }
+        }
+      }
+      for (const el of root.querySelectorAll('div, section, aside, footer, dialog, [role="dialog"], [role="alertdialog"]')) {
+        const meta = elementMeta(el);
+        const text = low(meta.text);
+        if (!meta.visible || meta.boundingBox.width < 120) continue;
+        if (text.includes('this website uses cookies') || (text.includes('cookie') && text.includes('allow cookies'))) {
+          return el;
+        }
+      }
+      return null;
+    }
+
+    function collectCandidates(root, bannerEl) {
+      const CLICKABLE_SEL = 'button, a[href], a, [role="button"], input[type="button"], input[type="submit"], input[type="reset"]';
+      const searchRoots = bannerEl ? [bannerEl] : [root];
+      const out = [];
+      const seen = new Set();
+
+      for (const searchRoot of searchRoots) {
+        for (const el of searchRoot.querySelectorAll(CLICKABLE_SEL)) {
+          if (!isClickableTag(el) || seen.has(el)) continue;
+          seen.add(el);
+          const meta = elementMeta(el);
+          if (!meta.visible || !meta.enabled) continue;
+          const labels = [meta.text, meta.ownText, meta.ariaLabel].filter(Boolean);
+          let preference = null;
+          for (const lbl of labels) {
+            if (isAllowLabel(lbl)) { preference = 'allow'; break; }
+            if (isRefuseLabel(lbl)) { preference = 'refuse'; break; }
+          }
+          if (!preference) continue;
+          out.push({ ...meta, preference, score: preference === 'allow'
+            ? (/\ballow cookies\b/i.test(meta.ownText || meta.text) ? 100 : 70)
+            : 40 });
+        }
+      }
+
+      if (bannerEl) {
+        for (const el of bannerEl.querySelectorAll('*')) {
+          if (!isClickableTag(el) || seen.has(el)) continue;
+          seen.add(el);
+          const meta = elementMeta(el);
+          if (!meta.visible) continue;
+          const own = meta.ownText || meta.text;
+          if (isAllowLabel(own) && !isRefuseLabel(own)) {
+            out.push({ ...meta, preference: 'allow', score: /\ballow cookies\b/i.test(own) ? 95 : 75 });
+          } else if (isRefuseLabel(own)) {
+            out.push({ ...meta, preference: 'refuse', score: 35 });
+          }
+        }
+      }
+
+      out.sort((a, b) => b.score - a.score);
+      return out.slice(0, 20);
+    }
+
+    function collectShadowHosts(root) {
+      const hosts = [];
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) {
+          hosts.push({
+            tag: el.tagName.toLowerCase(),
+            id: el.id || null,
+            className: typeof el.className === 'string' ? el.className : null,
+          });
+        }
+      });
+      return hosts.slice(0, 12);
+    }
+
+    function walkShadowRoots(root, fn) {
+      fn(root);
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) walkShadowRoots(el.shadowRoot, fn);
+      });
+    }
+
+    let bannerEl = null;
+    let buttonCandidates = [];
+    walkShadowRoots(document, (root) => {
+      if (bannerEl) return;
+      bannerEl = findBannerElement(root);
+      if (bannerEl) buttonCandidates = collectCandidates(root, bannerEl);
+    });
+    if (!buttonCandidates.length) {
+      buttonCandidates = collectCandidates(document, bannerEl);
+    }
+
+    return {
+      frameUsed: label,
+      beforeText: bodyText,
+      bannerElementTag: bannerEl?.tagName?.toLowerCase() || null,
+      bannerElementClass: bannerEl && typeof bannerEl.className === 'string' ? bannerEl.className : null,
+      bannerElementId: bannerEl?.id || null,
+      buttonCandidates,
+      shadowHostCandidates: collectShadowHosts(document),
+      iframeCount: window.frames?.length ?? 0,
+    };
+  }, frameLabel).catch(() => ({
+    frameUsed: frameLabel,
+    beforeText: null,
+    bannerElementTag: null,
+    bannerElementClass: null,
+    bannerElementId: null,
+    buttonCandidates: [],
+    shadowHostCandidates: [],
+    iframeCount: 0,
+  }));
+}
+
+async function clickCookieCandidateWithPlaywright(frame, candidate, methodPrefix) {
+  const page = frame.page();
+  const selParts = [];
+  if (candidate.id) selParts.push(`#${CSS.escape(candidate.id)}`);
+  else if (candidate.className) {
+    const cls = candidate.className.split(/\s+/).filter(Boolean)[0];
+    if (cls) selParts.push(`${candidate.tag}.${cls.replace(/([^\w-])/g, '\\$1')}`);
+  }
+  const locators = [
+    candidate.id ? frame.locator(`#${candidate.id}`) : null,
+    candidate.text ? frame.getByRole('button', { name: new RegExp(candidate.ownText || candidate.text, 'i') }).first() : null,
+    candidate.text ? frame.locator(`${candidate.tag || 'button'}`).filter({ hasText: new RegExp('\\ballow cookies\\b', 'i') }).first() : null,
+    selParts.length ? frame.locator(selParts[0]).first() : null,
+  ].filter(Boolean);
+
+  for (const locator of locators) {
+    try {
+      if (!await locator.count()) continue;
+      if (!await locator.first().isVisible({ timeout: 400 }).catch(() => false)) continue;
+      await locator.first().scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      await locator.first().hover({ timeout: 1500 }).catch(() => {});
+      try {
+        await locator.first().click({ timeout: 3000 });
+      } catch {
+        await locator.first().click({ timeout: 3000, force: true });
+      }
+      return `${methodPrefix}:playwright:${candidate.tag}:${candidate.id || candidate.className || candidate.text?.slice(0, 30)}`;
+    } catch {}
+  }
+  return null;
+}
+
+async function clickCookieCandidateWithEvents(frame, candidate, preferAllow = true) {
+  return frame.evaluate(({ candidate: c, preferAllow: allowFirst }) => {
+    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+    const low = (t) => norm(t).toLowerCase();
+    const isAllow = (t) => /\ballow cookies\b/i.test(t) || /\baccept all\b/i.test(t) || /\baccept cookies\b/i.test(t);
+    const isRefuse = (t) => /\brefuse cookies\b/i.test(t) || /\breject all\b/i.test(t);
+
+    function directText(el) {
+      let t = '';
+      for (const node of el.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) t += node.textContent;
+      }
+      return norm(t);
+    }
+
+    function isClickable(el) {
+      const tag = el.tagName.toLowerCase();
+      if (['button', 'a', 'input'].includes(tag)) return true;
+      if (el.getAttribute('role') === 'button') return true;
+      if (el.hasAttribute('onclick')) return true;
+      return window.getComputedStyle(el).cursor === 'pointer';
+    }
+
+    function matchesCandidate(el) {
+      if (c.id && el.id === c.id) return true;
+      if (c.className && el.className === c.className && el.tagName.toLowerCase() === c.tag) return true;
+      const text = norm(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+      const own = directText(el) || text;
+      return (c.ownText && own === c.ownText) || (c.text && text === c.text);
+    }
+
+    function dispatchClick(el) {
+      const rect = el.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+      el.dispatchEvent(new PointerEvent('pointerdown', opts));
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new PointerEvent('pointerup', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.dispatchEvent(new MouseEvent('click', opts));
+      if (typeof el.click === 'function') el.click();
+    }
+
+    function walkShadowRoots(root, fn) {
+      fn(root);
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) walkShadowRoots(el.shadowRoot, fn);
+      });
+    }
+
+    let target = null;
+    walkShadowRoots(document, (root) => {
+      if (target) return;
+      for (const el of root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')) {
+        if (!isClickable(el)) continue;
+        if (matchesCandidate(el)) { target = el; return; }
+      }
+    });
+
+    if (!target && c) {
+      walkShadowRoots(document, (root) => {
+        if (target) return;
+        const candidates = [];
+        for (const el of root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')) {
+          if (!isClickable(el)) continue;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          if (style.display === 'none' || rect.width < 2) continue;
+          const text = norm(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+          const own = directText(el) || text;
+          let score = 0;
+          if (allowFirst && isAllow(own)) score = /\ballow cookies\b/i.test(own) ? 100 : 80;
+          else if (!allowFirst && isRefuse(own)) score = 60;
+          else if (allowFirst && isAllow(text) && !isRefuse(own)) score = 70;
+          if (score) candidates.push({ el, score, own, text });
+        }
+        candidates.sort((a, b) => b.score - a.score);
+        target = candidates[0]?.el || null;
+      });
+    }
+
+    if (!target) return { ok: false, method: null, clickedCandidate: c };
+
+    dispatchClick(target);
+    const active = document.activeElement;
+    return {
+      ok: true,
+      method: `dom_events:${target.tagName.toLowerCase()}:${target.id || directText(target) || norm(target.innerText).slice(0, 30)}`,
+      clickedCandidate: {
+        tag: target.tagName.toLowerCase(),
+        className: typeof target.className === 'string' ? target.className : null,
+        id: target.id || null,
+        text: norm(target.innerText || target.textContent || '').slice(0, 140),
+        ownText: directText(target).slice(0, 80),
+      },
+      activeElementAfterClick: active ? {
+        tag: active.tagName?.toLowerCase(),
+        id: active.id || null,
+        className: typeof active.className === 'string' ? active.className : null,
+      } : null,
+    };
+  }, { candidate, preferAllow }).catch(() => ({ ok: false, method: null, clickedCandidate: candidate }));
+}
+
+async function removeCookieOverlayLastResort(frame) {
+  return frame.evaluate(() => {
+    let removed = 0;
+    const selectors = [
+      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
+      '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar', '#CybotCookiebotDialog',
+      '#onetrust-banner-sdk', '[class*="CookieConsent" i]',
+    ];
+    const hideEl = (el) => {
+      el.style.setProperty('display', 'none', 'important');
+      el.style.setProperty('visibility', 'hidden', 'important');
+      el.style.setProperty('opacity', '0', 'important');
+      el.style.setProperty('pointer-events', 'none', 'important');
+      try { el.remove(); } catch {}
+      removed++;
+    };
+    for (const sel of selectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        const text = (el.innerText || el.textContent || '').toLowerCase();
+        if (text.includes('cookie') || text.includes('consent') || text.includes('this website uses')) {
+          hideEl(el);
+        }
+      });
+    }
+    document.querySelectorAll('div, section, aside, dialog, [role="dialog"]').forEach((el) => {
+      const style = window.getComputedStyle(el);
+      if (style.position !== 'fixed' && style.position !== 'sticky') return;
+      const text = (el.innerText || el.textContent || '').toLowerCase();
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 100 && rect.height > 40 && text.includes('cookie') && text.includes('allow')) {
+        hideEl(el);
+      }
+    });
+    document.querySelectorAll('[class*="overlay" i], [class*="backdrop" i]').forEach((el) => {
+      const text = (el.innerText || el.textContent || '').toLowerCase();
+      if (text.includes('cookie') || text.includes('allow cookies')) hideEl(el);
+    });
+    return removed;
+  }).catch(() => 0);
+}
+
+async function attemptCookieDismissInFrame(frame, frameLabel, { preferAllow = true } = {}) {
+  const attempt = { ...emptyCookieAttemptDiagnostics(), frameUsed: frameLabel };
+  const ctx = await collectCookieBannerContext(frame, frameLabel);
+  attempt.bannerElementTag = ctx.bannerElementTag;
+  attempt.bannerElementClass = ctx.bannerElementClass;
+  attempt.bannerElementId = ctx.bannerElementId;
+  attempt.buttonCandidates = ctx.buttonCandidates;
+  attempt.beforeText = ctx.beforeText;
+  attempt.iframeCount = ctx.iframeCount;
+  attempt.shadowHostCandidates = ctx.shadowHostCandidates;
+
+  const allowCandidates = ctx.buttonCandidates.filter(c => c.preference === 'allow');
+  const refuseCandidates = ctx.buttonCandidates.filter(c => c.preference === 'refuse');
+  const ordered = preferAllow
+    ? [...allowCandidates, ...refuseCandidates]
+    : [...refuseCandidates, ...allowCandidates];
+
+  for (const candidate of ordered.slice(0, 6)) {
+    let method = await clickCookieCandidateWithPlaywright(frame, candidate, frameLabel);
+    if (!method) {
+      const ev = await clickCookieCandidateWithEvents(frame, candidate, preferAllow);
+      if (ev.ok) {
+        method = `${frameLabel}:${ev.method}`;
+        attempt.clickedCandidate = ev.clickedCandidate || candidate;
+        attempt.activeElementAfterClick = ev.activeElementAfterClick || null;
+      }
+    } else {
+      attempt.clickedCandidate = candidate;
+      attempt.method = method;
+    }
+    if (method) {
+      attempt.method = method;
+      await frame.page().waitForTimeout(600);
+      await waitForCookieBannerGone(frame.page(), 4000);
+      const afterCtx = await collectCookieBannerContext(frame, frameLabel);
+      attempt.afterText = afterCtx.beforeText;
+      const pageStillVisible = await isCookieBannerVisible(frame.page());
+      attempt.didTextDisappear = !pageStillVisible;
+      attempt.didElementDetach = !afterCtx.bannerElementId && !!ctx.bannerElementId;
+      if (!pageStillVisible) {
+        attempt.method = method;
+        return { success: true, method, attempt };
+      }
+      attempt.failureReason = 'clicked_but_banner_still_visible';
+    }
+  }
+
+  const evFallback = await clickCookieCandidateWithEvents(frame, null, preferAllow);
+  if (evFallback.ok) {
+    attempt.method = `${frameLabel}:${evFallback.method}`;
+    attempt.clickedCandidate = evFallback.clickedCandidate;
+    attempt.activeElementAfterClick = evFallback.activeElementAfterClick;
+    await frame.page().waitForTimeout(600);
+    await waitForCookieBannerGone(frame.page(), 4000);
+    const afterCtx = await collectCookieBannerContext(frame, frameLabel);
+    attempt.afterText = afterCtx.beforeText;
+    attempt.didTextDisappear = !(await isCookieBannerVisible(frame.page()));
+    if (attempt.didTextDisappear) {
+      return { success: true, method: attempt.method, attempt };
+    }
+    attempt.failureReason = 'event_fallback_clicked_but_banner_still_visible';
+  }
+
+  attempt.failureReason = attempt.failureReason || 'no_clickable_candidate_matched';
+  return { success: false, method: attempt.method, attempt };
+}
+
+async function clickCookieConsentButton(page) {
+  const frames = page.frames();
+  for (let i = 0; i < frames.length; i++) {
+    const frame = frames[i];
+    const label = i === 0 ? 'main' : `frame_${i}`;
+    try {
+      const hasCookieText = await frame.evaluate(() => {
+        const t = (document.body?.innerText || '').toLowerCase();
+        return t.includes('cookie') && (t.includes('allow cookies') || t.includes('refuse cookies') || t.includes('this website uses cookies'));
+      }).catch(() => false);
+      if (!hasCookieText && i > 0) continue;
+      const result = await attemptCookieDismissInFrame(frame, label);
+      recordCookieAttempt(result.attempt);
+      if (result.success) return result.method;
     } catch {}
   }
 
-  return page.evaluate(() => {
-    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
-    const low = (t) => norm(t).toLowerCase();
-    const isAllow = (t) => /\ballow cookies\b/i.test(t) || /\baccept all\b/i.test(t)
-      || /\baccept cookies\b/i.test(t) || /^accept$/i.test(t) || /^agree$/i.test(t);
-    const isRefuse = (t) => /\brefuse cookies\b/i.test(t) || /\breject all\b/i.test(t) || /^decline$/i.test(t);
+  const mainResult = await attemptCookieDismissInFrame(page.mainFrame(), 'main_retry');
+  recordCookieAttempt(mainResult.attempt);
+  if (mainResult.success) return mainResult.method;
 
-    function clickEl(el, label) {
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-      if (typeof el.click === 'function') el.click();
-      return label;
-    }
-
-    const candidates = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"], span, div, p')];
-    for (const el of candidates) {
-      const text = norm(el.innerText || el.textContent || el.value);
-      if (!text) continue;
-      if (isAllow(text)) {
-        for (const child of el.querySelectorAll('*')) {
-          const ct = norm(child.innerText || child.textContent);
-          if (isAllow(ct) && !isRefuse(ct)) return clickEl(child, `dom_allow_child:${ct.slice(0, 40)}`);
-        }
-        return clickEl(el, `dom_allow:${text.slice(0, 60)}`);
+  const playwrightAttempts = [
+    { method: 'playwright_role_allow_cookies', run: () => page.getByRole('button', { name: /allow cookies/i }).first() },
+    { method: 'playwright_locator_allow_in_banner', run: () => page.locator('[class*="cookie" i] button, [id*="cookie" i] button, [class*="consent" i] button').filter({ hasText: /allow cookies/i }).first() },
+    { method: 'playwright_role_refuse_cookies', run: () => page.getByRole('button', { name: /refuse cookies/i }).first() },
+  ];
+  for (const pw of playwrightAttempts) {
+    try {
+      const locator = pw.run();
+      if (await locator.isVisible({ timeout: 500 }).catch(() => false)) {
+        await locator.scrollIntoViewIfNeeded().catch(() => {});
+        await locator.hover().catch(() => {});
+        try { await locator.click({ timeout: 3000 }); } catch { await locator.click({ timeout: 3000, force: true }); }
+        return pw.method;
       }
-    }
-    for (const el of candidates) {
-      const text = norm(el.innerText || el.textContent || el.value);
-      if (!text) continue;
-      if (isRefuse(text)) return clickEl(el, `dom_refuse:${text.slice(0, 60)}`);
-    }
-    const combined = norm(document.body?.innerText || '');
-    if (/refuse cookiesallow cookies/i.test(combined.replace(/\s+/g, ''))) {
-      for (const el of candidates) {
-        const text = low(el.innerText || el.textContent);
-        if (text.includes('allow cookies')) return clickEl(el, 'dom_concatenated_allow');
-      }
-    }
-    return null;
-  }).catch(() => null);
+    } catch {}
+  }
+  return null;
 }
 
 async function dismissCookieBanner(page) {
   cookieDismissDiagnostics.cookieDismissAttempted++;
+  const attemptStart = emptyCookieAttemptDiagnostics();
   try {
     if (!(await isCookieBannerVisible(page))) {
       cookieDismissDiagnostics.cookieBannerStillVisible = false;
+      attemptStart.method = 'already_hidden';
+      recordCookieAttempt(attemptStart);
       return { success: true, method: 'already_hidden' };
     }
 
-    const method = await clickCookieConsentButton(page);
+    attemptStart.beforeText = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600)).catch(() => null);
+    attemptStart.iframeCount = page.frames().length;
+
+    let method = await clickCookieConsentButton(page);
     if (method) {
       cookieDismissDiagnostics.cookieClickMethod = method;
       await page.waitForTimeout(500);
-      await waitForCookieBannerGone(page);
+      await waitForCookieBannerGone(page, 5000);
     }
 
-    const stillVisible = await isCookieBannerVisible(page);
+    let stillVisible = await isCookieBannerVisible(page);
     cookieDismissDiagnostics.cookieBannerStillVisible = stillVisible;
     if (!stillVisible) {
       cookieDismissDiagnostics.cookieDismissSucceeded++;
+      attemptStart.method = method || 'unknown';
+      attemptStart.didTextDisappear = true;
+      attemptStart.afterText = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600)).catch(() => null);
+      recordCookieAttempt({ ...cookieDismissDiagnostics.lastAttempt, ...attemptStart });
       console.log(`  [cookie] dismissed via ${method || 'unknown'}`);
       return { success: true, method: method || 'unknown' };
     }
 
     if (method) {
-      await page.keyboard.press('Escape').catch(() => {});
-      await page.waitForTimeout(300);
-      const retryMethod = await clickCookieConsentButton(page);
-      if (retryMethod) {
-        cookieDismissDiagnostics.cookieClickMethod = `${method}|retry:${retryMethod}`;
-        await page.waitForTimeout(500);
-        await waitForCookieBannerGone(page);
-        const stillAfterRetry = await isCookieBannerVisible(page);
-        cookieDismissDiagnostics.cookieBannerStillVisible = stillAfterRetry;
-        if (!stillAfterRetry) {
+      method = await clickCookieConsentButton(page);
+      if (method) {
+        cookieDismissDiagnostics.cookieClickMethod = `${cookieDismissDiagnostics.cookieClickMethod}|retry:${method}`;
+        await waitForCookieBannerGone(page, 5000);
+        stillVisible = await isCookieBannerVisible(page);
+        cookieDismissDiagnostics.cookieBannerStillVisible = stillVisible;
+        if (!stillVisible) {
           cookieDismissDiagnostics.cookieDismissSucceeded++;
-          console.log(`  [cookie] dismissed on retry via ${retryMethod}`);
-          return { success: true, method: retryMethod };
+          console.log(`  [cookie] dismissed on retry via ${method}`);
+          return { success: true, method };
         }
       }
     }
+
+    const removed = await removeCookieOverlayLastResort(page.mainFrame());
+    for (const frame of page.frames().slice(1)) {
+      await removeCookieOverlayLastResort(frame).catch(() => {});
+    }
+    await page.waitForTimeout(400);
+    await waitForCookieBannerGone(page, 3000);
+    stillVisible = await isCookieBannerVisible(page);
+    cookieDismissDiagnostics.cookieBannerStillVisible = stillVisible;
+    if (!stillVisible) {
+      cookieDismissDiagnostics.cookieDismissSucceeded++;
+      cookieDismissDiagnostics.cookieClickMethod = 'overlay_removed_last_resort';
+      const last = cookieDismissDiagnostics.lastAttempt || attemptStart;
+      last.method = 'overlay_removed_last_resort';
+      last.afterText = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600)).catch(() => null);
+      last.didTextDisappear = true;
+      last.failureReason = removed ? `removed_${removed}_overlay_nodes` : 'overlay_hidden';
+      recordCookieAttempt(last);
+      console.log(`  [cookie] overlay removed last resort (${removed} node(s))`);
+      return { success: true, method: 'overlay_removed_last_resort' };
+    }
+
+    attemptStart.afterText = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600)).catch(() => null);
+    attemptStart.failureReason = cookieDismissDiagnostics.lastAttempt?.failureReason || 'banner_still_visible_after_all_attempts';
+    attemptStart.clickedCandidate = cookieDismissDiagnostics.lastAttempt?.clickedCandidate || null;
+    attemptStart.buttonCandidates = cookieDismissDiagnostics.lastAttempt?.buttonCandidates || [];
+    recordCookieAttempt(attemptStart);
   } catch (e) {
     console.log(`  [cookie] dismiss failed: ${e.message}`);
+    attemptStart.failureReason = e.message;
+    recordCookieAttempt(attemptStart);
   }
   cookieDismissDiagnostics.cookieBannerStillVisible = await isCookieBannerVisible(page).catch(() => true);
   return { success: false, method: cookieDismissDiagnostics.cookieClickMethod };
@@ -5884,6 +6338,8 @@ async function buildEnrichmentDebugPayload() {
     cookieBannerStillVisible: cookieDismissDiagnostics.cookieBannerStillVisible,
     cookieClickMethod: cookieDismissDiagnostics.cookieClickMethod,
     modalTextAfterCookieDismissSample: cookieDismissDiagnostics.modalTextAfterCookieDismissSample,
+    cookieDismissLastAttempt: cookieDismissDiagnostics.lastAttempt,
+    cookieDismissAttempts: cookieDismissDiagnostics.attempts,
     enrichmentBrowserActive: !!enrichmentBrowserPool?.browser?.isConnected?.(),
     prioritySchedule: {
       p1: { everyMinutes: CHECK_MINS, staleHours: detailStaleMaxAgeHours(1) },
@@ -6707,6 +7163,8 @@ app.post('/api/admin/enrich-date', async (req, res) => {
         cookieBannerStillVisible: result.cookieBannerStillVisible ?? false,
         cookieClickMethod: result.cookieClickMethod ?? null,
         modalTextAfterCookieDismissSample: result.modalTextAfterCookieDismissSample ?? null,
+        cookieDismissLastAttempt: result.cookieDismissLastAttempt ?? null,
+        cookieDismissAttempts: result.cookieDismissAttempts ?? [],
       };
     };
 
