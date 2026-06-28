@@ -26,10 +26,18 @@
 curl -s http://localhost:3000/api/status | jq '{dataSource, currentSessionsCount, scrapeInProgress, minutesSinceLastScrape, coveragePercent, missingDatesInScrapeWindow, watchlistSideDebug}'
 ```
 
-6. Pick a future date (e.g. July 2) with arrows or calendar — saved sessions for that date should display if scraped; otherwise **Not checked yet** or **No sessions found for this date**.
-7. Lineup/watchlist wave side should match Browse (canonical `current_sessions` side, not stale watchlist row).
-8. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
-9. Price appears on cards when modal scrape captured it.
+6. Pick a future date (e.g. Monday Jun 29 or Thu Jul 2) with arrows or calendar — saved sessions for that date should display if scraped; otherwise **Not checked yet** or **No sessions found for this date** (never **Still checking** when saved rows exist).
+7. Debug a date:
+
+```bash
+curl -s http://localhost:3000/api/debug/date/2026-06-29 | jq '{isoDate, currentSessionsCountForDate, wasDateChecked, uiReason, uiReasonText}'
+curl -s "http://localhost:3000/api/status?selected_date=2026-06-29" | jq '{selectedDateDebug, currentSessionsByDate, sessionsForSelectedDateCount}'
+```
+
+8. Trigger Tier 1 refresh (wait ~5 min or restart) — future-date sessions must **not** disappear from Browse.
+9. Lineup/watchlist wave side should match Browse (canonical `current_sessions` side, not stale watchlist row).
+10. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
+11. Price appears on cards when modal scrape captured it.
 
 ### Profile Sync Code (cross-device Lineup)
 
@@ -73,7 +81,8 @@ Profile codes derive a stable `user_key` client-side (`profile:` + SHA-256). Wat
 ### API checks
 
 ```bash
-curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, dataSource, lastScrapeAttempt, lastSuccessfulScrape, minutesSinceLastScrape, coveragePercent, scrapeScheduleEnabled, serverStartedAt, waveSideDebug, watchlistSideDebug}'
+curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, currentSessionsByDate, dataSource, lastScrapeAttempt, lastSuccessfulScrape, lastFullCoverageScrape, tierCoverage, minutesSinceLastScrape, coveragePercent, scrapeScheduleEnabled, serverStartedAt, waveSideDebug, watchlistSideDebug}'
+curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{currentSessionsCountForDate, wasDateChecked, uiReason, uiReasonText, supabaseCurrentSessionsCountForDate}'
 curl -s http://localhost:3000/api/analytics/availability-summary | jq '.snapshotCount, .averageSlotsByWeekday'
 curl -s -X POST http://localhost:3000/api/notify/test -H 'Content-Type: application/json' -d '{"ntfy_topic":"your-topic"}'
 ```

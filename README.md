@@ -49,8 +49,11 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - If a refresh fails, the app keeps last known good data with **`showing saved data · refresh failed`**.
 - **`dataSource`**: `"supabase/current_sessions"` when serving persisted rows, `"memory-fallback"` when Supabase is unavailable.
 - `/api/status` reloads `current_sessions` from Supabase on every request (without disturbing in-progress scrape date tracking).
+- Tier 1 (today/tomorrow) **upserts only** — it never deletes future rows from `current_sessions`.
+- The serve window uses `SCRAPE_WEEKS_AHEAD` so saved future dates (Mon, Jul 2, etc.) stay visible even when the booking site exposes fewer weeks.
 - Status includes `selectedDateDebug` when `selected_date` query param is passed.
-- Status fields include `currentSessionsCount`, `lastSuccessfulScrape`, `lastScrapeAttempt`, `minutesSinceLastScrape`, `scrapeInProgress`, `missingDatesInScrapeWindow`, `coveragePercent`, and `watchlistSideDebug` (stored vs canonical wave side).
+- Status fields include `currentSessionsCount`, `currentSessionsByDate`, `tierCoverage`, `lastFullCoverageScrape`, `lastTier1Scrape`–`lastTier4Scrape`, `datesCheckedEmpty`, `lastSuccessfulScrape`, `lastScrapeAttempt`, `minutesSinceLastScrape`, `scrapeInProgress`, `missingDatesInScrapeWindow`, `coveragePercent`, and `watchlistSideDebug`.
+- Debug a single date: `GET /api/debug/date/YYYY-MM-DD` — session count, scrape runs, snapshots, and UI reason.
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
 ### Profile Sync Code (internal beta)

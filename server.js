@@ -66,6 +66,8 @@ let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const datesCheckedDuringScrape = new Set();
 let persistedDatesChecked = new Set();
+let datesCheckedEmpty = new Set();
+let lastFullCoverageScrape = null;
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let lastHistorySnapshotSavedAt = null;
 let lastLatestSnapshotSavedAt = null;
@@ -114,28 +116,57 @@ function buildScrapeMetaPayload() {
     effectiveWeeksAhead,
     scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
     lastTierRun: { ...lastTierRun },
+    lastFullCoverageScrape,
     slotCache,
     weeksScraped: lastWeeksScraped,
-    datesCheckedDuringScrape: [...datesCheckedDuringScrape],
+    datesCheckedDuringScrape: [...persistedDatesChecked],
+    datesCheckedEmpty: [...datesCheckedEmpty],
   };
+}
+
+function sessionDateKey(s) {
+  return s?.dateKey || s?.isoDate || null;
+}
+
+function scrapeWindowDays() {
+  return Math.max(SCRAPE_WEEKS_AHEAD, effectiveWeeksAhead || 1) * 7;
+}
+
+function sessionWithinScrapeWindow(s) {
+  const dk = sessionDateKey(s);
+  if (!dk) return true;
+  const days = daysFromToday(dk);
+  return days >= 0 && days < scrapeWindowDays();
+}
+
+function allStoredSessions() {
+  return asSessionArray([...sessionsByKey.values()]).filter(sessionWithinScrapeWindow);
 }
 
 function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
   if (Array.isArray(snapSessions) && snapSessions.length) {
-    sessionsByKey.clear();
-    for (const s of snapSessions) sessionsByKey.set(s.key, s);
+    for (const s of snapSessions) {
+      if (!s?.key) continue;
+      const existing = sessionsByKey.get(s.key);
+      sessionsByKey.set(s.key, existing ? { ...existing, ...s } : s);
+    }
     rebuildSessionsArray();
   }
   if (meta) {
     if (meta.weeksAvailableOnSite != null) weeksAvailableOnSite = meta.weeksAvailableOnSite;
     if (meta.effectiveWeeksAhead != null) effectiveWeeksAhead = meta.effectiveWeeksAhead;
     if (meta.lastTierRun) Object.assign(lastTierRun, meta.lastTierRun);
+    if (meta.lastFullCoverageScrape) lastFullCoverageScrape = meta.lastFullCoverageScrape;
     if (meta.slotCache && typeof meta.slotCache === 'object') slotCache = meta.slotCache;
     if (meta.weeksScraped != null) lastWeeksScraped = meta.weeksScraped;
     if (Array.isArray(meta.datesCheckedDuringScrape)) {
-      datesCheckedDuringScrape.clear();
-      for (const d of meta.datesCheckedDuringScrape) datesCheckedDuringScrape.add(d);
-      persistedDatesChecked = new Set(meta.datesCheckedDuringScrape);
+      for (const d of meta.datesCheckedDuringScrape) {
+        datesCheckedDuringScrape.add(d);
+        persistedDatesChecked.add(d);
+      }
+    }
+    if (Array.isArray(meta.datesCheckedEmpty)) {
+      for (const d of meta.datesCheckedEmpty) datesCheckedEmpty.add(d);
     }
   }
   if (loadedAt) {
@@ -158,18 +189,48 @@ function datesCheckedForUi() {
 
 function sessionsForDate(dateKey) {
   if (!dateKey) return [];
-  return sessions.filter(s => (s.dateKey || s.isoDate) === dateKey);
+  return allStoredSessions().filter(s => sessionDateKey(s) === dateKey);
+}
+
+function currentSessionsByDateMap() {
+  const map = {};
+  for (const s of allStoredSessions()) {
+    const dk = sessionDateKey(s);
+    if (!dk) continue;
+    map[dk] = (map[dk] || 0) + 1;
+  }
+  return map;
+}
+
+function recordTierDateCoverage(datesSeen) {
+  if (!datesSeen) return;
+  const seenDates = datesSeen instanceof Set ? [...datesSeen] : asSessionArray(datesSeen);
+  for (const d of seenDates) {
+    datesCheckedDuringScrape.add(d);
+    persistedDatesChecked.add(d);
+    const hasSessions = allStoredSessions().some(s => sessionDateKey(s) === d);
+    if (!hasSessions) datesCheckedEmpty.add(d);
+    else datesCheckedEmpty.delete(d);
+  }
 }
 
 function buildSelectedDateDebug(selectedDate) {
   if (!selectedDate) return null;
   const dateSessions = sessionsForDate(selectedDate);
-  const wasChecked = persistedDatesChecked.has(selectedDate) || dateSessions.length > 0;
+  const hasSaved = dateSessions.length > 0;
+  const wasChecked = hasSaved || persistedDatesChecked.has(selectedDate);
+  const checkedEmpty = datesCheckedEmpty.has(selectedDate);
+  let uiReason = 'not_checked';
+  if (hasSaved) uiReason = 'has_sessions';
+  else if (checkedEmpty || (wasChecked && !hasSaved)) uiReason = 'checked_empty';
+  else if (scrapeInProgress) uiReason = 'checking';
   return {
     selectedDate,
-    selectedDateHasSavedSessions: dateSessions.length > 0,
+    selectedDateHasSavedSessions: hasSaved,
     selectedDateWasChecked: wasChecked,
+    selectedDateCheckedEmpty: checkedEmpty,
     sessionsForSelectedDateCount: dateSessions.length,
+    uiReason,
   };
 }
 
@@ -261,6 +322,22 @@ function recordScrapeError(e, context = 'scrape') {
   if (lastScrapeErrorStack) console.error(lastScrapeErrorStack);
 }
 
+function tierCoverageSummary() {
+  const coverage = {};
+  for (const tier of [1, 2, 3, 4]) {
+    const cfg = TIER_CONFIG[tier];
+    const tierSessions = allStoredSessions().filter(s => sessionInTier(s, tier));
+    const dates = new Set(tierSessions.map(sessionDateKey).filter(Boolean));
+    coverage[tier] = {
+      label: cfg.label,
+      sessionCount: tierSessions.length,
+      dateCount: dates.size,
+      lastRun: lastTierRun[tier] || null,
+    };
+  }
+  return coverage;
+}
+
 function getStatusFields() {
   const dataAgeMinutes = lastSuccessfulScrape
     ? Math.max(0, Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000))
@@ -268,7 +345,8 @@ function getStatusFields() {
   const coverage = computeDateCoverage();
   return {
     sessionsCount: sessions.length,
-    currentSessionsCount: sessions.length,
+    currentSessionsCount: sessionsByKey.size,
+    currentSessionsByDate: currentSessionsByDateMap(),
     source: normalizeDataSource(dataSource),
     dataSource: normalizeDataSource(dataSource),
     supabaseConfigured,
@@ -280,13 +358,20 @@ function getStatusFields() {
     lastScrapeErrorStackPreview: stackPreview(lastScrapeErrorStack),
     dataAgeMinutes,
     scrapeInProgress,
-    totalSessionsTracked: sessions.length,
+    totalSessionsTracked: sessionsByKey.size,
     latestSnapshotSavedAt: lastLatestSnapshotSavedAt,
     historySnapshotsEnabled: supabaseConfigured && HISTORY_SNAPSHOTS_ENABLED,
     snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
     minutesSinceLastScrape: dataAgeMinutes,
     missingDatesInScrapeWindow: coverage.missingDatesInScrapeWindow,
     coveragePercent: coverage.coveragePercent,
+    tierCoverage: tierCoverageSummary(),
+    lastFullCoverageScrape,
+    lastTier1Scrape: lastTierRun[1],
+    lastTier2Scrape: lastTierRun[2],
+    lastTier3Scrape: lastTierRun[3],
+    lastTier4Scrape: lastTierRun[4],
+    datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     scrapeScheduleEnabled,
     serverStartedAt,
   };
@@ -384,7 +469,7 @@ async function loadCurrentSessionsFromSupabase({ reloadMeta = true } = {}) {
     const age = lastSuccessfulScrape
       ? Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000)
       : '?';
-    console.log(`  Supabase: loaded ${sessions.length} current session(s) (last scrape ${age}m ago)`);
+    console.log(`  Supabase: loaded ${sessionsByKey.size} current session(s) (${sessions.length} in serve window, last scrape ${age}m ago)`);
     return true;
   } catch (e) {
     console.error('  Supabase current_sessions load failed:', e.message);
@@ -497,9 +582,10 @@ async function saveLatestSnapshotToSupabase() {
   if (!supabase) return;
   try {
     const now = new Date().toISOString();
+    const snapshotSessions = allStoredSessions();
     const { error } = await supabase.from('scrape_snapshots').upsert({
       id: 'latest',
-      sessions,
+      sessions: snapshotSessions,
       scrape_meta: buildScrapeMetaPayload(),
       last_successful_scrape: lastSuccessfulScrape,
       last_scrape_attempt: lastScrapeAttempt || lastSuccessfulScrape || now,
@@ -508,10 +594,24 @@ async function saveLatestSnapshotToSupabase() {
     }, { onConflict: 'id' });
     if (error) throw error;
     lastLatestSnapshotSavedAt = now;
-    persistedDatesChecked = new Set(datesCheckedDuringScrape);
-    console.log(`  Supabase: saved snapshot (${sessions.length} sessions)`);
+    console.log(`  Supabase: saved snapshot (${snapshotSessions.length} sessions, ${persistedDatesChecked.size} dates checked)`);
   } catch (e) {
     console.error('  Supabase save failed:', e.message);
+  }
+}
+
+async function prunePastSessionsFromSupabase() {
+  if (!supabase) return;
+  const today = todayDateKey();
+  try {
+    const { error } = await supabase
+      .from('current_sessions')
+      .delete()
+      .eq('park', PARK)
+      .lt('iso_date', today);
+    if (error) throw error;
+  } catch (e) {
+    console.error('  Supabase prune past sessions failed:', e.message);
   }
 }
 
@@ -2037,13 +2137,19 @@ function enumerateDateKeys(fromKey, toKey) {
 function expectedDatesInScrapeWindow() {
   const dates = [];
   const start = parseDateKey(todayDateKey());
-  const count = effectiveWeeksAhead * 7;
+  const count = scrapeWindowDays();
   for (let i = 0; i < count; i++) {
     const d = new Date(start);
     d.setDate(start.getDate() + i);
     dates.push(dateKeyFromDate(d));
   }
   return dates;
+}
+
+function allCheckedDatesSet() {
+  const checked = new Set(persistedDatesChecked);
+  for (const d of datesCheckedDuringScrape) checked.add(d);
+  return checked;
 }
 
 function expectedDatesForTier(tier) {
@@ -2208,7 +2314,7 @@ function tierMaxDay(tier) {
 }
 
 function sessionInTier(s, tier) {
-  const days = daysFromToday(s.dateKey);
+  const days = daysFromToday(sessionDateKey(s));
   const cfg = TIER_CONFIG[tier];
   return days >= cfg.minDay && days <= tierMaxDay(tier);
 }
@@ -2223,18 +2329,21 @@ function weeksForTier(tier) {
 
 function computeDateCoverage() {
   const expected = expectedDatesInScrapeWindow();
-  const dateKeys = [...new Set(sessions.map(s => s.dateKey).filter(Boolean))].sort();
+  const stored = allStoredSessions();
+  const dateKeys = [...new Set(stored.map(sessionDateKey).filter(Boolean))].sort();
   const sessionsByDate = {};
   const sessionsByDateAndSide = {};
-  for (const s of sessions) {
-    if (!s.dateKey) continue;
-    sessionsByDate[s.dateKey] = (sessionsByDate[s.dateKey] || 0) + 1;
+  for (const s of stored) {
+    const dk = sessionDateKey(s);
+    if (!dk) continue;
+    sessionsByDate[dk] = (sessionsByDate[dk] || 0) + 1;
     const side = s.waveSide || `Wave ${s.wave}`;
-    if (!sessionsByDateAndSide[s.dateKey]) sessionsByDateAndSide[s.dateKey] = {};
-    sessionsByDateAndSide[s.dateKey][side] = (sessionsByDateAndSide[s.dateKey][side] || 0) + 1;
+    if (!sessionsByDateAndSide[dk]) sessionsByDateAndSide[dk] = {};
+    sessionsByDateAndSide[dk][side] = (sessionsByDateAndSide[dk][side] || 0) + 1;
   }
-  const checkedDates = expected.filter(d => datesCheckedDuringScrape.has(d));
-  const missingDatesInScrapeWindow = expected.filter(d => !datesCheckedDuringScrape.has(d));
+  const checked = allCheckedDatesSet();
+  const checkedDates = expected.filter(d => checked.has(d));
+  const missingDatesInScrapeWindow = expected.filter(d => !checked.has(d));
   const datesWithSessions = expected.filter(d => (sessionsByDate[d] || 0) > 0);
   const expectedDatesCount = expected.length;
   const coveredDatesCount = checkedDates.length;
@@ -2256,7 +2365,8 @@ function computeDateCoverage() {
     coveredDatesCount,
     coveragePercent,
     missingDatesInScrapeWindow,
-    datesCheckedDuringScrape: [...datesCheckedDuringScrape].sort(),
+    datesCheckedDuringScrape: [...checked].sort(),
+    datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     datesWithSessionsCount: datesWithSessions.length,
     weeksScraped: lastWeeksScraped,
   };
@@ -2267,13 +2377,7 @@ function filterBatchForTier(batch, tier) {
 }
 
 function rebuildSessionsArray() {
-  const maxDay = effectiveWeeksAhead * 7;
-  sessions = asSessionArray([...sessionsByKey.values()])
-    .filter(s => {
-      const days = daysFromToday(s.dateKey);
-      return days >= 0 && days < maxDay;
-    })
-    .sort((a, b) => a.ts - b.ts || a.wave - b.wave);
+  sessions = allStoredSessions().sort((a, b) => a.ts - b.ts || a.wave - b.wave);
 }
 
 function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
@@ -2398,10 +2502,6 @@ async function runTierScrape(tier) {
     const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
       await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
 
-    if (datesSeen) {
-      for (const d of datesSeen) datesCheckedDuringScrape.add(d);
-    }
-
     const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
     const byKey = new Map(batch.map(s => [s.key, s]));
 
@@ -2412,6 +2512,7 @@ async function runTierScrape(tier) {
 
     const merged = [...byKey.values()];
     const updatedKeys = mergeBatchIntoStore(merged, tier, { preserveSlots: !cfg.slotCounts });
+    if (datesSeen) recordTierDateCoverage(datesSeen);
 
     if (cfg.slotCounts) {
       syncSlotCacheAvailability(merged);
@@ -2435,6 +2536,9 @@ async function runTierScrape(tier) {
     await upsertCurrentSessionsToSupabase(merged, tier);
     lastSnapshotRowsInsertedLastRun = await saveAvailabilitySnapshotsToSupabase(merged, tier);
     await saveLatestSnapshotToSupabase();
+    if (supabase) await loadCurrentSessionsFromSupabase({ reloadMeta: true });
+    if (tier >= 2) lastFullCoverageScrape = lastSuccessfulScrape;
+    if (tier === 1) await prunePastSessionsFromSupabase();
 
     await finishScrapeRun(scrapeRunId, {
       success: true,
@@ -2507,14 +2611,17 @@ function statusPayload(userKey = null, selectedDate = null) {
     selectedDateWasChecked: selectedDateDebug?.selectedDateWasChecked ?? null,
     sessionsForSelectedDateCount: selectedDateDebug?.sessionsForSelectedDateCount ?? null,
     selectedDateDebug,
+    datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     scrapeMeta: {
       weeksAvailableOnSite,
       effectiveWeeksAhead,
       scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
       lastTierRun: { ...lastTierRun },
+      lastFullCoverageScrape,
       supabaseConfigured,
       ...dateCoverage,
       datesCheckedDuringScrape: uiDatesChecked,
+      datesCheckedEmpty: [...datesCheckedEmpty].sort(),
     },
     ...getStatusFields(),
   };
@@ -2544,12 +2651,85 @@ app.get('/api/sessions', async (req, res) => {
   }
 });
 
+function uiReasonText(reason) {
+  switch (reason) {
+    case 'has_sessions': return 'Show saved sessions for this date';
+    case 'checked_empty': return 'Show "No sessions found for this date"';
+    case 'checking': return 'Show "Still checking this date…" while scrape runs';
+    case 'not_checked': return 'Show "Not checked yet"';
+    default: return reason || 'unknown';
+  }
+}
+
+app.get('/api/debug/date/:isoDate', async (req, res) => {
+  const isoDate = req.params.isoDate;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+    return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
+  }
+  try {
+    await ensureSessionsForStatus();
+    const dateSessions = sessionsForDate(isoDate);
+    const selectedDateDebug = buildSelectedDateDebug(isoDate);
+    const payload = {
+      isoDate,
+      currentSessionsCountForDate: dateSessions.length,
+      currentSessionsForDate: dateSessions.slice(0, 8),
+      wasDateChecked: selectedDateDebug?.selectedDateWasChecked ?? false,
+      selectedDateCheckedEmpty: selectedDateDebug?.selectedDateCheckedEmpty ?? false,
+      selectedDateDebug,
+      uiReason: selectedDateDebug?.uiReason ?? null,
+      uiReasonText: uiReasonText(selectedDateDebug?.uiReason),
+      scrapeInProgress,
+      persistedDatesChecked: [...persistedDatesChecked].sort(),
+      datesCheckedEmpty: [...datesCheckedEmpty].sort(),
+      relevantScrapeRuns: [],
+      latestAvailabilitySnapshots: [],
+    };
+
+    if (supabase) {
+      const { data: runs, error: runsError } = await supabase
+        .from('scrape_runs')
+        .select('id, tier, started_at, finished_at, success, sessions_found, dates_covered, missing_dates, coverage_percent, error')
+        .order('started_at', { ascending: false })
+        .limit(30);
+      if (runsError) throw runsError;
+      payload.relevantScrapeRuns = (runs || []).filter((run) => {
+        if (Array.isArray(run.missing_dates) && !run.missing_dates.includes(isoDate)) {
+          return run.success && run.dates_covered != null;
+        }
+        return true;
+      }).slice(0, 10);
+
+      const { data: snaps, error: snapsError } = await supabase
+        .from('availability_snapshots')
+        .select('scraped_at, session_key, iso_date, start_time, session_type, wave_side, available, slots_available, source_tier')
+        .eq('iso_date', isoDate)
+        .order('scraped_at', { ascending: false })
+        .limit(12);
+      if (snapsError) throw snapsError;
+      payload.latestAvailabilitySnapshots = snaps || [];
+
+      const { count, error: countError } = await supabase
+        .from('current_sessions')
+        .select('*', { count: 'exact', head: true })
+        .eq('park', PARK)
+        .eq('iso_date', isoDate);
+      if (countError) throw countError;
+      payload.supabaseCurrentSessionsCountForDate = count ?? 0;
+    }
+
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ isoDate, error: e.message });
+  }
+});
+
 app.get('/api/debug/scrape', (_req, res) => {
   const coverage = computeDateCoverage();
   res.json({
     scrapeInProgress,
     sessionsCount: sessions.length,
-    currentSessionsCount: sessions.length,
+    currentSessionsCount: sessionsByKey.size,
     snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
     lastScrapeAttempt,
     lastScrapeError,
@@ -2559,6 +2739,8 @@ app.get('/api/debug/scrape', (_req, res) => {
     supabaseConfigured,
     effectiveWeeksAhead,
     lastTierRun: { ...lastTierRun },
+    lastFullCoverageScrape,
+    tierCoverage: tierCoverageSummary(),
     lastWeeksScraped,
     ...coverage,
   });

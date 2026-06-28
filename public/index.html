@@ -1012,7 +1012,11 @@ function dateLabel(dateKey) {
 }
 
 function getPickerDays() {
-  const weeks = data.scrapeMeta?.effectiveWeeksAhead || data.effectiveWeeksAhead || 4;
+  const weeks = data.scrapeMeta?.scrapeWeeksAhead
+    || data.scrapeWeeksAhead
+    || data.scrapeMeta?.effectiveWeeksAhead
+    || data.effectiveWeeksAhead
+    || 4;
   const count = weeks * 7;
   const days = [];
   const start = new Date();
@@ -1032,8 +1036,16 @@ function checkedDatesSet() {
   return new Set(list);
 }
 
+function checkedEmptyDatesSet() {
+  const list = data.datesCheckedEmpty
+    || data.scrapeMeta?.datesCheckedEmpty
+    || [];
+  return new Set(list);
+}
+
 function isDateChecked(dateKey) {
   if (sessionCountForDate(dateKey) > 0) return true;
+  if (checkedEmptyDatesSet().has(dateKey)) return true;
   return checkedDatesSet().has(dateKey);
 }
 
@@ -1120,6 +1132,7 @@ function saveStatusCache() {
       dataSource: data.dataSource || data.source,
       effectiveWeeksAhead: data.effectiveWeeksAhead || data.scrapeMeta?.effectiveWeeksAhead,
       datesCheckedDuringScrape: data.datesCheckedDuringScrape || data.scrapeMeta?.datesCheckedDuringScrape,
+      datesCheckedEmpty: data.datesCheckedEmpty || data.scrapeMeta?.datesCheckedEmpty,
       activeDayKey,
     }));
   } catch (e) {
@@ -1454,21 +1467,23 @@ function renderBrowse() {
   const listEl = document.getElementById('session-list');
   if (!filtered.length) {
     const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
-    const wasChecked = data.selectedDateWasChecked ?? isDateChecked(activeDayKey);
-    const hasSavedForDay = daySessions.length > 0 || data.selectedDateHasSavedSessions;
+    const debug = data.selectedDateDebug?.selectedDate === activeDayKey ? data.selectedDateDebug : null;
+    const hasSavedForDay = daySessions.length > 0
+      || data.selectedDateHasSavedSessions
+      || debug?.selectedDateHasSavedSessions;
+    const wasChecked = debug?.selectedDateWasChecked ?? data.selectedDateWasChecked ?? isDateChecked(activeDayKey);
+    const checkedEmpty = debug?.selectedDateCheckedEmpty ?? checkedEmptyDatesSet().has(activeDayKey);
     let msg;
-    if (!wasChecked && !hasSavedForDay && data.scrapeInProgress) {
-      msg = 'Still checking this date…';
-    } else if (!wasChecked && !hasSavedForDay) {
-      msg = 'Not checked yet';
-    } else if (!daySessions.length && wasChecked) {
-      msg = 'No sessions found for this date';
-    } else if (activeDayKey === todayKey() && daySessions.length && !daySessions.some(s => isSessionUpcoming(s, activeDayKey))) {
-      msg = 'No upcoming sessions today';
-    } else if (daySessions.length) {
+    if (hasSavedForDay) {
       msg = 'No sessions match these filters';
+    } else if (checkedEmpty || debug?.uiReason === 'checked_empty' || (wasChecked && !hasSavedForDay)) {
+      msg = 'No sessions found for this date';
+    } else if (debug?.uiReason === 'checking' || (!wasChecked && data.scrapeInProgress)) {
+      msg = 'Still checking this date…';
     } else if (!wasChecked) {
       msg = 'Not checked yet';
+    } else if (activeDayKey === todayKey() && daySessions.length && !daySessions.some(s => isSessionUpcoming(s, activeDayKey))) {
+      msg = 'No upcoming sessions today';
     } else {
       msg = 'No sessions found for this date';
     }

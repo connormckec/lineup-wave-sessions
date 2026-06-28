@@ -193,3 +193,8 @@ alter table availability_snapshots add column if not exists price_max numeric;
 alter table availability_snapshots add column if not exists currency text default 'USD';
 
 alter table scrape_runs add column if not exists coverage_percent integer;
+
+-- scrape_meta jsonb in scrape_snapshots may include:
+--   datesCheckedDuringScrape text[] — ISO dates the scraper has visited
+--   datesCheckedEmpty text[] — ISO dates checked with zero sessions
+--   lastFullCoverageScrape timestamptz — last tier 2+ successful run
