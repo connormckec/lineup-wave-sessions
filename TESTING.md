@@ -39,7 +39,19 @@ curl -s "http://localhost:3000/api/status?selected_date=2026-06-29" | jq '{selec
 10. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
 11. Price appears on cards when modal scrape captured it.
 
-### Browser cache / boot
+### Selected-date sessions (Supabase source of truth)
+
+Browse loads **`GET /api/sessions?date=YYYY-MM-DD`** on every date change. That endpoint queries `current_sessions` directly for the exact `iso_date` and returns:
+
+- `sessions` — rows for that date
+- `statusReason` — `saved_sessions_found` | `checked_no_sessions` | `not_checked` | `error`
+- `dataSource` — `supabase/current_sessions`
+
+The UI renders the returned sessions directly — it does not filter the full `/api/status` payload client-side for the selected date.
+
+```bash
+curl -s "http://localhost:3000/api/sessions?date=2026-06-29" | jq '{isoDate, sessionsCount, statusReason, dataSource, hasSavedSessions}'
+```
 
 - Sessions load **before** watchlist on startup — Lineup fetch cannot block Browse rendering.
 - `/api/status` response is normalized (`sessions`, `currentSessions`, `isoDate`/`dateKey`) before render.

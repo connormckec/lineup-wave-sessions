@@ -664,10 +664,113 @@ function sessionsForDateKey(dateKey, list) {
   return surfSessions(list).filter(s => dateKeyFromSession(s) === dateKey);
 }
 
+function normalizeIsoDate(value) {
+  if (!value) return todayKey();
+  const s = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : todayKey();
+}
+
+let selectedDateSessions = [];
+let selectedDateMeta = {
+  statusReason: null,
+  sessionsCount: 0,
+  dataSource: null,
+  isLoading: false,
+  lastFetchError: null,
+  endpoint: null,
+  isScrapeInProgress: false,
+  hasSavedSessions: false,
+};
+
+let selectedDateFetchToken = 0;
+
+async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
+  const dateKey = normalizeIsoDate(isoDate);
+  const token = ++selectedDateFetchToken;
+  const endpoint = `/api/sessions?date=${encodeURIComponent(dateKey)}`;
+  selectedDateMeta = {
+    ...selectedDateMeta,
+    isLoading: true,
+    endpoint,
+    lastFetchError: null,
+  };
+  if (!silent) safeRenderAll();
+
+  const failsafe = setTimeout(() => {
+    if (token !== selectedDateFetchToken) return;
+    if (selectedDateMeta.isLoading) {
+      selectedDateMeta.isLoading = false;
+      selectedDateMeta.lastFetchError = selectedDateMeta.lastFetchError || 'Load timed out (5s)';
+      selectedDateMeta.statusReason = selectedDateSessions.length ? 'saved_sessions_found' : 'error';
+      safeRenderAll();
+    }
+  }, BOOT_FAILSAFE_MS);
+
+  try {
+    const res = await fetchApi(endpoint, {}, 20000);
+    const payload = await res.json();
+    if (token !== selectedDateFetchToken) return;
+
+    if (!res.ok) {
+      throw new Error(payload.error || `HTTP ${res.status}`);
+    }
+
+    const sessions = normalizeSessions(payload.sessions || []);
+    selectedDateSessions = sessions;
+    selectedDateMeta = {
+      statusReason: payload.statusReason || (sessions.length ? 'saved_sessions_found' : 'not_checked'),
+      sessionsCount: payload.sessionsCount ?? sessions.length,
+      dataSource: payload.dataSource || null,
+      wasDateChecked: payload.wasDateChecked,
+      hasSavedSessions: payload.hasSavedSessions ?? sessions.length > 0,
+      isScrapeInProgress: !!payload.isScrapeInProgress,
+      isLoading: false,
+      lastFetchError: null,
+      endpoint,
+    };
+    lastFetchError = null;
+
+    const byKey = new Map(asSessionArray(data.sessions).map(s => [s.key, s]));
+    for (const s of sessions) byKey.set(s.key, s);
+    data.sessions = [...byKey.values()];
+
+    console.log('[dateSessions]', {
+      date: dateKey,
+      count: sessions.length,
+      statusReason: selectedDateMeta.statusReason,
+      dataSource: selectedDateMeta.dataSource,
+    });
+  } catch (err) {
+    if (token !== selectedDateFetchToken) return;
+    selectedDateMeta.lastFetchError = err?.message || String(err);
+    selectedDateMeta.isLoading = false;
+    if (!selectedDateSessions.length) {
+      selectedDateMeta.statusReason = 'error';
+    }
+    console.error('[dateSessions]', dateKey, err);
+  } finally {
+    clearTimeout(failsafe);
+    if (token === selectedDateFetchToken) {
+      selectedDateMeta.isLoading = false;
+      safeRenderAll();
+    }
+  }
+}
+
+function onSelectedDateChange(isoDate) {
+  activeDayKey = normalizeIsoDate(isoDate);
+  saveActiveDayKey(activeDayKey);
+  loadSelectedDateSessions(activeDayKey);
+  renderBrowse();
+  updateDateNavButtons();
+}
+
 function logRenderDebug(label) {
   const count = asSessionArray(data.sessions).length;
-  const forDate = sessionsForDateKey(activeDayKey).length;
-  console.log(`[${label}] sessions=${count} selectedDate=${activeDayKey} forDate=${forDate} source=${data.dataSource || data.source || '?'}`);
+  const forDate = sessionsForSelectedDate().length;
+  console.log(`[${label}] sessions=${count} selectedDate=${activeDayKey} forDate=${forDate} reason=${selectedDateMeta.statusReason} source=${selectedDateMeta.dataSource || data.dataSource || '?'}`);
 }
 
 function showStatusMessage(html) {
@@ -1099,8 +1202,17 @@ function isSessionUpcoming(s, selectedDateKey) {
   return s.ts > Math.floor(Date.now() / 1000);
 }
 
+function sessionsForSelectedDate() {
+  return asSessionArray(selectedDateSessions);
+}
+
+function browseSessionPool() {
+  if (selectedDateSessions.length) return sessionsForSelectedDate();
+  return surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+}
+
 function visibleBrowseSessions() {
-  let filtered = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+  let filtered = browseSessionPool().filter(isSurfSession);
   filtered = filtered.filter(matchesWaveFilter);
   if (activeLevels.size) filtered = filtered.filter(s => activeLevels.has(s.level));
   filtered = filtered.filter(s => matchesTimeRange(s, filterFromH, filterToH));
@@ -1370,26 +1482,12 @@ async function resetLocalAppCache() {
 async function debugReloadSessions() {
   const msgEl = document.getElementById('reset-state-msg');
   try {
-    const params = new URLSearchParams({
-      user_key: getUserKey(),
-      selected_date: activeDayKey || todayKey(),
-    });
-    const profileCode = getSavedProfileCode();
-    if (profileCode) params.set('profile_code', profileCode);
-    const { payload, sessions } = await fetchSessionsPayload(params);
-    console.log('[debugReload] first 3 sessions:', sessions.slice(0, 3));
-    console.log('[debugReload] counts', {
-      raw: extractSessionsFromPayload(payload).length,
-      normalized: sessions.length,
-      sessionsCount: payload.sessionsCount,
-      currentSessionsCount: payload.currentSessionsCount,
-      dataSource: payload.dataSource,
-    });
-    data = { ...data, ...payload, sessions };
+    await loadSelectedDateSessions(activeDayKey, { silent: false });
+    console.log('[debugReload] first 3 sessions:', selectedDateSessions.slice(0, 3));
+    console.log('[debugReload] meta', selectedDateMeta);
     finishLoading('ready');
-    safeRenderAll();
     if (msgEl) {
-      msgEl.textContent = `Debug reload: ${sessions.length} sessions (see console).`;
+      msgEl.textContent = `Debug reload: ${selectedDateSessions.length} sessions for ${activeDayKey} (${selectedDateMeta.statusReason}).`;
       msgEl.style.color = '#00c9a7';
     }
   } catch (e) {
@@ -1432,10 +1530,7 @@ function shiftActiveDay(delta) {
   const nextIdx = idx + delta;
   if (nextIdx < 0 || nextIdx >= days.length) return;
   if (delta < 0 && days[nextIdx] < todayKey()) return;
-  activeDayKey = days[nextIdx];
-  saveActiveDayKey(activeDayKey);
-  renderBrowse();
-  updateDateNavButtons();
+  onSelectedDateChange(days[nextIdx]);
 }
 
 function updateDateNavButtons() {
@@ -1629,6 +1724,7 @@ async function refresh({ silent = false } = {}) {
     finishLoading('ready');
     logRenderDebug('refresh');
     if (!activeDayKey) activeDayKey = todayKey();
+    await loadSelectedDateSessions(activeDayKey, { silent: true });
     safeRenderAll();
     updateDateNavButtons();
     scheduleRefreshPoll();
@@ -1754,6 +1850,8 @@ function renderStatusBar() {
   let detail;
   if (scrapeInProgress && trackedCount > 0) {
     detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
+  } else if (selectedDateMeta.isLoading && selectedDateSessions.length) {
+    detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
   } else if (scrapeInProgress) {
     detail = 'refreshing…';
   } else if (!trackedCount && !lastSuccessfulScrape) {
@@ -1812,7 +1910,7 @@ function renderBrowse() {
       `<button type="button" class="lessons-link${showLessons ? ' on' : ''}" id="lessons-toggle">${showLessons ? 'Hide lessons' : 'Show lessons'}</button>`;
   }
 
-  let levelScope = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+  let levelScope = browseSessionPool().filter(isSurfSession);
   levelScope = levelScope.filter(matchesWaveFilter);
   const levels = sortLevels([...new Set(levelScope.map(s => s.level).filter(Boolean))]);
 
@@ -1827,40 +1925,42 @@ function renderBrowse() {
     ].join('');
   }
 
-  if (uiLoading && !asSessionArray(data.sessions).length) {
+  if (selectedDateMeta.isLoading && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
     return;
   }
 
-  if (!asSessionArray(data.sessions).length && lastFetchError) {
-    listEl.innerHTML = `<div class="empty">Could not load sessions.<br>${lastFetchError}<br>Try Debug reload sessions in Settings.</div>`;
+  if (uiLoading && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
+    listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
     return;
   }
 
-  if (bootState === 'error' && !asSessionArray(data.sessions).length) {
+  if (!selectedDateSessions.length && selectedDateMeta.statusReason === 'error') {
+    listEl.innerHTML = `<div class="empty">Could not load sessions.<br>${selectedDateMeta.lastFetchError || lastFetchError || 'Unknown error'}<br>Try Debug reload sessions in Settings.</div>`;
+    return;
+  }
+
+  if (bootState === 'error' && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Could not load sessions. Check connection or tap Reset local app cache in Settings.</div>';
     return;
   }
 
   let filtered = visibleBrowseSessions();
   if (!filtered.length) {
-    const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
-    const debug = data.selectedDateDebug?.selectedDate === activeDayKey ? data.selectedDateDebug : null;
-    const hasSavedForDay = daySessions.length > 0
-      || data.selectedDateHasSavedSessions
-      || debug?.selectedDateHasSavedSessions;
-    const wasChecked = debug?.selectedDateWasChecked ?? data.selectedDateWasChecked ?? isDateChecked(activeDayKey);
-    const checkedEmpty = debug?.selectedDateCheckedEmpty ?? checkedEmptyDatesSet().has(activeDayKey);
+    const poolCount = browseSessionPool().filter(isSurfSession).length;
+    const reason = selectedDateMeta.statusReason;
     let msg;
-    if (hasSavedForDay) {
+    if (poolCount > 0 || reason === 'saved_sessions_found' || selectedDateMeta.hasSavedSessions) {
       msg = 'No sessions match these filters';
-    } else if (checkedEmpty || debug?.uiReason === 'checked_empty' || (wasChecked && !hasSavedForDay)) {
+    } else if (reason === 'checked_no_sessions') {
       msg = 'No sessions found for this date';
-    } else if (debug?.uiReason === 'checking' || (!wasChecked && data.scrapeInProgress)) {
-      msg = 'Still checking this date…';
-    } else if (!wasChecked) {
+    } else if (reason === 'not_checked') {
       msg = 'Not checked yet';
-    } else if (activeDayKey === todayKey() && daySessions.length && !daySessions.some(s => isSessionUpcoming(s, activeDayKey))) {
+    } else if (reason === 'error') {
+      msg = selectedDateMeta.lastFetchError || 'Could not load sessions';
+    } else if (selectedDateMeta.isLoading) {
+      msg = 'Loading sessions…';
+    } else if (activeDayKey === todayKey()) {
       msg = 'No upcoming sessions today';
     } else {
       msg = 'No sessions found for this date';
@@ -1999,15 +2099,15 @@ function renderDebugState() {
     ['App version', data.appVersion || '—'],
     ['Build time', fmtTime(data.buildTime)],
     ['Selected date', activeDayKey || todayKey()],
-    ['Sessions loaded', String(asSessionArray(data.sessions).length)],
-    ['Sessions for date', String(sessionsForDateKey(activeDayKey).length)],
-    ['dataSource', data.dataSource || data.source || '—'],
+    ['Selected date endpoint', selectedDateMeta.endpoint || '—'],
+    ['Returned sessions', String(selectedDateMeta.sessionsCount ?? selectedDateSessions.length)],
+    ['Status reason', selectedDateMeta.statusReason || '—'],
+    ['dataSource', selectedDateMeta.dataSource || data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
-    ['lastFetchError', lastFetchError || '—'],
+    ['lastFetchError', selectedDateMeta.lastFetchError || lastFetchError || '—'],
     ['lastRenderError', lastRenderError || '—'],
-    ['uiLoading', uiLoading ? 'yes' : 'no'],
+    ['Date loading', selectedDateMeta.isLoading ? 'yes' : 'no'],
     ['serviceWorker', swActive ? 'active' : 'inactive'],
-    ['userAgent', navigator.userAgent.slice(0, 80) + '…'],
   ];
   grid.innerHTML = rows.map(([k, v]) =>
     `<dt>${k}</dt><dd>${String(v).replace(/</g, '&lt;')}</dd>`
@@ -2224,8 +2324,7 @@ function closePicker() {
 }
 
 function applyPicker() {
-  activeDayKey = pickerDraft.dayKey;
-  saveActiveDayKey(activeDayKey);
+  onSelectedDateChange(pickerDraft.dayKey);
   filterFromH = pickerDraft.fromH;
   filterToH = pickerDraft.toH;
   closePicker();
@@ -2312,7 +2411,10 @@ initTimeSelects();
     });
 
     await Promise.race([
-      refresh({ silent: true }),
+      (async () => {
+        await refresh({ silent: true });
+        await loadSelectedDateSessions(activeDayKey, { silent: true });
+      })(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Session fetch timeout 5s')), BOOT_FAILSAFE_MS)),
     ]);
 

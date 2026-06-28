@@ -215,6 +215,92 @@ function sessionsForDate(dateKey) {
   return allStoredSessions().filter(s => sessionDateKey(s) === dateKey);
 }
 
+function normalizeIsoDateParam(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+  const m = trimmed.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
+function isoDateFromRow(row) {
+  const raw = row?.iso_date ?? row?.isoDate;
+  if (!raw) return null;
+  if (typeof raw === 'string') return raw.slice(0, 10);
+  return String(raw).slice(0, 10);
+}
+
+async function loadSessionsForDateFromSupabase(isoDate) {
+  if (!isoDate) return [];
+  if (!supabase) {
+    await ensureSessionsForStatus();
+    return sessionsForDate(isoDate);
+  }
+  try {
+    const { data, error } = await supabase
+      .from('current_sessions')
+      .select('*')
+      .eq('park', PARK)
+      .eq('iso_date', isoDate)
+      .order('start_ts', { ascending: true });
+    if (error) throw error;
+    const rows = asSessionArray(data);
+    const dateSessions = rows.map(currentRowToSession).filter(s => s?.key);
+    for (const s of dateSessions) {
+      sessionsByKey.set(s.key, s);
+    }
+    rebuildSessionsArray();
+    return dateSessions;
+  } catch (e) {
+    console.error(`  Supabase current_sessions load for ${isoDate} failed:`, e.message);
+    throw e;
+  }
+}
+
+function dateCoverageForIsoDate(isoDate) {
+  const wasChecked = persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate);
+  const checkedEmpty = datesCheckedEmpty.has(isoDate);
+  const inMemoryCount = currentSessionsByDateMap()[isoDate] || 0;
+  return {
+    isoDate,
+    sessionsForDate: inMemoryCount,
+    wasDateChecked: wasChecked,
+    checkedEmpty,
+    inPersistedDatesChecked: persistedDatesChecked.has(isoDate),
+    inDatesCheckedEmpty: datesCheckedEmpty.has(isoDate),
+  };
+}
+
+function statusReasonForDate(isoDate, dateSessions) {
+  if (dateSessions.length > 0) return 'saved_sessions_found';
+  if (datesCheckedEmpty.has(isoDate)) return 'checked_no_sessions';
+  if (persistedDatesChecked.has(isoDate)) return 'checked_no_sessions';
+  return 'not_checked';
+}
+
+async function buildSessionsForDatePayload(isoDate) {
+  if (!persistedDatesChecked.size && supabase) {
+    await loadScrapeMetaFromSupabase();
+  }
+  const dateSessions = await loadSessionsForDateFromSupabase(isoDate);
+  const hasSaved = dateSessions.length > 0;
+  const wasChecked = hasSaved || persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate);
+  const statusReason = statusReasonForDate(isoDate, dateSessions);
+  return {
+    isoDate,
+    sessions: dateSessions,
+    sessionsCount: dateSessions.length,
+    dataSource: supabase ? 'supabase/current_sessions' : normalizeDataSource(dataSource),
+    lastSuccessfulScrape,
+    lastCheckedForDate: wasChecked ? (lastSuccessfulScrape || lastTierRun[1] || lastTierRun[2] || null) : null,
+    wasDateChecked: wasChecked,
+    isScrapeInProgress: scrapeInProgress,
+    hasSavedSessions: hasSaved,
+    statusReason,
+    dateCoverage: dateCoverageForIsoDate(isoDate),
+  };
+}
+
 function currentSessionsByDateMap() {
   const map = {};
   for (const s of allStoredSessions()) {
@@ -270,8 +356,8 @@ function currentRowToSession(row) {
   return {
     ...raw,
     key: row.session_key,
-    dateKey: row.iso_date || raw.dateKey,
-    isoDate: row.iso_date || raw.isoDate,
+    dateKey: isoDateFromRow(row) || raw.dateKey,
+    isoDate: isoDateFromRow(row) || raw.isoDate,
     ts: row.start_ts ?? raw.ts,
     time: row.start_time || raw.time,
     date: row.display_date || raw.date,
@@ -2711,6 +2797,32 @@ app.get('/api/status', async (req, res) => {
 });
 
 app.get('/api/sessions', async (req, res) => {
+  const isoDate = normalizeIsoDateParam(req.query.date || req.query.iso_date || req.query.isoDate);
+
+  if (isoDate) {
+    try {
+      const payload = await buildSessionsForDatePayload(isoDate);
+      res.json(payload);
+    } catch (e) {
+      console.error(`/api/sessions?date=${isoDate} error:`, e.message);
+      res.status(500).json({
+        isoDate,
+        sessions: [],
+        sessionsCount: 0,
+        dataSource: supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback',
+        lastSuccessfulScrape,
+        lastCheckedForDate: null,
+        wasDateChecked: false,
+        isScrapeInProgress: scrapeInProgress,
+        hasSavedSessions: false,
+        statusReason: 'error',
+        error: e.message,
+        dateCoverage: dateCoverageForIsoDate(isoDate),
+      });
+    }
+    return;
+  }
+
   try {
     const userKey = req.query.user_key || null;
     const profileCode = req.query.profile_code || req.query.profileCode || null;

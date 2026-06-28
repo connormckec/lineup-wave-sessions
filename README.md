@@ -44,7 +44,8 @@ On startup the server loads saved sessions from `current_sessions` before accept
 
 ### Stabilization behavior
 
-- **`GET /api/status`** returns saved sessions immediately; if memory is empty it reloads from Supabase first.
+- **`GET /api/sessions?date=YYYY-MM-DD`** queries Supabase `current_sessions` for that exact date and returns saved sessions with `statusReason` (`saved_sessions_found`, `checked_no_sessions`, `not_checked`). Browse uses this as the display source of truth on every date change.
+- **`GET /api/status`** returns global scrape meta and full session list; background refresh only.
 - While a scrape runs, the header shows **`checked Xm ago · refreshing…`** and sessions stay on screen.
 - If a refresh fails, the app keeps last known good data with **`showing saved data · refresh failed`**.
 - **`dataSource`**: `"supabase/current_sessions"` when serving persisted rows, `"memory-fallback"` when Supabase is unavailable.
