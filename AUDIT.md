@@ -185,6 +185,10 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `POST /api/admin/run-tier1` | Manually trigger Tier 1 scrape (today/tomorrow + slots) |
 | `POST /api/admin/run-tier2` | Manually trigger Tier 2 scrape (next 7 days) |
 | `POST /api/admin/run-tier3` | Manually trigger Tier 3 scrape (weeks 2–3) |
+| `GET /api/debug/collector` | Scheduler state, tier scrape times, recent scrape_runs, recommendedAction |
+| `POST /api/admin/run-tier1` | Manually trigger Tier 1 scrape (today/tomorrow + slots) |
+| `POST /api/admin/run-tier2` | Manually trigger Tier 2 scrape (next 7 days) |
+| `POST /api/admin/run-tier3` | Manually trigger Tier 3 scrape (weeks 2–3) |
 | `GET /api/debug/boot` | Park timezone, saved session counts, why Browse would show not_checked |
 | `GET /api/debug/enrichment` | Enrichment queue, stale/missing counts, run duration, recent errors |
 | `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
