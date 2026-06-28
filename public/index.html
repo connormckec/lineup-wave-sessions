@@ -718,6 +718,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
   const dateKey = normalizeIsoDate(isoDate);
   const token = ++selectedDateFetchToken;
   const endpoint = `/api/sessions?date=${encodeURIComponent(dateKey)}`;
+  const prevSessions = selectedDateSessions.slice();
   selectedDateMeta = {
     ...selectedDateMeta,
     isLoading: true,
@@ -797,6 +798,9 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     if (token !== selectedDateFetchToken) return;
     selectedDateMeta.lastFetchError = formatApiError(err?.message || String(err));
     selectedDateMeta.isLoading = false;
+    if (!selectedDateSessions.length && prevSessions.length) {
+      selectedDateSessions = prevSessions;
+    }
     if (!selectedDateSessions.length) {
       selectedDateMeta.statusReason = isSchemaMissingMessage(selectedDateMeta.lastFetchError) ? 'schema_error' : 'error';
     }
@@ -1605,6 +1609,9 @@ function updateDateNavButtons() {
 }
 
 function sessionCountForDate(dateKey) {
+  if (dateKey === activeDayKey && selectedDateSessions.length) {
+    return selectedDateSessions.length;
+  }
   return surfSessions().filter(s => dateKeyFromSession(s) === dateKey).length;
 }
 
@@ -1904,7 +1911,9 @@ function renderStatusBar() {
   } = data;
 
   const loadedCount = asSessionArray(data.sessions).length;
-  const trackedCount = loadedCount || (currentSessionsCount ?? sessionsCount ?? 0);
+  const selectedCount = selectedDateSessions.length;
+  const trackedCount = selectedCount || loadedCount || (currentSessionsCount ?? sessionsCount ?? 0);
+  const hasSavedForView = selectedCount > 0 || selectedDateMeta.hasSavedSessions;
   const ageMins = minutesSinceLastScrape ?? dataAgeMinutes;
   const src = source || dataSource;
 
@@ -1915,28 +1924,28 @@ function renderStatusBar() {
   };
 
   let detail;
-  if (scrapeInProgress && trackedCount > 0) {
+  if ((scrapeInProgress || selectedDateMeta.isLoading) && hasSavedForView) {
     detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
-  } else if (selectedDateMeta.isLoading && selectedDateSessions.length) {
+  } else if (scrapeInProgress && trackedCount > 0) {
     detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
   } else if (scrapeInProgress) {
     detail = 'refreshing…';
-  } else if (!trackedCount && !lastSuccessfulScrape) {
+  } else if (!trackedCount && !lastSuccessfulScrape && !hasSavedForView) {
     detail = 'waiting for first scrape';
   } else if (lastScrapeError && trackedCount > 0) {
     detail = 'showing saved data · refresh failed';
-  } else if (isUsingCachedData || src === 'supabase' || src === 'supabase/current_sessions') {
+  } else if (hasSavedForView || isUsingCachedData || src === 'supabase' || src === 'supabase/current_sessions' || (src || '').includes('fallback')) {
     detail = `showing saved data · checked ${ageLabel(ageMins) || 'earlier'}`;
   } else {
     detail = `checked ${ageLabel(ageMins) || 'just now'}`;
   }
 
-  if (uiLoading && !loadedCount) {
+  if (uiLoading && !loadedCount && !selectedCount) {
     txt.innerHTML = '<span class="check-time">Loading sessions…</span>';
     return;
   }
 
-  if (lastFetchError && !loadedCount && !lastSuccessfulScrape) {
+  if (lastFetchError && !loadedCount && !selectedCount && !lastSuccessfulScrape) {
     txt.innerHTML = `<span class="check-time">Could not load · ${lastFetchError}</span>`;
     return;
   }
@@ -1945,7 +1954,7 @@ function renderStatusBar() {
     return;
   }
 
-  if (!trackedCount && !lastSuccessfulScrape) {
+  if (!trackedCount && !lastSuccessfulScrape && !hasSavedForView) {
     txt.innerHTML = `<span class="check-time">${detail}</span>`;
     return;
   }
@@ -2022,11 +2031,11 @@ function renderBrowse() {
     const poolCount = browseSessionPool().filter(isSurfSession).length;
     const reason = selectedDateMeta.statusReason;
     let msg;
-    if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'saved_sessions_fallback' || selectedDateMeta.hasSavedSessions) {
+    if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'fallback_sessions_found' || selectedDateMeta.hasSavedSessions) {
       msg = 'No sessions match these filters';
     } else if (reason === 'checked_no_sessions') {
       msg = 'No sessions found for this date';
-    } else if (reason === 'not_checked') {
+    } else if (reason === 'not_checked' && !selectedDateMeta.isLoading) {
       msg = 'Not checked yet';
     } else if (reason === 'schema_error') {
       msg = formatApiError(selectedDateMeta.lastFetchError);
@@ -2044,10 +2053,13 @@ function renderBrowse() {
   }
 
   filtered.sort((a, b) => a.ts - b.ts);
-  const fallbackNote = (selectedDateMeta.isFallback || selectedDateMeta.statusReason === 'saved_sessions_fallback')
+  const refreshingNote = selectedDateMeta.isLoading
+    ? '<div class="fallback-note">Refreshing…</div>'
+    : '';
+  const fallbackNote = (!selectedDateMeta.isLoading && (selectedDateMeta.isFallback || selectedDateMeta.statusReason === 'fallback_sessions_found'))
     ? '<div class="fallback-note">Showing saved snapshot</div>'
     : '';
-  listEl.innerHTML = fallbackNote + filtered.map(sessionCardHtml).join('');
+  listEl.innerHTML = refreshingNote + fallbackNote + filtered.map(sessionCardHtml).join('');
 }
 
 function sessionCardHtml(s) {

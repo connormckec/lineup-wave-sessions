@@ -145,13 +145,14 @@ curl -s "http://localhost:3000/api/status?selected_date=2026-06-29" | jq '{selec
 
 ### Selected-date sessions (Supabase source of truth)
 
-Browse loads **`GET /api/sessions?date=YYYY-MM-DD`** on every date change. That endpoint queries `current_sessions` directly for the exact `iso_date` and returns:
+Browse loads **`GET /api/sessions?date=YYYY-MM-DD`** on every date change. That endpoint queries `current_sessions` first, then fallback sources, and returns:
 
 - `sessions` — rows for that date
-- `statusReason` — `saved_sessions_found` | `checked_no_sessions` | `not_checked` | `error`
-- `dataSource` — `supabase/current_sessions`
+- `statusReason` — `saved_sessions_found` | `fallback_sessions_found` | `checked_no_sessions` | `not_checked` | `error`
+- `dataSource` — `supabase/current_sessions` or fallback source
+- `hasSavedSessions`, `lastBasicCheckAt`, `lastDetailedCheckAt`
 
-The UI renders the returned sessions directly — it does not filter the full `/api/status` payload client-side for the selected date.
+The UI renders the returned sessions directly — it does not filter the full `/api/status` payload client-side for the selected date. **Do not show "Not checked yet" or "waiting for first scrape" when `/api/sessions?date=` returns sessions.**
 
 ```bash
 curl -s "http://localhost:3000/api/sessions?date=2026-06-29" | jq '{isoDate, sessionsCount, statusReason, dataSource, hasSavedSessions}'

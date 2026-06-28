@@ -738,50 +738,136 @@ async function startupCoverageCheck() {
   return { sparse, fallbackAvailable: fallback };
 }
 
+async function queryCurrentSessionsByDateFromDb() {
+  if (!supabase) return currentSessionsByDateMap();
+  try {
+    const { data, error } = await supabase
+      .from('current_sessions')
+      .select('iso_date, last_basic_check_at, last_detailed_check_at, slots_available')
+      .eq('park', PARK);
+    if (error) throw error;
+    const byDate = {};
+    const basicDates = new Set();
+    const detailedDates = new Set();
+    for (const row of data || []) {
+      const dk = isoDateFromRow(row);
+      if (!dk) continue;
+      byDate[dk] = (byDate[dk] || 0) + 1;
+      if (row.last_basic_check_at) basicDates.add(dk);
+      if (row.last_detailed_check_at || row.slots_available != null) detailedDates.add(dk);
+    }
+    return { byDate, basicDates: [...basicDates].sort(), detailedDates: [...detailedDates].sort() };
+  } catch (e) {
+    console.warn('  queryCurrentSessionsByDateFromDb failed:', e.message);
+    const map = currentSessionsByDateMap();
+    return { byDate: map, basicDates: [], detailedDates: [] };
+  }
+}
+
+async function queryAvailabilitySnapshotsByDate() {
+  const byDate = {};
+  if (!supabase) return byDate;
+  try {
+    const windowEnd = expectedDatesInScrapeWindow().slice(-1)[0];
+    const { data, error } = await supabase
+      .from('availability_snapshots')
+      .select('iso_date')
+      .eq('park', PARK)
+      .gte('iso_date', todayDateKey())
+      .lte('iso_date', windowEnd || '9999-12-31');
+    if (error) throw error;
+    for (const row of data || []) {
+      const dk = String(row.iso_date).slice(0, 10);
+      byDate[dk] = (byDate[dk] || 0) + 1;
+    }
+  } catch (e) {
+    console.warn('  queryAvailabilitySnapshotsByDate failed:', e.message);
+  }
+  return byDate;
+}
+
+async function fetchScrapeSnapshotMeta() {
+  if (!supabase) {
+    const snap = await fetchLatestSnapshotSessions();
+    return {
+      scrapeSnapshotsAvailable: snap.length > 0,
+      scrapeSnapshotsSessionCount: snap.length,
+      latestScrapeSnapshotAt: lastLatestSnapshotSavedAt,
+      scrapeSnapshotsByDate: {},
+    };
+  }
+  try {
+    const { data, error } = await supabase
+      .from('scrape_snapshots')
+      .select('updated_at, sessions, last_successful_scrape')
+      .eq('id', 'latest')
+      .maybeSingle();
+    if (error) throw error;
+    const sessions = asSessionArray(data?.sessions);
+    const byDate = {};
+    for (const s of sessions) {
+      const dk = sessionDateKey(snapshotJsonToSession(s));
+      if (dk) byDate[dk] = (byDate[dk] || 0) + 1;
+    }
+    return {
+      scrapeSnapshotsAvailable: sessions.length > 0,
+      scrapeSnapshotsSessionCount: sessions.length,
+      latestScrapeSnapshotAt: data?.updated_at || data?.last_successful_scrape || null,
+      scrapeSnapshotsByDate: byDate,
+    };
+  } catch (e) {
+    return {
+      scrapeSnapshotsAvailable: false,
+      scrapeSnapshotsSessionCount: 0,
+      latestScrapeSnapshotAt: null,
+      scrapeSnapshotsByDate: {},
+    };
+  }
+}
+
 async function buildCoverageDebugPayload() {
   const expected = expectedDatesInScrapeWindow();
-  const currentMap = currentSessionsByDateMap();
-  const snapSessions = await fetchLatestSnapshotSessions();
-  const snapDates = new Set(snapSessions.map(s => sessionDateKey(snapshotJsonToSession(s))).filter(Boolean));
-  const availDates = new Set();
+  const dbStats = await queryCurrentSessionsByDateFromDb();
+  const currentMap = dbStats.byDate;
+  const availByDate = await queryAvailabilitySnapshotsByDate();
+  const snapMeta = await fetchScrapeSnapshotMeta();
+  const snapDates = Object.keys(snapMeta.scrapeSnapshotsByDate || {});
 
-  if (supabase) {
-    try {
-      const { data } = await supabase
-        .from('availability_snapshots')
-        .select('iso_date')
-        .eq('park', PARK)
-        .gte('iso_date', todayDateKey())
-        .limit(5000);
-      for (const row of data || []) {
-        if (row.iso_date) availDates.add(String(row.iso_date).slice(0, 10));
-      }
-    } catch {}
-  }
-
-  const datesInCurrentSessions = Object.keys(currentMap).filter(d => expected.includes(d)).sort();
-  const missingDates = expected.filter(d => !(currentMap[d] > 0));
+  const datesInCurrentSessions = expected.filter(d => (currentMap[d] || 0) > 0).sort();
+  const missingDatesFromCurrentSessions = expected.filter(d => !(currentMap[d] > 0));
   const coverage = computeDateCoverage();
+  const detailStats = detailCoverageStats();
   const sparse = isCurrentSessionsSparse();
   const fallback = await checkFallbackAvailable();
 
   let recommendedAction = 'none';
   if (sparse && fallback) recommendedAction = 'POST /api/admin/backfill-current-sessions';
   else if (sparse) recommendedAction = 'wait for Tier 2/3 scrape or run tier scrape manually';
-  else if (missingDates.length) recommendedAction = 'background Tier 2/3 will fill missing dates';
+  else if (missingDatesFromCurrentSessions.length) recommendedAction = 'background Tier 2/3 will fill missing dates';
 
   return {
     scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
     effectiveWeeksAhead,
     expectedDates: expected,
     expectedDatesCount: expected.length,
+    currentSessionsCount: Object.values(currentMap).reduce((a, b) => a + b, 0),
+    currentSessionsByDate: currentMap,
+    availabilitySnapshotsByDate: availByDate,
+    scrapeSnapshotsAvailable: snapMeta.scrapeSnapshotsAvailable,
+    scrapeSnapshotsSessionCount: snapMeta.scrapeSnapshotsSessionCount,
+    latestScrapeSnapshotAt: snapMeta.latestScrapeSnapshotAt,
+    scrapeSnapshotsByDate: snapMeta.scrapeSnapshotsByDate,
     datesInCurrentSessions,
-    datesInScrapeSnapshots: [...snapDates].filter(d => expected.includes(d)).sort(),
-    datesInAvailabilitySnapshots: [...availDates].filter(d => expected.includes(d)).sort(),
-    missingDates,
+    datesInScrapeSnapshots: snapDates.filter(d => expected.includes(d)).sort(),
+    datesInAvailabilitySnapshots: Object.keys(availByDate).filter(d => expected.includes(d)).sort(),
+    missingDates: missingDatesFromCurrentSessions,
+    missingDatesFromCurrentSessions,
+    datesWithBasicRows: dbStats.basicDates.filter(d => expected.includes(d)),
+    datesWithDetailedRows: dbStats.detailedDates.filter(d => expected.includes(d)),
     sessionsByDate: currentMap,
-    coveragePercent: coverage.coveragePercent,
+    coveragePercent: coverage.sessionsCoveragePercent,
     sessionsCoveragePercent: coverage.sessionsCoveragePercent,
+    detailCoveragePercent: detailStats.detailCoveragePercent,
     sparse,
     fallbackAvailable: fallback,
     backfillRecommended: sparse && fallback,
@@ -789,7 +875,11 @@ async function buildCoverageDebugPayload() {
     lastTier1Scrape: lastTierRun[1],
     lastTier2Scrape: lastTierRun[2],
     lastTier3Scrape: lastTierRun[3],
+    lastFullCoverageScrape,
     scrapeInProgress,
+    backgroundCollectorEnabled: scrapeScheduleEnabled,
+    inMemorySessionsCount: sessionsByKey.size,
+    inMemoryDatesCount: Object.keys(currentSessionsByDateMap()).length,
   };
 }
 
@@ -809,11 +899,46 @@ function dateCoverageForIsoDate(isoDate) {
 
 function statusReasonForDate(isoDate, dateSessions, { isFallback = false } = {}) {
   if (dateSessions.length > 0) {
-    return isFallback ? 'saved_sessions_fallback' : 'saved_sessions_found';
+    return isFallback ? 'fallback_sessions_found' : 'saved_sessions_found';
   }
   if (datesCheckedEmpty.has(isoDate)) return 'checked_no_sessions';
   if (persistedDatesChecked.has(isoDate)) return 'checked_no_sessions';
   return 'not_checked';
+}
+
+function dateCheckTimestamps(dateSessions) {
+  const basic = asSessionArray(dateSessions)
+    .map(s => s.lastBasicCheckAt || s.last_basic_check_at)
+    .filter(Boolean)
+    .sort()
+    .pop() || null;
+  const detailed = asSessionArray(dateSessions)
+    .map(s => s.lastDetailedCheckAt || s.last_detailed_check_at)
+    .filter(Boolean)
+    .sort()
+    .pop() || null;
+  return { lastBasicCheckAt: basic, lastDetailedCheckAt: detailed };
+}
+
+function resolveDateUiDisplay(isoDate, { sessions, statusReason, isFallback = false } = {}) {
+  const count = asSessionArray(sessions).length;
+  if (count > 0) {
+    return {
+      statusReason: statusReason || (isFallback ? 'fallback_sessions_found' : 'saved_sessions_found'),
+      uiDisplay: 'sessions',
+      uiMessage: `Render ${count} session card(s)${isFallback ? ' (saved snapshot fallback)' : ''}`,
+    };
+  }
+  if (statusReason === 'checked_no_sessions') {
+    return { statusReason, uiDisplay: 'empty', uiMessage: 'No sessions found for this date' };
+  }
+  if (statusReason === 'schema_error') {
+    return { statusReason, uiDisplay: 'error', uiMessage: 'Database schema missing — run supabase/schema.sql' };
+  }
+  if (statusReason === 'error') {
+    return { statusReason, uiDisplay: 'error', uiMessage: 'Could not load sessions for this date' };
+  }
+  return { statusReason: statusReason || 'not_checked', uiDisplay: 'not_checked', uiMessage: 'Not checked yet' };
 }
 
 async function buildSessionsForDatePayload(isoDate) {
@@ -846,6 +971,7 @@ async function buildSessionsForDatePayload(isoDate) {
   const hasSaved = dateSessions.length > 0;
   const wasChecked = hasSaved || persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate);
   const statusReason = statusReasonForDate(isoDate, dateSessions, { isFallback });
+  const checkTimes = dateCheckTimestamps(dateSessions);
   return {
     isoDate,
     sessions: dateSessions,
@@ -853,6 +979,8 @@ async function buildSessionsForDatePayload(isoDate) {
     dataSource: src,
     isFallback,
     lastSuccessfulScrape,
+    lastBasicCheckAt: checkTimes.lastBasicCheckAt,
+    lastDetailedCheckAt: checkTimes.lastDetailedCheckAt,
     lastCheckedForDate: wasChecked ? (lastSuccessfulScrape || lastTierRun[1] || lastTierRun[2] || null) : null,
     wasDateChecked: wasChecked,
     isScrapeInProgress: scrapeInProgress,
@@ -1051,7 +1179,12 @@ function getStatusFields() {
     snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
     minutesSinceLastScrape: dataAgeMinutes,
     missingDatesInScrapeWindow: coverage.missingDatesInScrapeWindow,
-    coveragePercent: coverage.coveragePercent,
+    coveragePercent: coverage.sessionsCoveragePercent,
+    sessionsCoveragePercent: coverage.sessionsCoveragePercent,
+    earliestSessionDate: coverage.earliestSessionDate,
+    latestSessionDate: coverage.latestSessionDate,
+    uniqueDatesCount: coverage.uniqueDatesCount,
+    expectedDatesCount: coverage.expectedDatesCount,
     tierCoverage: tierCoverageSummary(),
     lastFullCoverageScrape,
     lastTier1Scrape: lastTierRun[1],
@@ -4015,7 +4148,7 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
     return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
   }
   try {
-    await ensureSessionsForStatus();
+    const apiPayload = await buildSessionsForDatePayload(isoDate);
     let primaryForDate = [];
     if (supabase) {
       const { data, error } = await supabase
@@ -4028,75 +4161,71 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
     }
     const fallbackSnapshot = await loadSessionsForDateFromSnapshotBlob(isoDate);
     const fallbackAvailability = await loadSessionsForDateFromAvailabilitySnapshots(isoDate);
-    const dateSessions = primaryForDate.length
-      ? primaryForDate
-      : (fallbackSnapshot.length ? fallbackSnapshot : (fallbackAvailability.length ? fallbackAvailability : sessionsForDate(isoDate)));
-    const withSlots = dateSessions.filter(s => s.slots != null);
-    const withCapacity = dateSessions.filter(s => s.capacity != null);
-    const withPrice = dateSessions.filter(s => s.priceText || s.priceMin != null);
-    const detailStatuses = {};
-    for (const s of dateSessions) {
-      const st = s.detailStatus || 'unknown';
-      detailStatuses[st] = (detailStatuses[st] || 0) + 1;
-    }
-    const latestBasic = dateSessions
-      .map(s => s.lastBasicCheckAt)
-      .filter(Boolean)
-      .sort()
-      .pop() || null;
-    const latestDetailed = dateSessions
-      .map(s => s.lastDetailedCheckAt)
-      .filter(Boolean)
-      .sort()
-      .pop() || null;
-    const selectedDateDebug = buildSelectedDateDebug(isoDate);
+    const checkTimes = dateCheckTimestamps(apiPayload.sessions);
+    const uiResolved = resolveDateUiDisplay(isoDate, {
+      sessions: apiPayload.sessions,
+      statusReason: apiPayload.statusReason,
+      isFallback: apiPayload.isFallback,
+    });
     const payload = {
       isoDate,
-      sessionsCount: dateSessions.length,
-      sessionsWithSlotsCount: withSlots.length,
-      sessionsWithCapacityCount: withCapacity.length,
-      sessionsWithPriceCount: withPrice.length,
-      latestLastBasicCheckAt: latestBasic,
-      latestLastDetailedCheckAt: latestDetailed,
-      detailStatusSummary: detailStatuses,
+      apiContract: {
+        isoDate: apiPayload.isoDate,
+        sessionsCount: apiPayload.sessionsCount,
+        dataSource: apiPayload.dataSource,
+        statusReason: apiPayload.statusReason,
+        hasSavedSessions: apiPayload.hasSavedSessions,
+        lastBasicCheckAt: apiPayload.lastBasicCheckAt,
+        lastDetailedCheckAt: apiPayload.lastDetailedCheckAt,
+        isScrapeInProgress: apiPayload.isScrapeInProgress,
+        isFallback: apiPayload.isFallback,
+        error: apiPayload.error,
+      },
+      sessionsCount: apiPayload.sessionsCount,
       currentSessionsCountForDate: primaryForDate.length,
       currentSessionsForDate: primaryForDate.slice(0, 8),
+      availabilitySnapshotsCountForDate: 0,
+      scrapeSnapshotsForDate: fallbackSnapshot.slice(0, 8),
       fallbackSessionsFromSnapshot: fallbackSnapshot.slice(0, 8),
       fallbackSessionsFromAvailability: fallbackAvailability.slice(0, 8),
       fallbackSnapshotCount: fallbackSnapshot.length,
       fallbackAvailabilityCount: fallbackAvailability.length,
-      dataSourceForDate: primaryForDate.length
-        ? 'supabase/current_sessions'
-        : (fallbackSnapshot.length
-          ? 'supabase/scrape_snapshots_fallback'
-          : (fallbackAvailability.length ? 'supabase/availability_snapshots_fallback' : 'none')),
-      sampleSessions: dateSessions.slice(0, 5).map(s => ({
+      wasDateChecked: apiPayload.wasDateChecked,
+      lastBasicCheckAt: checkTimes.lastBasicCheckAt || apiPayload.lastBasicCheckAt,
+      lastDetailedCheckAt: checkTimes.lastDetailedCheckAt || apiPayload.lastDetailedCheckAt,
+      statusReason: uiResolved.statusReason,
+      uiDisplay: uiResolved.uiDisplay,
+      uiMessage: uiResolved.uiMessage,
+      sampleSessions: apiPayload.sessions.slice(0, 5).map(s => ({
         key: s.key,
         time: s.time,
         level: s.level,
+        waveSide: s.waveSide,
         available: s.available,
         slots: s.slots,
         capacity: s.capacity,
         estimatedBooked: s.estimatedBooked,
+        fillRate: s.fillRate,
         priceText: s.priceText,
-        detailStatus: s.detailStatus,
+        lastBasicCheckAt: s.lastBasicCheckAt,
         lastDetailedCheckAt: s.lastDetailedCheckAt,
       })),
-      wasDateChecked: selectedDateDebug?.selectedDateWasChecked ?? false,
-      selectedDateCheckedEmpty: selectedDateDebug?.selectedDateCheckedEmpty ?? false,
-      selectedDateDebug,
-      uiReason: selectedDateDebug?.uiReason ?? null,
-      uiReasonText: uiReasonText(selectedDateDebug?.uiReason),
       scrapeInProgress,
-      detailEnrichmentInProgress,
       persistedDatesChecked: [...persistedDatesChecked].sort(),
       datesCheckedEmpty: [...datesCheckedEmpty].sort(),
       relevantScrapeRuns: [],
-      latestAvailabilitySnapshots: [],
-      enrichmentQueueRows: [],
+      latestSnapshotsForDate: [],
     };
 
     if (supabase) {
+      try {
+        const { count } = await supabase
+          .from('availability_snapshots')
+          .select('*', { count: 'exact', head: true })
+          .eq('iso_date', isoDate);
+        payload.availabilitySnapshotsCountForDate = count ?? 0;
+      } catch {}
+
       const { data: runs, error: runsError } = await supabase
         .from('scrape_runs')
         .select('id, tier, started_at, finished_at, success, sessions_found, dates_covered, missing_dates, coverage_percent, error')
@@ -4117,23 +4246,8 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
         .order('scraped_at', { ascending: false })
         .limit(12);
       if (snapsError) throw snapsError;
+      payload.latestSnapshotsForDate = snaps || [];
       payload.latestAvailabilitySnapshots = snaps || [];
-
-      const { data: queueRows, error: queueError } = await supabase
-        .from('session_enrichment_queue')
-        .select('session_key, iso_date, priority, status, reason, attempts, last_attempt_at, last_error, updated_at')
-        .eq('iso_date', isoDate)
-        .order('priority', { ascending: true })
-        .limit(20);
-      if (!queueError) payload.enrichmentQueueRows = queueRows || [];
-
-      const { count, error: countError } = await supabase
-        .from('current_sessions')
-        .select('*', { count: 'exact', head: true })
-        .eq('park', PARK)
-        .eq('iso_date', isoDate);
-      if (countError) throw countError;
-      payload.supabaseCurrentSessionsCountForDate = count ?? 0;
     }
 
     res.json(payload);

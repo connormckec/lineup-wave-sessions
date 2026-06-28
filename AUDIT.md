@@ -16,7 +16,82 @@ If you see:
 
 ---
 
-## Required Supabase tables
+## Pipeline diagnosis (saved + live data)
+
+Use these endpoints to diagnose before changing code:
+
+```bash
+curl -s /api/debug/coverage | jq
+curl -s /api/debug/date/2026-06-29 | jq '{statusReason,uiMessage,apiContract,sessionsCount,currentSessionsCountForDate,fallbackSnapshotCount}'
+curl -s "/api/sessions?date=2026-06-29" | jq '{sessionsCount,statusReason,dataSource,hasSavedSessions,isFallback}'
+```
+
+### Where is saved full-window data stored?
+
+| Source | Role |
+|--------|------|
+| **`current_sessions`** | **Display table** — latest row per session; Browse reads this first |
+| **`scrape_snapshots`** (`id='latest'`) | Merged JSON backup; fallback when `current_sessions` sparse for a date |
+| **`availability_snapshots`** | Append-only history; fallback = latest row per `session_key` for a date |
+| **In-memory `sessionsByKey`** | Server cache; reloaded on startup from `current_sessions` |
+
+### Does `current_sessions` have rows beyond tomorrow?
+
+Check `GET /api/debug/coverage` → `datesInCurrentSessions`, `currentSessionsByDate`, `missingDatesFromCurrentSessions`.
+
+If only today/tomorrow appear: Tier 2/3 have not populated yet, or backfill has not run. Run `POST /api/admin/backfill-current-sessions` if `scrape_snapshots` or `availability_snapshots` have broader data.
+
+### Are Tier 2/Tier 3 running?
+
+Check `lastTier2Scrape`, `lastTier3Scrape`, `relevantScrapeRuns` in debug endpoints. Tier 2 every 30 min, Tier 3 every 6 h. **Railway App Sleep must be disabled** or scrapes pause until someone opens the app.
+
+### Is Tier 1 overwriting future-date rows?
+
+**No** — Tier 1 upserts today/tomorrow only. It must not reload-wipe memory (fixed: no full `loadCurrentSessionsFromSupabase` after tier scrape). `saveLatestSnapshotToSupabase` merges with existing snapshot JSON so Tier 1 cannot shrink saved future dates.
+
+### Is the frontend using `/api/sessions?date=`?
+
+**Yes** — Browse calls `GET /api/sessions?date=YYYY-MM-DD` on every date change and renders `selectedDateSessions` directly.
+
+**Bug that caused “waiting for first scrape”:** The status bar used global `/api/status` session counts (`data.sessions`) instead of selected-date sessions. Future dates could have rows from `/api/sessions?date=` while the header still said “waiting for first scrape”. Fixed: status bar and empty states now respect `selectedDateSessions` and API `statusReason`.
+
+### Why “not checked yet” when saved data exists?
+
+Only if **all** sources return zero rows for that date: `current_sessions`, `scrape_snapshots`, `availability_snapshots`, memory.
+
+If fallback rows exist, API returns `statusReason: fallback_sessions_found` — UI must not show “Not checked yet”.
+
+---
+
+## Canonical display contract
+
+**Only path for Browse:** `GET /api/sessions?date=YYYY-MM-DD`
+
+```json
+{
+  "isoDate": "YYYY-MM-DD",
+  "sessions": [],
+  "sessionsCount": 0,
+  "dataSource": "supabase/current_sessions",
+  "statusReason": "saved_sessions_found | fallback_sessions_found | checked_no_sessions | not_checked | schema_error | error",
+  "hasSavedSessions": true,
+  "lastBasicCheckAt": "...",
+  "lastDetailedCheckAt": "...",
+  "isScrapeInProgress": false,
+  "isFallback": false,
+  "error": null
+}
+```
+
+| statusReason | When |
+|--------------|------|
+| `saved_sessions_found` | Rows from `current_sessions` |
+| `fallback_sessions_found` | Rows from snapshot/history/memory fallback |
+| `checked_no_sessions` | Date was scraped, zero sessions |
+| `not_checked` | No source has rows for this date |
+| `schema_error` | Table missing — run schema.sql |
+
+---
 
 | Table | Used by app | Purpose |
 |-------|-------------|---------|
@@ -116,7 +191,7 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
   "sessions": [],
   "sessionsCount": 0,
   "dataSource": "supabase/current_sessions",
-  "statusReason": "saved_sessions_found | checked_no_sessions | not_checked | schema_error | error",
+  "statusReason": "saved_sessions_found | fallback_sessions_found | checked_no_sessions | not_checked | schema_error | error",
   "lastCheckedForDate": "2026-06-27T12:00:00.000Z",
   "wasDateChecked": true,
   "isScrapeInProgress": false,
@@ -142,9 +217,10 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
 
 | Value | UI message |
 |-------|------------|
-| `saved_sessions_found` | Sessions list |
+| `saved_sessions_found` | Sessions list from `current_sessions` |
+| `fallback_sessions_found` | Sessions from snapshot/history fallback |
 | `checked_no_sessions` | No sessions found for this date |
-| `not_checked` | Not checked yet |
+| `not_checked` | Not checked yet — **only when no source has rows** |
 | `schema_error` | Database schema missing. Run supabase/schema.sql. |
 | `error` | Actionable error string from `error` field |
 
