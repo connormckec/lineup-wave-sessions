@@ -36,6 +36,39 @@ See [`AUDIT.md`](AUDIT.md) for the full table/column/API contract.
 
 ---
 
+## Full-window session coverage
+
+After schema reset or sparse `current_sessions` (only today/tomorrow):
+
+1. **Check coverage:**
+
+```bash
+curl -s http://localhost:3000/api/debug/coverage | jq '{expectedDatesCount, datesInCurrentSessions, missingDates, coveragePercent, sessionsCoveragePercent, backfillRecommended, recommendedAction}'
+curl -s http://localhost:3000/api/status | jq '{currentSessionsByDate, earliestSessionDate, latestSessionDate, uniqueDatesCount, missingDatesInScrapeWindow, backfillRecommended, fallbackAvailable}'
+```
+
+2. **Backfill if recommended:**
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/backfill-current-sessions | jq
+```
+
+3. **Verify dates** (adjust dates as needed):
+
+```bash
+for d in 2026-06-28 2026-06-29 2026-06-30 2026-07-02 2026-07-10; do
+  curl -s "http://localhost:3000/api/sessions?date=$d" | jq -c "{date:\"$d\", count:.sessionsCount, reason:.statusReason, source:.dataSource, fallback:.isFallback}"
+done
+```
+
+4. Arrow through those dates in the UI — sessions should render (or *Showing saved snapshot* for fallback data).
+5. After Tier 1 runs, confirm future dates **do not disappear**.
+6. Wait for or trigger Tier 2 — confirm next 7 days populate in `currentSessionsByDate`.
+
+**Railway:** App Sleep must be disabled for continuous background collection.
+
+---
+
 ## Future session detail enrichment
 
 After deploying schema changes, run updated [`supabase/schema.sql`](supabase/schema.sql) (adds `detail_status`, `session_enrichment_queue`, `snapshot_type`).

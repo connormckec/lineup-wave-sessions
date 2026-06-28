@@ -60,6 +60,25 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - Debug a single date: `GET /api/debug/date/YYYY-MM-DD` — session count, scrape runs, snapshots, and UI reason.
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
+### Full-window session coverage
+
+The app serves sessions across the full `SCRAPE_WEEKS_AHEAD` window (default 4 weeks), not just today/tomorrow.
+
+- **Tier 1** (every 5 min): today/tomorrow — upserts only those dates; never wipes future rows.
+- **Tier 2** (every 30 min): next 7 days.
+- **Tier 3** (every 6 hours): weeks 2–4.
+- **`scrape_snapshots`** merges with existing snapshot data so Tier 1 cannot shrink saved future dates.
+- On startup, if `current_sessions` is sparse, the server **auto-backfills** from `scrape_snapshots` / `availability_snapshots` or schedules Tier 2.
+
+**Manual backfill** (after schema reset):
+
+```bash
+curl -X POST https://YOUR-APP/api/admin/backfill-current-sessions
+curl https://YOUR-APP/api/debug/coverage
+```
+
+**Railway:** Disable **Serverless / App Sleep** — otherwise Tier 2/3 scrapes pause until someone opens the app. Long-term: separate web API service + scraper worker.
+
 ### Future session detail enrichment
 
 Two scrape levels run in parallel:

@@ -291,6 +291,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .sc-price{font-size:11px;color:var(--muted);margin-top:2px}
 .sc-booked{font-size:11px;color:var(--sub);margin-top:2px;line-height:1.35}
 .sc-detail-pending{font-size:10px;color:var(--muted);margin-top:2px;font-style:italic;opacity:.85}
+.fallback-note{font-size:11px;color:var(--muted);text-align:center;padding:6px 12px 2px;font-style:italic;opacity:.9}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
 .sc-right{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
 .sc-actions{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
@@ -772,6 +773,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       statusReason: payload.statusReason || (sessions.length ? 'saved_sessions_found' : 'not_checked'),
       sessionsCount: payload.sessionsCount ?? sessions.length,
       dataSource: payload.dataSource || null,
+      isFallback: !!payload.isFallback,
       wasDateChecked: payload.wasDateChecked,
       hasSavedSessions: payload.hasSavedSessions ?? sessions.length > 0,
       isScrapeInProgress: !!payload.isScrapeInProgress,
@@ -2020,7 +2022,7 @@ function renderBrowse() {
     const poolCount = browseSessionPool().filter(isSurfSession).length;
     const reason = selectedDateMeta.statusReason;
     let msg;
-    if (poolCount > 0 || reason === 'saved_sessions_found' || selectedDateMeta.hasSavedSessions) {
+    if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'saved_sessions_fallback' || selectedDateMeta.hasSavedSessions) {
       msg = 'No sessions match these filters';
     } else if (reason === 'checked_no_sessions') {
       msg = 'No sessions found for this date';
@@ -2042,7 +2044,10 @@ function renderBrowse() {
   }
 
   filtered.sort((a, b) => a.ts - b.ts);
-  listEl.innerHTML = filtered.map(sessionCardHtml).join('');
+  const fallbackNote = (selectedDateMeta.isFallback || selectedDateMeta.statusReason === 'saved_sessions_fallback')
+    ? '<div class="fallback-note">Showing saved snapshot</div>'
+    : '';
+  listEl.innerHTML = fallbackNote + filtered.map(sessionCardHtml).join('');
 }
 
 function sessionCardHtml(s) {

@@ -102,7 +102,9 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
 | `GET /api/schema/health` | Table probe results, `missingTables`, actionable message |
 | `GET /api/watchlist?user_key=` | User watchlist |
 | `GET /api/debug/date/:isoDate` | Date-level debug + enrichment queue rows |
+| `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
 | `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date |
+| `GET /api/debug/coverage` | Expected vs actual dates across sources |
 
 ---
 
