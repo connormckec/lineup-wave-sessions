@@ -181,12 +181,8 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `GET /api/schema/health` | Table probe results, `missingTables`, actionable message |
 | `GET /api/watchlist?user_key=` | User watchlist |
 | `GET /api/debug/date/:isoDate` | Date-level debug + enrichment queue rows |
-| `GET /api/debug/collector` | Scheduler state, tier scrape times, recent scrape_runs, recommendedAction |
-| `POST /api/admin/run-tier1` | Manually trigger Tier 1 scrape (today/tomorrow + slots) |
-| `POST /api/admin/run-tier2` | Manually trigger Tier 2 scrape (next 7 days) |
-| `POST /api/admin/run-tier3` | Manually trigger Tier 3 scrape (weeks 2–3) |
-| `GET /api/debug/collector` | Scheduler state, tier scrape times, recent scrape_runs, recommendedAction |
-| `POST /api/admin/run-tier1` | Manually trigger Tier 1 scrape (today/tomorrow + slots) |
+| `GET /api/debug/collector` | Scheduler state: `tier1IntervalConfigured`, `tier1LastAttemptAt`, `tier1LastCompletedAt`, `tier1LastSkipReason`, `tier1TargetDates`, `tier1LastResult`, recent scrape_runs |
+| `POST /api/admin/run-tier1` | Manually trigger Tier 1 (park-local today + tomorrow). Use `?wait=true` for `targetDates`, `sessionsFound`, `rowsUpserted`, `skipReason`, `blockingScrapeTier`. |
 | `POST /api/admin/run-tier2` | Manually trigger Tier 2 scrape (next 7 days) |
 | `POST /api/admin/run-tier3` | Manually trigger Tier 3 scrape (weeks 2–3) |
 | `GET /api/debug/boot` | Park timezone, saved session counts, why Browse would show not_checked |

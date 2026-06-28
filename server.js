@@ -95,6 +95,8 @@ let lastScrapeAttempt  = null;
 let lastScrapeError    = null;
 let lastScrapeErrorStack = null;
 let scrapeInProgress   = false;
+let currentScrapeTier  = null;
+let currentScrapeStartedAt = null;
 let detailEnrichmentInProgress = false;
 let lastDetailEnrichmentAt = null;
 let lastDetailEnrichmentError = null;
@@ -240,6 +242,19 @@ const collectorState = {
   tier1NextRunAt: null,
   tier2NextRunAt: null,
   tier3NextRunAt: null,
+  tier1LastAttemptAt: null,
+  tier1LastCompletedAt: null,
+  tier1LastSkippedAt: null,
+  tier1LastSkipReason: null,
+  tier1LastError: null,
+  tier1TargetDates: null,
+  tier1LastResult: null,
+  tier2LastAttemptAt: null,
+  tier2LastCompletedAt: null,
+  tier2LastSkippedAt: null,
+  tier2LastSkipReason: null,
+  tier2LastError: null,
+  tier2LastResult: null,
   skippedRuns: [],
   cronTasks: {},
 };
@@ -822,15 +837,30 @@ async function startupCoverageCheck() {
     console.log(`  Backfill: ${result.rowsUpserted} row(s) upserted from ${result.sourceUsed}, dates: ${result.datesCovered.join(', ') || 'none'}`);
     await refreshCoverageFlags();
     if (result.rowsUpserted === 0 && !scrapeInProgress) {
-      console.log('  Backfill found nothing to upsert — scheduling Tier 2 broad scrape…');
-      setTimeout(() => runTierScrape(2).catch(console.error), 8_000);
+      console.log('  Backfill found nothing — Tier 1/Tier 2 deferred (120s check, Tier 1 first)');
+      setTimeout(() => {
+        if (scrapeInProgress) return;
+        if (!lastTierRun[1]) {
+          runScheduledTier(1, { reason: 'startup_backfill_tier1_first' }).catch(console.error);
+          return;
+        }
+        runScheduledTier(2, { reason: 'startup_backfill_tier2' }).catch(console.error);
+      }, 120_000);
     }
     return result;
   }
 
   if (sparse && !scrapeInProgress) {
-    console.log('  Sparse coverage, no fallback — scheduling Tier 2 scrape…');
-    setTimeout(() => runTierScrape(2).catch(console.error), 8_000);
+    console.log('  Sparse coverage, no fallback — Tier 2 deferred until Tier 1 completes (120s check)');
+    setTimeout(() => {
+      if (scrapeInProgress) return;
+      if (!lastTierRun[1]) {
+        console.log('  Tier 1 not completed yet — running Tier 1 first');
+        runScheduledTier(1, { reason: 'startup_coverage_tier1_first' }).catch(console.error);
+        return;
+      }
+      runScheduledTier(2, { reason: 'startup_coverage_tier2' }).catch(console.error);
+    }, 120_000);
   }
 
   return { sparse, fallbackAvailable: fallback };
@@ -2776,17 +2806,93 @@ async function runDetailEnrichmentByPriority(priority) {
   return runDetailEnrichment({ priority, reason: `priority_${priority}` });
 }
 
-function tryAcquireScrapeLock(context = 'scrape') {
+function tryAcquireScrapeLock(context = 'scrape', tier = null) {
   if (scrapeInProgress) {
-    console.log(`  ${context} skipped — scrape already running`);
+    console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
     return false;
   }
   scrapeInProgress = true;
+  currentScrapeTier = tier;
+  currentScrapeStartedAt = new Date().toISOString();
   return true;
 }
 
 function releaseScrapeLock() {
   scrapeInProgress = false;
+  currentScrapeTier = null;
+  currentScrapeStartedAt = null;
+}
+
+function tierTargetDates(tier) {
+  if (tier === 1) {
+    const today = getParkTodayIso();
+    return [today, addDaysToParkIso(today, 1)];
+  }
+  return expectedDatesForTier(tier);
+}
+
+function recordTierRunState(tier, report, { reason = 'scheduled' } = {}) {
+  const now = new Date().toISOString();
+  const p = `tier${tier}`;
+  collectorState[`${p}LastAttemptAt`] = now;
+  if (tier === 1) {
+    collectorState.tier1TargetDates = report.targetDates || tierTargetDates(tier);
+  }
+  collectorState[`${p}LastResult`] = {
+    at: now,
+    reason,
+    tier,
+    started: report.started,
+    completed: report.completed,
+    skipped: report.skipped,
+    skipReason: report.skipReason,
+    targetDates: report.targetDates || tierTargetDates(tier),
+    sessionsFound: report.sessionsFound ?? 0,
+    rowsUpserted: report.rowsUpserted ?? 0,
+    snapshotsInserted: report.snapshotsInserted ?? 0,
+    durationMs: report.durationMs ?? 0,
+    error: report.error || report.errors?.[0]?.error || null,
+    blockingScrapeTier: report.blockingScrapeTier ?? null,
+    blockingScrapeStartedAt: report.blockingScrapeStartedAt ?? null,
+    slotCountsError: report.slotCountsError ?? null,
+  };
+  if (report.skipped) {
+    collectorState[`${p}LastSkippedAt`] = now;
+    collectorState[`${p}LastSkipReason`] = report.skipReason;
+  }
+  if (report.completed) {
+    collectorState[`${p}LastCompletedAt`] = now;
+    collectorState[`${p}LastError`] = report.slotCountsError || null;
+  }
+  if (report.error || report.errors?.length) {
+    collectorState[`${p}LastError`] = report.error || report.errors[0]?.error;
+  }
+}
+
+function reasonTodayHasZeroSessions(isoDate) {
+  const today = getParkTodayIso();
+  if (isoDate !== today) return null;
+  const memCount = sessionsForDate(isoDate).length;
+  if (memCount > 0) return null;
+
+  if (!lastTierRun[1]) {
+    if (collectorState.tier1LastSkippedAt) {
+      return `tier1_never_completed — last skip: ${collectorState.tier1LastSkipReason || 'unknown'} (${collectorState.tier1LastSkippedAt})`;
+    }
+    if (collectorState.tier1LastAttemptAt) {
+      return `tier1_never_completed — last attempt ${collectorState.tier1LastAttemptAt} did not finish`;
+    }
+    return 'tier1_never_completed — POST /api/admin/run-tier1?wait=true';
+  }
+  if (lastTierError[1]) return `tier1_last_error: ${lastTierError[1]}`;
+  if (datesCheckedEmpty.has(isoDate)) return 'tier1_checked_empty — booking site had no remaining sessions today';
+  if (collectorState.tier1LastResult?.sessionsFound === 0) {
+    return 'tier1_completed_but_found_zero_sessions_in_date_range';
+  }
+  if (!persistedDatesChecked.has(isoDate)) {
+    return 'today_not_marked_checked_by_tier1_yet';
+  }
+  return 'no_saved_rows_for_today — tier1 may have run before sessions were added or rows were pruned';
 }
 
 // ── Push notification via Ntfy.sh ────────────────────────────────────────────
@@ -4455,12 +4561,10 @@ function markCalendarSpanChecked(datesSeen, fromKey, toKey) {
 async function getVisibleDateKeysFromPage(page) {
   return page.evaluate(() => {
     const keys = new Set();
+    const fmt = (ts) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(ts * 1000));
     document.querySelectorAll('div.dynamic-cal-booking-ts').forEach(el => {
       const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
-      if (m) {
-        const d = new Date(+m[1] * 1000);
-        keys.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
-      }
+      if (m) keys.add(fmt(+m[1]));
     });
     document.querySelectorAll('[data-date]').forEach(el => {
       const attr = el.getAttribute('data-date');
@@ -4610,6 +4714,9 @@ function weeksForTier(tier) {
   const startWeek = Math.floor(cfg.minDay / 7);
   let endWeek = Math.min(Math.floor(tierMaxDay(tier) / 7), effectiveWeeksAhead - 1);
   endWeek = Math.min(endWeek + 1, effectiveWeeksAhead - 1);
+  if (tier === 1 && effectiveWeeksAhead > 1) {
+    endWeek = Math.max(endWeek, Math.min(1, effectiveWeeksAhead - 1));
+  }
   return { startWeek, endWeek: Math.max(startWeek, endWeek) };
 }
 
@@ -4840,9 +4947,12 @@ function updateEffectiveWeeksCap(detectedWeeks) {
 }
 
 
-async function runTierScrape(tier) {
+async function runTierScrape(tier, { reason = 'manual' } = {}) {
+  const targetDates = tierTargetDates(tier);
   const report = {
     tier,
+    reason,
+    targetDates,
     started: true,
     completed: false,
     skipped: false,
@@ -4852,37 +4962,51 @@ async function runTierScrape(tier) {
     snapshotsInserted: 0,
     durationMs: 0,
     errors: [],
+    error: null,
+    slotCountsError: null,
+    blockingScrapeTier: null,
+    blockingScrapeStartedAt: null,
   };
 
-  if (!tryAcquireScrapeLock(`tier ${tier}`)) {
+  if (!tryAcquireScrapeLock(`tier ${tier}`, tier)) {
     report.skipped = true;
     report.skipReason = 'scrape_in_progress';
     report.started = false;
-    console.log(`[tier ${tier}] skipped — scrape already running`);
-    collectorState.skippedRuns.push({ tier, at: new Date().toISOString(), reason: 'scrape_in_progress' });
+    report.blockingScrapeTier = currentScrapeTier;
+    report.blockingScrapeStartedAt = currentScrapeStartedAt;
+    console.log(`[tier ${tier}] skipped — scrape already running (tier ${currentScrapeTier})`);
+    collectorState.skippedRuns.push({
+      tier,
+      at: new Date().toISOString(),
+      reason: 'scrape_in_progress',
+      blockingScrapeTier: currentScrapeTier,
+    });
     if (collectorState.skippedRuns.length > 30) collectorState.skippedRuns.shift();
     const skipRunId = await beginScrapeRun(tier);
-    await finishScrapeRun(skipRunId, { success: false, error: 'skipped: scrape_in_progress' });
+    await finishScrapeRun(skipRunId, { success: false, error: `skipped: scrape_in_progress (tier ${currentScrapeTier})` });
+    recordTierRunState(tier, report, { reason });
     return report;
   }
 
   const cfg = TIER_CONFIG[tier];
   const { startWeek, endWeek } = weeksForTier(tier);
   if (endWeek < startWeek || startWeek >= effectiveWeeksAhead) {
-    const reason = `no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`;
-    console.log(`[tier ${tier}] skipped — ${reason}`);
+    const skipReason = `no weeks in range (offsets ${startWeek}–${endWeek}, effective=${effectiveWeeksAhead})`;
+    console.log(`[tier ${tier}] skipped — ${skipReason}`);
     report.skipped = true;
-    report.skipReason = reason;
-    collectorState.skippedRuns.push({ tier, at: new Date().toISOString(), reason });
+    report.skipReason = skipReason;
+    report.error = skipReason;
+    collectorState.skippedRuns.push({ tier, at: new Date().toISOString(), reason: skipReason });
     if (collectorState.skippedRuns.length > 30) collectorState.skippedRuns.shift();
     const skipRunId = await beginScrapeRun(tier);
-    await finishScrapeRun(skipRunId, { success: false, error: `skipped: ${reason}` });
+    await finishScrapeRun(skipRunId, { success: false, error: `skipped: ${skipReason}` });
     releaseScrapeLock();
+    recordTierRunState(tier, report, { reason });
     return report;
   }
 
   const tierStarted = Date.now();
-  console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek})`);
+  console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek}, dates ${targetDates.join(', ')})`);
 
   lastScrapeAttempt = new Date().toISOString();
   const scrapeRunId = await beginScrapeRun(tier);
@@ -4890,6 +5014,7 @@ async function runTierScrape(tier) {
   if (tier === 1) {
     checkCycle++;
     slotChecksThisCycle = 0;
+    collectorState.tier1TargetDates = targetDates;
   }
 
   const slotStats = { cached: 0, rechecked: 0, byReason: {}, queueLogged: false };
@@ -4905,7 +5030,7 @@ async function runTierScrape(tier) {
     const networkCapture = cfg.slotCounts ? installBookingNetworkCapture(page) : null;
     await openBookingPage(page);
 
-    const tierRequiredDates = expectedDatesForTier(tier);
+    const tierRequiredDates = targetDates.length ? targetDates : expectedDatesForTier(tier);
     const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
       await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
 
@@ -4913,8 +5038,13 @@ async function runTierScrape(tier) {
     const byKey = new Map(batch.map(s => [s.key, s]));
 
     if (cfg.slotCounts) {
-      await fillSlotCounts(page, batch, byKey, prevByKey, slotStats, { networkCapture });
-      applySlotCacheFallback(byKey);
+      try {
+        await fillSlotCounts(page, batch, byKey, prevByKey, slotStats, { networkCapture });
+        applySlotCacheFallback(byKey);
+      } catch (slotErr) {
+        report.slotCountsError = slotErr.message;
+        console.error(`  tier ${tier} slot counts failed (continuing with basic session data):`, slotErr.message);
+      }
     }
 
     const merged = [...byKey.values()];
@@ -4923,8 +5053,12 @@ async function runTierScrape(tier) {
       scrapeKind: cfg.slotCounts ? 'detailed' : 'basic',
     });
     if (datesSeen) recordTierDateCoverage(datesSeen);
+    for (const d of tierRequiredDates) {
+      datesCheckedDuringScrape.add(d);
+      persistedDatesChecked.add(d);
+    }
 
-    if (cfg.slotCounts) {
+    if (cfg.slotCounts && !report.slotCountsError) {
       syncSlotCacheAvailability(merged);
       const reasonParts = Object.entries(slotStats.byReason).map(([k, n]) => `${n} ${k}`);
       console.log(`  slot counts: ${slotStats.cached} from cache, ${slotStats.rechecked} re-checked${reasonParts.length ? ` (${reasonParts.join(', ')})` : ''}`);
@@ -4933,27 +5067,31 @@ async function runTierScrape(tier) {
     console.log(`  tier ${tier} summary: ${rawTilesTotal} tiles, ${weeksScraped} week(s), ${batch.length} in date range, ${updatedKeys.length} updated`);
     coverage = computeDateCoverage();
     console.log(`  tier ${tier} date coverage: ${coverage.earliestSessionDate || '?'} → ${coverage.latestSessionDate || '?'} (${coverage.uniqueDatesCount} days with sessions, ${coverage.sessionsCoveragePercent}% session coverage, ${coverage.coveragePercent}% dates checked)`);
-    await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
+    await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts && !report.slotCountsError });
 
     lastTierRun[tier] = new Date().toISOString();
     const durationMs = Date.now() - tierStarted;
     lastTierDurationMs[tier] = durationMs;
-    lastTierError[tier] = null;
+    lastTierError[tier] = report.slotCountsError || null;
     if (tier === 1) lastTier1DurationMs = durationMs;
     if (tier === 2) lastTier2DurationMs = durationMs;
     if (tier === 3) lastTier3DurationMs = durationMs;
     lastSuccessfulScrape = new Date().toISOString();
     lastCheck = lastSuccessfulScrape;
-    lastScrapeError = null;
-    lastScrapeErrorStack = null;
+    if (!report.slotCountsError) {
+      lastScrapeError = null;
+      lastScrapeErrorStack = null;
+    }
     hasFreshScrapeThisBoot = true;
     dataSource = supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback';
 
-    rowsUpserted = await upsertCurrentSessionsToSupabase(merged, tier, { scrapeKind: cfg.slotCounts ? 'detailed' : 'basic' });
+    rowsUpserted = await upsertCurrentSessionsToSupabase(merged, tier, {
+      scrapeKind: cfg.slotCounts && !report.slotCountsError ? 'detailed' : 'basic',
+    });
     snapshotsInserted = await saveAvailabilitySnapshotsToSupabase(
       merged,
       tier,
-      { snapshotType: cfg.slotCounts ? 'detailed' : 'basic' },
+      { snapshotType: cfg.slotCounts && !report.slotCountsError ? 'detailed' : 'basic' },
     );
     lastSnapshotRowsInsertedLastRun = snapshotsInserted;
     if (!cfg.slotCounts) {
@@ -4972,7 +5110,7 @@ async function runTierScrape(tier) {
     if (tier >= 2) lastFullCoverageScrape = lastSuccessfulScrape;
     if (tier === 1) await prunePastSessionsFromSupabase();
 
-    if (cfg.slotCounts) {
+    if (cfg.slotCounts && !report.slotCountsError) {
       const stillNeeding = merged.filter(s => s.available && !sessionHasDetailedData(s) && daysFromToday(sessionDateKey(s)) <= 1);
       if (stillNeeding.length) {
         console.log(`  tier 1 follow-up: ${stillNeeding.length} today/tomorrow session(s) still missing details`);
@@ -4996,11 +5134,13 @@ async function runTierScrape(tier) {
     report.snapshotsInserted = snapshotsInserted;
     report.durationMs = lastTierDurationMs[tier];
     updateTierNextRunEstimate(tier);
+    recordTierRunState(tier, report, { reason });
 
   } catch (e) {
     recordScrapeError(e, `tier ${tier} scrape`);
     lastTierError[tier] = lastScrapeError;
     report.errors.push({ error: lastScrapeError });
+    report.error = lastScrapeError;
     report.durationMs = Date.now() - tierStarted;
     lastTierDurationMs[tier] = report.durationMs;
     await saveScrapeErrorToSupabase(lastScrapeError);
@@ -5012,6 +5152,7 @@ async function runTierScrape(tier) {
       error: lastScrapeError,
       errorStack: lastScrapeErrorStack,
     });
+    recordTierRunState(tier, report, { reason });
   } finally {
     releaseScrapeLock();
     if (launched?.browser) await launched.browser.close().catch(() => {});
@@ -5446,6 +5587,18 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
       if (snapsError) throw snapsError;
       payload.latestSnapshotsForDate = snaps || [];
       payload.latestAvailabilitySnapshots = snaps || [];
+
+      payload.scrapeRunsForDate = (runs || [])
+        .filter((run) => run.tier === 1 || run.success)
+        .slice(0, 10);
+    }
+
+    payload.wasTodayInTier1TargetDates = tierTargetDates(1).includes(isoDate);
+    if (isoDate === getParkTodayIso()) {
+      payload.reasonTodayHasZeroSessions = reasonTodayHasZeroSessions(isoDate);
+      payload.tier1TargetDates = tierTargetDates(1);
+      payload.tier1LastResult = collectorState.tier1LastResult;
+      payload.tier1LastCompletedAt = collectorState.tier1LastCompletedAt || lastTierRun[1];
     }
 
     res.json(payload);
@@ -5553,13 +5706,23 @@ app.get('/api/debug/collector', async (_req, res) => {
 
 async function adminRunTierHandler(tier, req, res) {
   const wait = req.body?.wait === true || req.query?.wait === 'true';
+  const reason = req.body?.reason || `admin_run_tier${tier}`;
   try {
     if (scrapeInProgress && !wait) {
       return res.json({
         tier,
         started: false,
+        completed: false,
         skipped: true,
         skipReason: 'scrape_in_progress',
+        targetDates: tierTargetDates(tier),
+        sessionsFound: 0,
+        rowsUpserted: 0,
+        snapshotsInserted: 0,
+        durationMs: 0,
+        error: null,
+        blockingScrapeTier: currentScrapeTier,
+        blockingScrapeStartedAt: currentScrapeStartedAt,
         message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
       });
     }
@@ -5568,17 +5731,36 @@ async function adminRunTierHandler(tier, req, res) {
         const poll = setInterval(() => {
           if (!scrapeInProgress) { clearInterval(poll); resolve(); }
         }, 1000);
-        setTimeout(() => { clearInterval(poll); resolve(); }, 120_000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 180_000);
       });
     }
-    const report = await runTierScrape(tier);
+    const report = await runScheduledTier(tier, { reason });
     res.json({
       tier,
-      ...report,
+      started: report.started !== false,
+      completed: report.completed,
+      skipped: report.skipped,
+      skipReason: report.skipReason,
+      targetDates: report.targetDates,
+      sessionsFound: report.sessionsFound ?? 0,
+      rowsUpserted: report.rowsUpserted ?? 0,
+      snapshotsInserted: report.snapshotsInserted ?? 0,
+      durationMs: report.durationMs ?? 0,
+      error: report.error || report.errors?.[0]?.error || report.slotCountsError || null,
+      slotCountsError: report.slotCountsError ?? null,
+      blockingScrapeTier: report.blockingScrapeTier ?? null,
+      blockingScrapeStartedAt: report.blockingScrapeStartedAt ?? null,
       message: report.completed ? 'completed' : (report.skipped ? 'skipped' : 'failed'),
     });
   } catch (e) {
-    res.status(500).json({ tier, error: e.message, errors: [{ error: e.message }] });
+    res.status(500).json({
+      tier,
+      started: true,
+      completed: false,
+      skipped: false,
+      error: e.message,
+      errors: [{ error: e.message }],
+    });
   }
 }
 
@@ -5885,19 +6067,22 @@ function scheduleCronSafe(expression, handler, label) {
   return task;
 }
 
-function runTierScrapeAsync(tier, { reason = 'scheduled' } = {}) {
+async function runScheduledTier(tier, { reason = 'scheduled' } = {}) {
   console.log(`[collector] Tier ${tier} trigger (${reason})`);
-  runTierScrape(tier)
-    .then((report) => {
-      if (report.skipped) {
-        console.log(`[collector] Tier ${tier} skipped: ${report.skipReason}`);
-      } else if (report.completed) {
-        console.log(`[collector] Tier ${tier} completed in ${report.durationMs}ms — ${report.sessionsFound} sessions, ${report.rowsUpserted} upserted, ${report.snapshotsInserted} snapshots`);
-      } else if (report.errors?.length) {
-        console.error(`[collector] Tier ${tier} failed:`, report.errors[0]?.error);
-      }
-    })
-    .catch((e) => console.error(`[collector] Tier ${tier} error:`, e.message));
+  const report = await runTierScrape(tier, { reason });
+  recordTierRunState(tier, report, { reason });
+  if (report.skipped) {
+    console.log(`[collector] Tier ${tier} skipped: ${report.skipReason}`);
+  } else if (report.completed) {
+    console.log(`[collector] Tier ${tier} completed in ${report.durationMs}ms — ${report.sessionsFound} sessions, ${report.rowsUpserted} upserted, ${report.snapshotsInserted} snapshots`);
+  } else if (report.errors?.length || report.error) {
+    console.error(`[collector] Tier ${tier} failed:`, report.error || report.errors[0]?.error);
+  }
+  return report;
+}
+
+function runTierScrapeAsync(tier, { reason = 'scheduled' } = {}) {
+  runScheduledTier(tier, { reason }).catch((e) => console.error(`[collector] Tier ${tier} error:`, e.message));
 }
 
 async function buildCollectorDebugPayload() {
@@ -5954,12 +6139,22 @@ async function buildCollectorDebugPayload() {
     backgroundCollectorEnabled,
     scrapeScheduleEnabled: !!scrapeScheduleEnabled,
     schedulerStartedAt: collectorState.schedulerStartedAt,
-    tier1IntervalConfigured: collectorState.tier1Interval,
-    tier2IntervalConfigured: collectorState.tier2Interval,
-    tier3IntervalConfigured: collectorState.tier3Interval,
+    tier1IntervalConfigured: !!collectorState.cronTasks.tier1,
+    tier1IntervalCron: collectorState.tier1Interval,
+    tier2IntervalConfigured: !!collectorState.cronTasks.tier2,
+    tier2IntervalCron: collectorState.tier2Interval,
+    tier3IntervalConfigured: !!collectorState.cronTasks.tier3,
+    tier3IntervalCron: collectorState.tier3Interval,
     tier1NextRunAt: collectorState.tier1NextRunAt,
     tier2NextRunAt: collectorState.tier2NextRunAt,
     tier3NextRunAt: collectorState.tier3NextRunAt,
+    tier1LastAttemptAt: collectorState.tier1LastAttemptAt,
+    tier1LastCompletedAt: collectorState.tier1LastCompletedAt || lastTierRun[1],
+    tier1LastSkippedAt: collectorState.tier1LastSkippedAt,
+    tier1LastSkipReason: collectorState.tier1LastSkipReason,
+    tier1LastError: collectorState.tier1LastError || lastTierError[1],
+    tier1TargetDates: collectorState.tier1TargetDates || tierTargetDates(1),
+    tier1LastResult: collectorState.tier1LastResult,
     initialScrapeScheduled: collectorState.initialScrapeScheduled,
     lastTier1Scrape: lastTierRun[1],
     minutesSinceLastTier1: minutesSinceTier1,
@@ -5974,10 +6169,13 @@ async function buildCollectorDebugPayload() {
     lastTier2Error: lastTierError[2],
     lastTier3Error: lastTierError[3],
     scrapeInProgress,
+    currentScrapeTier,
+    currentScrapeStartedAt,
     weekDetectionInProgress,
     lastScrapeError,
     lastSuccessfulScrape,
     effectiveWeeksAhead,
+    parkTodayIso: getParkTodayIso(),
     skippedRunsRecent: collectorState.skippedRuns.slice(-10),
     recentScrapeRuns,
     currentSessionsByDate: currentSessionsByDateMap(),
@@ -6061,20 +6259,23 @@ function startBackgroundCollector() {
   updateTierNextRunEstimate(3);
 
   collectorState.initialScrapeScheduled = true;
-  console.log('  Initial scrape scheduled — Tier 1 in 15s, week detection in parallel');
+  console.log('  Initial scrape scheduled — Tier 1 in 10s (priority), week detection in parallel');
 
-  setTimeout(() => runTierScrapeAsync(1, { reason: 'startup_tier1' }), 15_000);
+  setTimeout(() => runTierScrapeAsync(1, { reason: 'startup_tier1' }), 10_000);
 
   setTimeout(() => {
     detectWeeksOnStartupWithTimeout().catch(console.error);
   }, 5_000);
 
   setTimeout(() => {
-    if (isCurrentSessionsSparse()) {
-      console.log('  Coverage sparse — scheduling startup Tier 2 in 60s');
+    if (isCurrentSessionsSparse() && !lastTierRun[1] && !scrapeInProgress) {
+      console.log('  Coverage sparse and Tier 1 not done — re-triggering Tier 1');
+      runTierScrapeAsync(1, { reason: 'startup_tier1_retry' });
+    } else if (isCurrentSessionsSparse() && lastTierRun[1] && !scrapeInProgress) {
+      console.log('  Coverage sparse — scheduling startup Tier 2');
       runTierScrapeAsync(2, { reason: 'startup_tier2_sparse' });
     }
-  }, 60_000);
+  }, 120_000);
 
   console.log('── Background collector ready ──\n');
 }

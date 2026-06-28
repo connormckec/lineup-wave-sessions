@@ -90,15 +90,19 @@ curl -s "http://localhost:3000/api/sessions?date=$(curl -s http://localhost:3000
 ## Collector scheduler verification
 
 ```bash
-curl -s http://localhost:3000/api/debug/collector | jq
-curl -s -X POST http://localhost:3000/api/admin/run-tier1 | jq
+curl -s http://localhost:3000/api/debug/collector | jq '{tier1IntervalConfigured,tier1NextRunAt,tier1LastAttemptAt,tier1LastCompletedAt,tier1LastSkippedAt,tier1LastSkipReason,tier1LastError,tier1TargetDates,tier1LastResult,lastTier1Scrape,minutesSinceLastTier1}'
+curl -s -X POST 'http://localhost:3000/api/admin/run-tier1?wait=true' | jq '{started,completed,skipped,skipReason,targetDates,sessionsFound,rowsUpserted,durationMs,error,blockingScrapeTier}'
+TODAY=$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso)
+curl -s "http://localhost:3000/api/debug/date/$TODAY" | jq '{sessionsCount,currentSessionsCountForDate,availabilitySnapshotsCountForDate,wasTodayInTier1TargetDates,reasonTodayHasZeroSessions,scrapeRunsForDate}'
 ```
 
-1. `scrapeScheduleEnabled` must be `true` after server boot.
-2. Within 15s of boot, initial Tier 1 should start (`initialScrapeScheduled: true`).
-3. Within 5–10 minutes, `lastTier1Scrape` should not be null.
-4. `recentScrapeRuns` should show tier 1/2/3 attempts in Supabase.
-5. Manual `POST /api/admin/run-tier1` returns `completed` with `sessionsFound > 0` when booking site is reachable.
+1. `scrapeScheduleEnabled` and `tier1IntervalConfigured` must be `true` after server boot.
+2. Within 10s of boot, initial Tier 1 should start (`initialScrapeScheduled: true`, `tier1LastAttemptAt` set).
+3. Within 5–10 minutes, `lastTier1Scrape` / `tier1LastCompletedAt` should not be null.
+4. `recentScrapeRuns` should show tier 1 attempts in Supabase (including skipped runs with error text).
+5. Manual `POST /api/admin/run-tier1?wait=true` returns `completed` or a clear `skipped`/`error` (never silent).
+6. If today has zero sessions, `reasonTodayHasZeroSessions` on `/api/debug/date/<today>` explains why.
+7. Tier 2 continues working; today populates after Tier 1 completes when the booking site has sessions.
 
 ---
 
