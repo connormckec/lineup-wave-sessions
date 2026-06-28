@@ -290,6 +290,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .sc-wave{font-size:12px;color:var(--sub);margin-top:4px;font-family:var(--font-body);font-weight:500}
 .sc-price{font-size:11px;color:var(--muted);margin-top:2px}
 .sc-booked{font-size:11px;color:var(--sub);margin-top:2px;line-height:1.35}
+.sc-detail-pending{font-size:10px;color:var(--muted);margin-top:2px;font-style:italic;opacity:.85}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
 .sc-right{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
 .sc-actions{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
@@ -675,6 +676,9 @@ function normalizeSessionRow(s) {
     session_type: level,
     time,
     wave: Number.isFinite(wave) ? wave : s.wave,
+    detailStatus: s.detailStatus || s.detail_status || null,
+    lastDetailedCheckAt: s.lastDetailedCheckAt || s.last_detailed_check_at || null,
+    lastBasicCheckAt: s.lastBasicCheckAt || s.last_basic_check_at || null,
   };
 }
 
@@ -1224,6 +1228,15 @@ function formatBookedLine(s, hist) {
   return `${slots} spot${slots === 1 ? '' : 's'} left`;
 }
 
+function formatDetailStatusLine(s) {
+  const status = s.detailStatus || s.detail_status;
+  if (!s.available) return '';
+  if (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null) return '';
+  if (status === 'checking') return 'checking details';
+  if (status === 'failed') return 'details unavailable';
+  return 'details pending';
+}
+
 const HOUR_OPTIONS = [];
 for (let h = 6; h <= 22; h++) {
   const ampm = h < 12 ? 'am' : 'pm';
@@ -1650,7 +1663,14 @@ function sessionConditionDisplay(s, hist) {
     return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots };
   }
   if (slots == null) {
-    return { primary: 'Open', sub: null, desktop: 'Open', color: '#00c9a7', slots: null };
+    const detailHint = formatDetailStatusLine(s);
+    return {
+      primary: 'Open',
+      sub: detailHint || null,
+      desktop: detailHint ? `Open · ${detailHint}` : 'Open',
+      color: '#00c9a7',
+      slots: null,
+    };
   }
   const primary = formatSpotCountShort(slots);
   let sub = null;
@@ -2045,6 +2065,7 @@ function sessionCardHtml(s) {
   const sideLabel = s.waveSide || waveLabel(s.wave);
   const price = formatPrice(s);
   const booked = formatBookedLine(s, hist);
+  const detailLine = formatDetailStatusLine(s);
 
   return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)">
     <div class="sc-accent" style="background:${accent}"></div>
@@ -2054,6 +2075,7 @@ function sessionCardHtml(s) {
       ${slotBarHtml(slots, s.level, cfg.c, dimmed, s)}
       <div class="sc-wave">${sideLabel}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
       ${booked ? `<div class="sc-booked">${booked}</div>` : ''}
+      ${!booked && detailLine ? `<div class="sc-detail-pending">${detailLine}</div>` : ''}
       ${price ? `<div class="sc-price">${price}</div>` : ''}
       <a class="book-link" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
     </div>
@@ -2159,7 +2181,9 @@ function renderDebugState() {
     ['schemaHealth', data.schemaHealth?.missingTables?.length
       ? `missing: ${data.schemaHealth.missingTables.join(', ')}`
       : (data.schemaHealth?.checkedAt ? 'ok' : '—')],
-    ['schemaActionRequired', data.schemaActionRequired || data.schemaHealth?.schemaActionRequired || '—'],
+    ['detailCoverage', data.detailCoveragePercent != null ? `${data.detailCoveragePercent}%` : '—'],
+    ['sessionsWithSlots', String(data.sessionsWithSlotsCount ?? '—')],
+    ['detailEnrichment', data.detailEnrichmentInProgress ? 'running' : (data.lastDetailEnrichmentAt || '—')],
     ['lastFetchError', selectedDateMeta.lastFetchError || lastFetchError || '—'],
     ['lastRenderError', lastRenderError || '—'],
     ['Date loading', selectedDateMeta.isLoading ? 'yes' : 'no'],

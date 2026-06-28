@@ -26,8 +26,8 @@ If you see:
 | `scrape_runs` | Yes | Scrape attempt audit log |
 | `watchlist_items` | Yes | Per-user Lineup / ntfy watches |
 | `notification_events` | Yes | Alert dedupe / debug log |
+| `session_enrichment_queue` | Yes | Background detail enrichment queue |
 | `date_coverage` | **No** | Not referenced in code |
-| `session_enrichment_queue` | **No** | Not referenced in code |
 
 ---
 
@@ -60,6 +60,12 @@ If you see:
 | `first_seen_at` | timestamptz | |
 | `last_seen_at` | timestamptz | |
 | `last_scraped_at` | timestamptz | |
+| `last_basic_check_at` | timestamptz | Set on basic tile scrape |
+| `last_detailed_check_at` | timestamptz | Set on modal/network detail scrape |
+| `detail_status` | text | `pending`, `checking`, `checked`, `failed` |
+| `detail_error` | text | e.g. `slots_exceed_capacity` |
+
+**Critical rule:** Basic scrapes must not null out `slots_available`, `capacity`, `estimated_booked`, `fill_rate`, or price fields when a newer detailed check exists.
 
 ### `scrape_snapshots`
 
@@ -95,7 +101,8 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
 | `GET /api/sessions` | Legacy: same as status payload when no `date` param |
 | `GET /api/schema/health` | Table probe results, `missingTables`, actionable message |
 | `GET /api/watchlist?user_key=` | User watchlist |
-| `GET /api/debug/date/:isoDate` | Date-level debug |
+| `GET /api/debug/date/:isoDate` | Date-level debug + enrichment queue rows |
+| `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date |
 
 ---
 

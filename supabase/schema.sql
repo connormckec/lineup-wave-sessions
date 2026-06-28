@@ -5,8 +5,7 @@
 -- Step 2: Confirm tables in Table Editor (especially current_sessions).
 -- Step 3: Hit GET /api/schema/health and GET /api/sessions?date=YYYY-MM-DD on your server.
 --
--- NOT used by the app (do not create unless you add features later):
---   date_coverage, session_enrichment_queue
+-- NOT used by the app: date_coverage
 
 -- Operational scrape state (meta only — sessions live in current_sessions)
 create table if not exists scrape_snapshots (
@@ -45,6 +44,10 @@ create table if not exists current_sessions (
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   last_scraped_at timestamptz not null default now(),
+  last_basic_check_at timestamptz,
+  last_detailed_check_at timestamptz,
+  detail_status text,
+  detail_error text,
   primary key (park, session_key)
 );
 
@@ -77,6 +80,7 @@ create table if not exists availability_snapshots (
   currency text default 'USD',
   status_label text,
   source_tier integer,
+  snapshot_type text default 'basic',
   raw jsonb
 );
 
@@ -171,6 +175,31 @@ create table if not exists notification_events (
 create index if not exists notification_events_session_idx
   on notification_events (session_key, created_at desc);
 
+-- Background detail enrichment queue (slots/capacity/price for future dates)
+create table if not exists session_enrichment_queue (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  park text not null default 'atlantic_park',
+  session_key text not null,
+  iso_date date,
+  priority integer not null default 2,
+  reason text,
+  status text not null default 'pending',
+  attempts integer not null default 0,
+  last_attempt_at timestamptz,
+  last_error text
+);
+
+create unique index if not exists session_enrichment_queue_park_session_idx
+  on session_enrichment_queue (park, session_key);
+
+create index if not exists session_enrichment_queue_status_priority_idx
+  on session_enrichment_queue (status, priority, created_at);
+
+create index if not exists session_enrichment_queue_iso_date_idx
+  on session_enrichment_queue (iso_date);
+
 -- Column migrations for existing deployments (safe when tables exist from above)
 alter table watchlist_items add column if not exists alert_when_selling_fast boolean not null default true;
 alter table watchlist_items add column if not exists fast_drop_threshold integer not null default 3;
@@ -190,11 +219,16 @@ alter table current_sessions add column if not exists price_text text;
 alter table current_sessions add column if not exists price_min numeric;
 alter table current_sessions add column if not exists price_max numeric;
 alter table current_sessions add column if not exists currency text default 'USD';
+alter table current_sessions add column if not exists last_basic_check_at timestamptz;
+alter table current_sessions add column if not exists last_detailed_check_at timestamptz;
+alter table current_sessions add column if not exists detail_status text;
+alter table current_sessions add column if not exists detail_error text;
 
 alter table availability_snapshots add column if not exists price_text text;
 alter table availability_snapshots add column if not exists price_min numeric;
 alter table availability_snapshots add column if not exists price_max numeric;
 alter table availability_snapshots add column if not exists currency text default 'USD';
+alter table availability_snapshots add column if not exists snapshot_type text default 'basic';
 
 alter table scrape_runs add column if not exists coverage_percent integer;
 

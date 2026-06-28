@@ -36,6 +36,41 @@ See [`AUDIT.md`](AUDIT.md) for the full table/column/API contract.
 
 ---
 
+## Future session detail enrichment
+
+After deploying schema changes, run updated [`supabase/schema.sql`](supabase/schema.sql) (adds `detail_status`, `session_enrichment_queue`, `snapshot_type`).
+
+1. **Status — detail coverage:**
+
+```bash
+curl -s http://localhost:3000/api/status | jq '{detailCoveragePercent, sessionsWithSlotsCount, sessionsWithCapacityCount, sessionsWithPriceCount, enrichmentQueuePending, detailEnrichmentInProgress, lastDetailEnrichmentAt}'
+```
+
+2. **Browse a future date** — sessions appear immediately; open sessions without slots show *details pending*.
+
+3. **Debug a date:**
+
+```bash
+curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{sessionsCount, sessionsWithSlotsCount, sessionsWithCapacityCount, sessionsWithPriceCount, detailStatusSummary, latestLastDetailedCheckAt, sampleSessions}'
+```
+
+4. **Force enrichment:**
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/enrich-date \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-07-02"}' | jq
+```
+
+5. Confirm Jul 2 sessions gain slots/capacity/price where the booking site exposes them.
+6. Repeat for `2026-07-10`.
+7. Confirm today/tomorrow still show detailed counts after Tier 1 refresh.
+8. Confirm future sessions remain visible when details are pending (not hidden).
+9. Confirm `availability_snapshots` rows include `snapshot_type` `basic` and `detailed`.
+10. Confirm app loads saved data immediately on hard refresh.
+
+---
+
 ## Supabase availability collector
 
 ### Prerequisites

@@ -60,6 +60,34 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - Debug a single date: `GET /api/debug/date/YYYY-MM-DD` — session count, scrape runs, snapshots, and UI reason.
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
+### Future session detail enrichment
+
+Two scrape levels run in parallel:
+
+1. **Basic calendar scrape** (Tiers 1–4) — fast tile discovery across `SCRAPE_WEEKS_AHEAD`. Finds session identity, open/packed, wave side, level, and optional tile price text.
+2. **Detail enrichment** — slower modal (or network JSON when available) scrape for `slots_available`, `capacity`, `estimated_booked`, `fill_rate`, and price. Runs on a priority queue in the background.
+
+**Rules:**
+
+- Saved/basic sessions render immediately — enrichment never blocks the UI.
+- Basic scrapes **never overwrite** detailed slot/capacity/price fields with null.
+- Opening a date in Browse enqueues background enrichment for that date.
+- `POST /api/admin/enrich-date` with `{ "isoDate": "2026-07-02" }` forces detail collection for a date.
+
+**Schedule:**
+
+| Priority | Coverage | Frequency |
+|----------|----------|-----------|
+| P1 | Watched, selected date, today/tomorrow, next 48h | Every `CHECK_EVERY_MINS` (default 5 min) |
+| P2 | Next 7 days | Every `ENRICHMENT_TIER2_EVERY_MINS` (default 45 min) |
+| P3 | Weeks 2–4 | Every 6 hours (with Tier 3 scrape) |
+
+**Status fields:** `detailCoveragePercent`, `sessionsWithSlotsCount`, `sessionsWithCapacityCount`, `sessionsWithPriceCount`, `enrichmentQueuePending`, `detailEnrichmentInProgress`, `lastDetailEnrichmentAt`.
+
+**Railway:** Disable App Sleep / Serverless sleep so background scrapes and enrichment run on schedule. Playwright/Chromium is CPU-heavy — consider a dedicated worker service or upgraded compute if enrichment is slow.
+
+See [`AUDIT.md`](AUDIT.md) for schema columns (`detail_status`, `last_detailed_check_at`, `session_enrichment_queue`).
+
 ### Browser cache and local state
 
 - **API routes** (`/api/*`) send `Cache-Control: no-store` — responses are never cached by the browser or service worker.
