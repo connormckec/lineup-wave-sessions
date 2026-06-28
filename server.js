@@ -141,8 +141,22 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
   }
 }
 
+function normalizeDataSource(src) {
+  if (src === 'supabase-current' || src === 'supabase-cache' || src === 'supabase') return 'supabase';
+  if (src === 'memory' && supabaseConfigured) return 'supabase';
+  return 'memory-fallback';
+}
+
 function currentRowToSession(row) {
   const raw = row.raw && typeof row.raw === 'object' ? row.raw : {};
+  const capacity = row.capacity ?? raw.capacity ?? null;
+  const slots = row.slots_available ?? raw.slots ?? null;
+  let estimatedBooked = row.estimated_booked ?? raw.estimatedBooked ?? null;
+  let fillRate = row.fill_rate ?? raw.fillRate ?? null;
+  if (capacity != null && slots != null && estimatedBooked == null) {
+    estimatedBooked = capacity - slots;
+    fillRate = estimatedBooked / capacity;
+  }
   return {
     ...raw,
     key: row.session_key,
@@ -155,7 +169,14 @@ function currentRowToSession(row) {
     waveSide: row.wave_side || raw.waveSide,
     level: row.session_type || raw.level,
     available: row.available,
-    slots: row.slots_available ?? raw.slots ?? null,
+    slots,
+    capacity,
+    estimatedBooked,
+    fillRate,
+    priceText: row.price_text ?? raw.priceText ?? null,
+    priceMin: row.price_min ?? raw.priceMin ?? null,
+    priceMax: row.price_max ?? raw.priceMax ?? null,
+    currency: row.currency ?? raw.currency ?? 'USD',
     tier: row.source_tier ?? raw.tier,
     lastScraped: row.last_scraped_at || raw.lastScraped,
   };
@@ -163,6 +184,14 @@ function currentRowToSession(row) {
 
 function sessionToCurrentRow(s, sourceTier) {
   const now = new Date().toISOString();
+  const capacity = s.capacity ?? sessionCapacityForLevel(s.level);
+  const slots = s.slots ?? null;
+  let estimatedBooked = s.estimatedBooked ?? null;
+  let fillRate = s.fillRate ?? null;
+  if (capacity != null && slots != null && estimatedBooked == null) {
+    estimatedBooked = capacity - slots;
+    fillRate = estimatedBooked / capacity;
+  }
   return {
     park: PARK,
     session_key: s.key,
@@ -174,7 +203,14 @@ function sessionToCurrentRow(s, sourceTier) {
     wave_side: s.waveSide || null,
     session_type: s.level || null,
     available: s.available,
-    slots_available: s.slots ?? null,
+    slots_available: slots,
+    capacity,
+    estimated_booked: estimatedBooked,
+    fill_rate: fillRate,
+    price_text: s.priceText ?? null,
+    price_min: s.priceMin ?? null,
+    price_max: s.priceMax ?? null,
+    currency: s.currency || 'USD',
     status_label: availabilityStatusLabel(s),
     source_tier: sourceTier,
     raw: s,
@@ -203,10 +239,12 @@ function getStatusFields() {
   const dataAgeMinutes = lastSuccessfulScrape
     ? Math.max(0, Math.round((Date.now() - new Date(lastSuccessfulScrape).getTime()) / 60000))
     : null;
+  const coverage = computeDateCoverage();
   return {
     sessionsCount: sessions.length,
     currentSessionsCount: sessions.length,
-    source: dataSource,
+    source: normalizeDataSource(dataSource),
+    dataSource: normalizeDataSource(dataSource),
     supabaseConfigured,
     supabaseInitError,
     isUsingCachedData: sessions.length > 0 && !hasFreshScrapeThisBoot,
@@ -221,9 +259,18 @@ function getStatusFields() {
     historySnapshotsEnabled: supabaseConfigured && HISTORY_SNAPSHOTS_ENABLED,
     snapshotRowsInsertedLastRun: lastSnapshotRowsInsertedLastRun,
     minutesSinceLastScrape: dataAgeMinutes,
+    missingDatesInScrapeWindow: coverage.missingDatesInScrapeWindow,
+    coveragePercent: coverage.coveragePercent,
     scrapeScheduleEnabled,
     serverStartedAt,
   };
+}
+
+async function ensureSessionsForStatus() {
+  if (sessions.length > 0) return;
+  if (!supabase) return;
+  const loaded = await loadCurrentSessionsFromSupabase();
+  if (!loaded) await loadLatestSnapshotFromSupabase();
 }
 
 function waveSideSlug(side) {
@@ -306,7 +353,7 @@ async function loadCurrentSessionsFromSupabase() {
       }
     }
 
-    dataSource = 'supabase-current';
+    dataSource = 'supabase';
     hasFreshScrapeThisBoot = false;
 
     const age = lastSuccessfulScrape
@@ -365,6 +412,7 @@ async function finishScrapeRun(runId, {
   sessionsFound = null,
   datesCovered = null,
   missingDates = null,
+  coveragePercent = null,
   error = null,
   errorStack = null,
 } = {}) {
@@ -378,6 +426,7 @@ async function finishScrapeRun(runId, {
         sessions_found: sessionsFound,
         dates_covered: datesCovered,
         missing_dates: missingDates,
+        coverage_percent: coveragePercent,
         error,
         error_stack: errorStack,
       })
@@ -405,7 +454,7 @@ async function loadLatestSnapshotFromSupabase() {
     applyLoadedSnapshot(data.sessions, data.scrape_meta, data.last_successful_scrape);
     lastScrapeAttempt = data.last_scrape_attempt || null;
     lastScrapeError = data.last_scrape_error || null;
-    dataSource = 'supabase-cache';
+    dataSource = 'supabase';
     hasFreshScrapeThisBoot = false;
 
     const age = lastSuccessfulScrape
@@ -473,6 +522,50 @@ function sessionCapacityForLevel(level) {
   return 12;
 }
 
+function parsePriceFromText(text) {
+  if (!text) return {};
+  const currency = 'USD';
+  const rangeMatch = text.match(/\$\s*([\d,]+(?:\.\d{2})?)\s*[–\-]\s*\$\s*([\d,]+(?:\.\d{2})?)/);
+  if (rangeMatch) {
+    const min = parseFloat(rangeMatch[1].replace(/,/g, ''));
+    const max = parseFloat(rangeMatch[2].replace(/,/g, ''));
+    return {
+      price_text: `$${rangeMatch[1].replace(/,/g, '')}–$${rangeMatch[2].replace(/,/g, '')}`,
+      price_min: min,
+      price_max: max,
+      currency,
+    };
+  }
+  const singleMatch = text.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+  if (singleMatch) {
+    const v = parseFloat(singleMatch[1].replace(/,/g, ''));
+    return {
+      price_text: `$${singleMatch[1].replace(/,/g, '')}`,
+      price_min: v,
+      price_max: v,
+      currency,
+    };
+  }
+  return {};
+}
+
+function attachSessionMetrics(entry, details, level) {
+  if (!entry) return;
+  const slots = entry.slots ?? details?.slots ?? null;
+  const capacity = details?.capacity ?? entry.capacity ?? sessionCapacityForLevel(level);
+  if (capacity != null && slots != null) {
+    entry.capacity = capacity;
+    entry.estimatedBooked = capacity - slots;
+    entry.fillRate = entry.estimatedBooked / capacity;
+  }
+  if (details?.price_text) {
+    entry.priceText = details.price_text;
+    entry.priceMin = details.price_min;
+    entry.priceMax = details.price_max;
+    entry.currency = details.currency || 'USD';
+  }
+}
+
 function availabilityStatusLabel(s) {
   if (!s.available) return 'PACKED';
   if (s.slots == null) return 'OPEN';
@@ -490,11 +583,11 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) 
   try {
     const scrapedAt = new Date().toISOString();
     const rows = batch.map((s) => {
-      const capacity = sessionCapacityForLevel(s.level);
+      const capacity = s.capacity ?? sessionCapacityForLevel(s.level);
       const slotsAvailable = s.slots != null ? s.slots : null;
-      let estimatedBooked = null;
-      let fillRate = null;
-      if (capacity != null && slotsAvailable != null) {
+      let estimatedBooked = s.estimatedBooked ?? null;
+      let fillRate = s.fillRate ?? null;
+      if (capacity != null && slotsAvailable != null && estimatedBooked == null) {
         estimatedBooked = capacity - slotsAvailable;
         fillRate = estimatedBooked / capacity;
       }
@@ -513,6 +606,10 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier) 
         capacity,
         estimated_booked: estimatedBooked,
         fill_rate: fillRate,
+        price_text: s.priceText ?? null,
+        price_min: s.priceMin ?? null,
+        price_max: s.priceMax ?? null,
+        currency: s.currency || 'USD',
         status_label: availabilityStatusLabel(s),
         source_tier: sourceTier,
         raw: s,
@@ -589,6 +686,7 @@ function watchItemToClient(w) {
     level: w.session_type,
     session_type: w.session_type,
     wave_side: w.wave_side,
+    waveSide: w.wave_side,
     iso_date: w.iso_date,
     time: w.time || w.start_time,
     date: w.date || w.display_date,
@@ -599,11 +697,89 @@ function watchItemToClient(w) {
   };
 }
 
+function canonicalSessionForWatch(w) {
+  const key = w.session_key;
+  let live = sessionsByKey.get(key);
+  if (!live && w.start_ts != null && w.wave != null) {
+    live = sessionsByKey.get(`${w.start_ts}_${w.wave}`);
+  }
+  if (!live && w.iso_date && w.time) {
+    live = sessions.find(s =>
+      (s.isoDate || s.dateKey) === w.iso_date
+      && s.time === (w.time || w.start_time)
+      && (!w.session_type || s.level === w.session_type)
+    ) || null;
+  }
+  return live;
+}
+
+const pendingWatchSideSync = new Set();
+
+async function syncWatchSideToSupabase(watch) {
+  if (!supabase || !watch?.id) return;
+  try {
+    await supabase.from('watchlist_items').update({
+      wave_side: watch.wave_side,
+      wave: watch.wave,
+    }).eq('id', watch.id);
+  } catch (e) {
+    console.error('  watchlist wave_side sync failed:', e.message);
+  }
+}
+
+function queueWatchSideSync(watch) {
+  if (!watch?.id || pendingWatchSideSync.has(watch.id)) return;
+  pendingWatchSideSync.add(watch.id);
+  syncWatchSideToSupabase(watch).finally(() => pendingWatchSideSync.delete(watch.id));
+}
+
+function enrichWatchItemForClient(w) {
+  const base = watchItemToClient(w);
+  const live = canonicalSessionForWatch(w);
+  if (!live) return base;
+
+  if (live.waveSide && live.waveSide !== w.wave_side) {
+    w.wave_side = live.waveSide;
+    w.wave = live.wave ?? w.wave;
+    queueWatchSideSync(w);
+  }
+
+  return {
+    ...base,
+    wave: live.wave ?? base.wave,
+    wave_side: live.waveSide ?? base.wave_side,
+    waveSide: live.waveSide ?? base.wave_side,
+    slots: live.slots,
+    available: live.available,
+    capacity: live.capacity,
+    estimatedBooked: live.estimatedBooked,
+    priceText: live.priceText,
+  };
+}
+
+function buildWatchlistSideDebug(userKey) {
+  const items = userKey
+    ? activeWatchItems().filter(w => w.user_key === userKey)
+    : activeWatchItems();
+  return items.slice(0, 30).map(w => {
+    const live = canonicalSessionForWatch(w);
+    return {
+      session_key: w.session_key,
+      stored_wave_side: w.wave_side,
+      current_wave_side: live?.waveSide ?? null,
+      wave: live?.wave ?? w.wave,
+      iso_date: w.iso_date || live?.isoDate || live?.dateKey,
+      time: w.time || w.start_time || live?.time,
+      session_type: w.session_type || live?.level,
+    };
+  });
+}
+
 function watchlistForUser(userKey) {
   if (!userKey) return [];
   return activeWatchItems()
     .filter(w => w.user_key === userKey)
-    .map(watchItemToClient);
+    .map(enrichWatchItemForClient);
 }
 
 function watchAlertDefaults(row = {}) {
@@ -931,6 +1107,11 @@ async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false 
       });
     }
 
+    if (session.waveSide && session.waveSide !== watch.wave_side) {
+      watch.wave_side = session.waveSide;
+      watch.wave = session.wave ?? watch.wave;
+    }
+
     watch.last_seen_available = !!(session.available && session.slots !== 0);
     watch.last_seen_slots_available = session.slots ?? null;
     watch.last_seen_at = now;
@@ -1081,19 +1262,21 @@ function buildWatchRow(body) {
   const sessionKey = session_key || key;
   if (!user_key || !sessionKey) return null;
 
+  const live = sessionsByKey.get(sessionKey);
+
   return {
     user_key,
     ntfy_topic: (ntfy_topic || '').trim() || null,
     session_key: sessionKey,
-    iso_date: iso_date || dateKey || null,
-    start_ts: start_ts ?? ts ?? null,
-    wave_side: wave_side || waveSide || null,
-    session_type: session_type || level || null,
-    start_time: time || null,
-    time: time || null,
-    date: date || null,
-    day_label: dayLabel || null,
-    wave: wave != null ? +wave : null,
+    iso_date: iso_date || dateKey || live?.isoDate || live?.dateKey || null,
+    start_ts: start_ts ?? ts ?? live?.ts ?? null,
+    wave_side: live?.waveSide || wave_side || waveSide || null,
+    session_type: session_type || level || live?.level || null,
+    start_time: time || live?.time || null,
+    time: time || live?.time || null,
+    date: date || live?.date || null,
+    day_label: dayLabel || live?.dayLabel || null,
+    wave: live?.wave ?? (wave != null ? +wave : null),
     ...watchAlertDefaults({
       alert_when_opens,
       alert_when_low_slots,
@@ -1250,32 +1433,32 @@ async function closeModal(page, label = '') {
   return gone;
 }
 
-async function getSlotCount(page, ts, wave) {
+async function getSessionModalDetails(page, ts, wave) {
   const label = `${ts}_${wave}`;
-  console.log(`\n[getSlotCount ${label}] starting`);
+  console.log(`\n[getSessionModalDetails ${label}] starting`);
 
   try {
     const tileSel = `div[class*="booking-agenda-clickable_${ts}_${wave}"]`;
     const tile = await page.$(tileSel);
     if (!tile) {
-      console.log(`  [getSlotCount ${label}] tile not found (${tileSel})`);
+      console.log(`  [getSessionModalDetails ${label}] tile not found (${tileSel})`);
       return null;
     }
-    console.log(`  [getSlotCount ${label}] tile found, clicking...`);
+    console.log(`  [getSessionModalDetails ${label}] tile found, clicking...`);
 
     await tile.click({ timeout: 10_000 });
-    console.log(`  [getSlotCount ${label}] tile click registered`);
+    console.log(`  [getSessionModalDetails ${label}] tile click registered`);
 
     const modal = await waitForModal(page, label);
     if (!modal) {
-      console.log(`  [getSlotCount ${label}] abort — modal never appeared`);
+      console.log(`  [getSessionModalDetails ${label}] abort — modal never appeared`);
       return null;
     }
 
     const screenshotPath = path.join(__dirname, 'debug-modal.png');
     if (process.env.DEBUG_MODAL === '1') {
       await page.screenshot({ path: screenshotPath });
-      console.log(`  [getSlotCount ${label}] debug screenshot saved → ${screenshotPath}`);
+      console.log(`  [getSessionModalDetails ${label}] debug screenshot saved → ${screenshotPath}`);
     }
 
     await findPlusButton(modal, label, true);
@@ -1284,35 +1467,64 @@ async function getSlotCount(page, ts, wave) {
     for (let i = 0; i < MAX_SLOT_CLICKS; i++) {
       const btn = await findPlusButton(modal, label, false);
       if (!btn) {
-        console.log(`  [getSlotCount ${label}] click ${i + 1}: no visible + button found, stopping`);
+        console.log(`  [getSessionModalDetails ${label}] click ${i + 1}: no visible + button found, stopping`);
         break;
       }
       if (await isPlusDisabled(btn)) {
-        console.log(`  [getSlotCount ${label}] click ${i + 1}: + button disabled, stopping at ${n}`);
+        console.log(`  [getSessionModalDetails ${label}] click ${i + 1}: + button disabled, stopping at ${n}`);
         break;
       }
       await btn.click({ timeout: 5_000 });
       n++;
       const qty = await modal.locator('input.qty-info').last().inputValue().catch(() => '?');
-      console.log(`  [getSlotCount ${label}] click ${i + 1}: + clicked, count=${n}, qty-input=${qty}`);
+      console.log(`  [getSessionModalDetails ${label}] click ${i + 1}: + clicked, count=${n}, qty-input=${qty}`);
       await page.waitForTimeout(120);
     }
 
     if (n > 20) {
-      console.warn(`  [getSlotCount ${label}] WARNING: ${n} clicks — exceeds expected max (Progressive≈18, Pro≈10); + button detection may have run away`);
+      console.warn(`  [getSessionModalDetails ${label}] WARNING: ${n} clicks — exceeds expected max; + button detection may have run away`);
     }
 
-    console.log(`  [getSlotCount ${label}] result: ${n} available slot(s)`);
+    let priceInfo = {};
+    let capacityFromModal = null;
+    try {
+      const meta = await modal.evaluate(() => {
+        const el = document.querySelector('.modal.in, .modal.show, .modal, [role="dialog"]') || document.body;
+        const text = el.innerText || '';
+        const qty = document.querySelector('input.qty-info');
+        const maxAttr = qty?.getAttribute('max');
+        const maxQty = maxAttr ? parseInt(maxAttr, 10) : null;
+        return { text, maxQty: Number.isFinite(maxQty) && maxQty > 0 ? maxQty : null };
+      });
+      priceInfo = parsePriceFromText(meta.text);
+      if (meta.maxQty) capacityFromModal = meta.maxQty;
+      if (priceInfo.price_text) {
+        console.log(`  [getSessionModalDetails ${label}] price: ${priceInfo.price_text}`);
+      }
+    } catch (pe) {
+      console.log(`  [getSessionModalDetails ${label}] price parse skipped: ${pe.message}`);
+    }
+
+    console.log(`  [getSessionModalDetails ${label}] result: ${n} available slot(s)`);
     await closeModal(page, label);
-    return n > 0 ? n : null;
+    return {
+      slots: n > 0 ? n : null,
+      capacity: capacityFromModal,
+      ...priceInfo,
+    };
 
   } catch (e) {
-    console.error(`  [getSlotCount ${label}] ERROR: ${e.message}`);
+    console.error(`  [getSessionModalDetails ${label}] ERROR: ${e.message}`);
     try { await closeModal(page, label); } catch (ce) {
-      console.error(`  [getSlotCount ${label}] close after error failed: ${ce.message}`);
+      console.error(`  [getSessionModalDetails ${label}] close after error failed: ${ce.message}`);
     }
     return null;
   }
+}
+
+async function getSlotCount(page, ts, wave) {
+  const details = await getSessionModalDetails(page, ts, wave);
+  return details?.slots ?? null;
 }
 
 // Parse session tiles currently visible in the agenda DOM.
@@ -1727,7 +1939,9 @@ async function fillSlotCounts(page, batch, byKey, prevByKey, stats) {
       break;
     }
 
-    entry.slots = await getSlotCount(page, s.ts, s.wave);
+    const details = await getSessionModalDetails(page, s.ts, s.wave);
+    entry.slots = details?.slots ?? null;
+    if (details) attachSessionMetrics(entry, details, s.level);
     slotChecksThisCycle++;
     stats.rechecked++;
     stats.byReason[reason] = (stats.byReason[reason] || 0) + 1;
@@ -2059,6 +2273,11 @@ function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
     if (preserveSlots && existing?.slots != null && merged.slots == null) {
       merged.slots = existing.slots;
     }
+    if (existing) {
+      for (const field of ['capacity', 'estimatedBooked', 'fillRate', 'priceText', 'priceMin', 'priceMax', 'currency']) {
+        if (existing[field] != null && merged[field] == null) merged[field] = existing[field];
+      }
+    }
     sessionsByKey.set(raw.key, merged);
     updatedKeys.push(raw.key);
     logWaveSideParse(merged);
@@ -2192,7 +2411,7 @@ async function runTierScrape(tier) {
     lastScrapeError = null;
     lastScrapeErrorStack = null;
     hasFreshScrapeThisBoot = true;
-    dataSource = 'memory';
+    dataSource = supabaseConfigured ? 'supabase' : 'memory-fallback';
 
     await upsertCurrentSessionsToSupabase(merged, tier);
     lastSnapshotRowsInsertedLastRun = await saveAvailabilitySnapshotsToSupabase(merged, tier);
@@ -2203,6 +2422,7 @@ async function runTierScrape(tier) {
       sessionsFound: merged.length,
       datesCovered: coverage.coveredDatesCount,
       missingDates: coverage.missingDatesInScrapeWindow,
+      coveragePercent: coverage.coveragePercent,
     });
 
   } catch (e) {
@@ -2252,6 +2472,7 @@ function statusPayload(userKey = null) {
     internalBetaNotifications: INTERNAL_BETA,
     internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
     watchlistCount: activeWatchItems().length,
+    watchlistSideDebug: buildWatchlistSideDebug(userKey),
     waveSideDebug: {
       ambiguousCount: ambiguousSideMappings.length,
       ambiguousSamples: ambiguousSideMappings.slice(-10),
@@ -2270,12 +2491,24 @@ function statusPayload(userKey = null) {
   };
 }
 
-app.get('/api/status', (req, res) => {
-  res.json(statusPayload(req.query.user_key || null));
+app.get('/api/status', async (req, res) => {
+  try {
+    await ensureSessionsForStatus();
+    res.json(statusPayload(req.query.user_key || null));
+  } catch (e) {
+    console.error('/api/status error:', e.message);
+    res.json({ ...statusPayload(req.query.user_key || null), statusError: e.message });
+  }
 });
 
-app.get('/api/sessions', (req, res) => {
-  res.json(statusPayload(req.query.user_key || null));
+app.get('/api/sessions', async (req, res) => {
+  try {
+    await ensureSessionsForStatus();
+    res.json(statusPayload(req.query.user_key || null));
+  } catch (e) {
+    console.error('/api/sessions error:', e.message);
+    res.json({ ...statusPayload(req.query.user_key || null), statusError: e.message });
+  }
 });
 
 app.get('/api/debug/scrape', (_req, res) => {

@@ -22,6 +22,13 @@ create table if not exists current_sessions (
   session_type text,
   available boolean,
   slots_available integer,
+  capacity integer,
+  estimated_booked integer,
+  fill_rate numeric,
+  price_text text,
+  price_min numeric,
+  price_max numeric,
+  currency text default 'USD',
   status_label text,
   source_tier integer,
   raw jsonb,
@@ -54,6 +61,10 @@ create table if not exists availability_snapshots (
   capacity integer,
   estimated_booked integer,
   fill_rate numeric,
+  price_text text,
+  price_min numeric,
+  price_max numeric,
+  currency text default 'USD',
   status_label text,
   source_tier integer,
   raw jsonb
@@ -79,6 +90,7 @@ create table if not exists scrape_runs (
   sessions_found integer,
   dates_covered integer,
   missing_dates text[],
+  coverage_percent integer,
   error text,
   error_stack text
 );
@@ -165,3 +177,19 @@ alter table notification_events add column if not exists event_reason text;
 
 create index if not exists notification_events_session_idx
   on notification_events (session_key, created_at desc);
+
+-- Migrations for existing deployments
+alter table current_sessions add column if not exists capacity integer;
+alter table current_sessions add column if not exists estimated_booked integer;
+alter table current_sessions add column if not exists fill_rate numeric;
+alter table current_sessions add column if not exists price_text text;
+alter table current_sessions add column if not exists price_min numeric;
+alter table current_sessions add column if not exists price_max numeric;
+alter table current_sessions add column if not exists currency text default 'USD';
+
+alter table availability_snapshots add column if not exists price_text text;
+alter table availability_snapshots add column if not exists price_min numeric;
+alter table availability_snapshots add column if not exists price_max numeric;
+alter table availability_snapshots add column if not exists currency text default 'USD';
+
+alter table scrape_runs add column if not exists coverage_percent integer;

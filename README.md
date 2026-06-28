@@ -40,7 +40,16 @@ Open http://localhost:3000 to browse sessions and add watches.
 2. Run the full SQL in [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL editor.
 3. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your environment (server only — never expose to the frontend).
 
-On startup the server loads saved sessions from `current_sessions` before accepting requests, so the dashboard shows data immediately after refresh.
+On startup the server loads saved sessions from `current_sessions` before accepting requests. The UI treats Supabase as source of truth: saved sessions render immediately, background scrapes refresh in place, and failed scrapes never wipe visible data.
+
+### Stabilization behavior
+
+- **`GET /api/status`** returns saved sessions immediately; if memory is empty it reloads from Supabase first.
+- While a scrape runs, the header shows **`checked Xm ago · refreshing…`** and sessions stay on screen.
+- If a refresh fails, the app keeps last known good data with **`showing saved data · refresh failed`**.
+- **`dataSource`**: `"supabase"` when serving persisted data, `"memory-fallback"` when Supabase is unavailable.
+- Status fields include `currentSessionsCount`, `lastSuccessfulScrape`, `lastScrapeAttempt`, `minutesSinceLastScrape`, `scrapeInProgress`, `missingDatesInScrapeWindow`, `coveragePercent`, and `watchlistSideDebug` (stored vs canonical wave side).
+- Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
 ## Environment variables
 
@@ -75,7 +84,7 @@ Check collector health via `/api/status`:
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/status` | Live sessions + scrape state (`scrapeInProgress`, `currentSessionsCount`, `snapshotRowsInsertedLastRun`, date coverage) |
+| `GET /api/status` | Live sessions + scrape state (`scrapeInProgress`, `currentSessionsCount`, `dataSource`, `coveragePercent`, `missingDatesInScrapeWindow`, `watchlistSideDebug`, date coverage) |
 | `GET /api/analytics/availability-summary` | Aggregate stats from recent `availability_snapshots` |
 | `POST /api/notify/test` | Send a test ntfy notification |
 

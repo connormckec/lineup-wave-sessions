@@ -12,7 +12,24 @@
 1. Ensure `current_sessions` has rows (from a prior successful scrape, or seed manually).
 2. Restart the server: `npm start`.
 3. Open http://localhost:3000 — sessions should appear on first load without waiting for a scrape.
-4. Confirm startup log: `Serving N saved session(s) (supabase-current)`.
+4. Confirm startup log: `Serving N saved session(s) (supabase)`.
+
+### Stabilization / never-blank refresh
+
+1. With saved rows in `current_sessions`, hard-refresh the browser.
+2. Sessions should appear immediately (from API or local cache) — not a blank list while `scrapeInProgress` is true.
+3. Header while scraping: `checked Xm ago · refreshing…`.
+4. Simulate API returning empty sessions during scrape — UI should keep last cached sessions visible.
+5. Confirm `/api/status` fields:
+
+```bash
+curl -s http://localhost:3000/api/status | jq '{dataSource, currentSessionsCount, scrapeInProgress, minutesSinceLastScrape, coveragePercent, missingDatesInScrapeWindow, watchlistSideDebug}'
+```
+
+6. Pick a future date (e.g. July 2) with arrows or calendar — saved sessions for that date should display if scraped; otherwise **Not checked yet** or **No sessions found for this date**.
+7. Lineup/watchlist wave side should match Browse (canonical `current_sessions` side, not stale watchlist row).
+8. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
+9. Price appears on cards when modal scrape captured it.
 
 ### Background scrapes
 
@@ -35,7 +52,7 @@
 ### API checks
 
 ```bash
-curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, lastScrapeAttempt, lastSuccessfulScrape, minutesSinceLastScrape, scrapeScheduleEnabled, serverStartedAt, waveSideDebug}'
+curl -s http://localhost:3000/api/status | jq '{scrapeInProgress, currentSessionsCount, dataSource, lastScrapeAttempt, lastSuccessfulScrape, minutesSinceLastScrape, coveragePercent, scrapeScheduleEnabled, serverStartedAt, waveSideDebug, watchlistSideDebug}'
 curl -s http://localhost:3000/api/analytics/availability-summary | jq '.snapshotCount, .averageSlotsByWeekday'
 curl -s -X POST http://localhost:3000/api/notify/test -H 'Content-Type: application/json' -d '{"ntfy_topic":"your-topic"}'
 ```

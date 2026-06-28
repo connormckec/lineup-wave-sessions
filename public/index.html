@@ -59,9 +59,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Content ── */
 #content{flex:1;overflow:hidden;position:relative}
-.pane{position:absolute;inset:0;overflow-y:auto;padding:14px 14px calc(var(--nav-h)+8px);display:none;-webkit-overflow-scrolling:touch}
+.pane{position:absolute;inset:0;overflow-y:auto;padding:18px 14px calc(var(--nav-h)+16px);display:none;-webkit-overflow-scrolling:touch}
 .pane.active{display:block}
-.pane-header{font-family:var(--font-display);font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--sub);margin-bottom:14px}
+.pane-header{font-family:var(--font-display);font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--sub);margin:4px 0 16px}
 
 /* ── Bottom nav ── */
 #nav{
@@ -133,9 +133,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Date bar ── */
 .date-bar{
-  display:flex;align-items:center;justify-content:space-between;
+  display:flex;align-items:center;gap:6px;
   margin-bottom:14px;padding:4px 0;
 }
+.date-heading-wrap{flex:1;min-width:0;text-align:center;}
+.date-bar-actions{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.date-nav-btn{
+  width:36px;height:36px;border-radius:10px;
+  border:1px solid var(--border);background:rgba(14,42,74,.6);
+  color:var(--sub);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .15s;flex-shrink:0;padding:0;
+}
+.date-nav-btn:active:not(:disabled){background:var(--card-hover);color:var(--accent);border-color:var(--accent)}
+.date-nav-btn:disabled{opacity:.35;cursor:default}
 #date-label{
   font-family:var(--font-display);font-size:20px;font-weight:700;
   color:#fff;letter-spacing:.03em;line-height:1.2;
@@ -252,6 +263,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .slot-bar{display:flex;gap:3px;margin-top:5px;align-items:center}
 .slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .sc-wave{font-size:12px;color:var(--sub);margin-top:4px;font-family:var(--font-body);font-weight:500}
+.sc-price{font-size:11px;color:var(--muted);margin-top:2px}
+.sc-booked{font-size:11px;color:var(--sub);margin-top:2px}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
 .sc-right{display:flex;align-items:center;gap:10px;flex-shrink:0;padding-right:4px}
 .cond-badge{
@@ -373,12 +386,22 @@ input.field:focus{border-color:var(--accent)}
 
     <div class="pane active" id="pane-browse">
       <div class="date-bar">
-        <div id="date-label">Today</div>
-        <button type="button" id="cal-btn" aria-label="Pick date and time">
+        <button type="button" id="date-prev" class="date-nav-btn" aria-label="Previous day">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <div class="date-heading-wrap">
+          <div id="date-label">Today</div>
+        </div>
+        <div class="date-bar-actions">
+          <button type="button" id="date-next" class="date-nav-btn" aria-label="Next day">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+          <button type="button" id="cal-btn" aria-label="Pick date and time">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
           </svg>
         </button>
+        </div>
       </div>
       <div class="chips chips-sm" id="wave-chips"></div>
       <div class="lessons-toggle-row" id="lessons-toggle-row"></div>
@@ -451,6 +474,7 @@ const STORAGE = {
   userKey: 'ap_user_key',
   ntfyTopic: 'ap_ntfy_topic',
   watchlist: 'ap_watchlist',
+  statusCache: 'ap_status_cache',
 };
 
 function getUserKey() {
@@ -577,16 +601,33 @@ async function sendTestNotification() {
   }
 }
 
+const LEVEL_ORDER = [
+  'Progressive', 'Intermediate', 'Advanced Turns', 'Advanced Barrels',
+  'Expert Turns', 'Expert Barrels', 'Pro Turns', 'Pro Barrels',
+];
+
 const LEVELS = {
-  'Intermediate':     { s:'INT', c:'#00b4d8', pri:true },
   'Progressive':      { s:'PRG', c:'#48cae4', pri:true },
+  'Intermediate':     { s:'INT', c:'#00b4d8', pri:true },
   'Advanced Turns':   { s:'AT',  c:'#7b2fff', pri:true },
   'Advanced Barrels': { s:'AB',  c:'#c77dff', pri:true },
   'Expert Turns':     { s:'ET',  c:'#ff6b35', pri:false },
   'Expert Barrels':   { s:'EB',  c:'#ff4444', pri:false },
   'Pro Turns':        { s:'PT',  c:'#ffd166', pri:false },
+  'Pro Barrels':      { s:'PB',  c:'#e6b800', pri:false },
   'Boogie Nitez':     { s:'BOG', c:'#f72585', pri:false },
 };
+
+function sortLevels(levels) {
+  return [...levels].sort((a, b) => {
+    const ai = LEVEL_ORDER.indexOf(a);
+    const bi = LEVEL_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+}
 
 const WAVE_NAMES = {
   1: 'Left Wave',
@@ -629,10 +670,29 @@ function matchesWaveFilter(s) {
   return true;
 }
 
-function sessionCapacity(level) {
+function sessionCapacity(level, session) {
+  if (session?.capacity != null) return session.capacity;
   if (level === 'Progressive') return 18;
   if (level === 'Pro Turns') return 10;
   return 12;
+}
+
+function formatPrice(s) {
+  if (s.priceText) return s.priceText;
+  if (s.priceMin != null && s.priceMax != null && s.priceMin !== s.priceMax) {
+    return `$${Math.round(s.priceMin)}–$${Math.round(s.priceMax)}`;
+  }
+  if (s.priceMin != null) return `$${Math.round(s.priceMin)}`;
+  return '';
+}
+
+function formatBookedLine(s, hist) {
+  const slots = s.slots ?? hist?.slots;
+  if (!s.available || slots == null) return '';
+  if (s.capacity != null && s.estimatedBooked != null) {
+    return `${s.estimatedBooked}/${s.capacity} booked · ${slots} spot${slots === 1 ? '' : 's'} left`;
+  }
+  return `${slots} spot${slots === 1 ? '' : 's'} left`;
 }
 
 const HOUR_OPTIONS = [];
@@ -727,7 +787,68 @@ function checkedDatesSet() {
 }
 
 function isDateChecked(dateKey) {
+  if (sessionCountForDate(dateKey) > 0) return true;
   return checkedDatesSet().has(dateKey);
+}
+
+function loadStatusCache() {
+  try {
+    const raw = localStorage.getItem(STORAGE.statusCache);
+    if (!raw) return;
+    const cached = JSON.parse(raw);
+    if (asSessionArray(cached.sessions).length) {
+      data = {
+        ...data,
+        ...cached,
+        sessions: asSessionArray(cached.sessions),
+        history: cached.history && typeof cached.history === 'object' ? cached.history : {},
+      };
+      renderAll();
+    }
+  } catch (e) {
+    console.warn('[cache] load failed', e);
+  }
+}
+
+function saveStatusCache() {
+  try {
+    localStorage.setItem(STORAGE.statusCache, JSON.stringify({
+      sessions: data.sessions,
+      lastSuccessfulScrape: data.lastSuccessfulScrape,
+      minutesSinceLastScrape: data.minutesSinceLastScrape,
+      dataAgeMinutes: data.dataAgeMinutes,
+      scrapeInProgress: data.scrapeInProgress,
+      lastScrapeError: data.lastScrapeError,
+      source: data.source || data.dataSource,
+      effectiveWeeksAhead: data.effectiveWeeksAhead || data.scrapeMeta?.effectiveWeeksAhead,
+      datesCheckedDuringScrape: data.datesCheckedDuringScrape || data.scrapeMeta?.datesCheckedDuringScrape,
+    }));
+  } catch (e) {
+    console.warn('[cache] save failed', e);
+  }
+}
+
+function shiftActiveDay(delta) {
+  const days = getPickerDays();
+  const idx = days.indexOf(activeDayKey);
+  if (idx < 0) return;
+  const nextIdx = idx + delta;
+  if (nextIdx < 0 || nextIdx >= days.length) return;
+  if (delta < 0 && days[nextIdx] < todayKey()) return;
+  activeDayKey = days[nextIdx];
+  renderBrowse();
+  updateDateNavButtons();
+}
+
+function updateDateNavButtons() {
+  const prev = document.getElementById('date-prev');
+  const next = document.getElementById('date-next');
+  const days = getPickerDays();
+  if (prev) prev.disabled = activeDayKey <= todayKey() || days.indexOf(activeDayKey) <= 0;
+  if (next) {
+    const idx = days.indexOf(activeDayKey);
+    next.disabled = idx < 0 || idx >= days.length - 1;
+  }
 }
 
 function sessionCountForDate(dateKey) {
@@ -796,9 +917,9 @@ function surfCondition(s, hist) {
 }
 
 
-function slotBarHtml(slots, level, levelColor, dimmed) {
+function slotBarHtml(slots, level, levelColor, dimmed, session) {
   if (slots == null) return '';
-  const capacity = sessionCapacity(level);
+  const capacity = sessionCapacity(level, session);
   const open  = Math.min(Math.max(0, slots), capacity);
   const taken = capacity - open;
   const openColor  = dimmed ? '#1a3a55' : levelColor;
@@ -834,25 +955,31 @@ function scheduleRefreshPoll() {
 async function refresh() {
   const btn = document.getElementById('refresh-btn');
   btn.classList.add('spinning');
+  const prevSessions = asSessionArray(data.sessions);
   try {
     const res = await fetch(`/api/status?user_key=${encodeURIComponent(getUserKey())}`);
     const payload = await res.json();
+    const incoming = asSessionArray(payload.sessions);
+    const sessions = incoming.length > 0 || !prevSessions.length ? incoming : prevSessions;
     data = {
       ...payload,
-      sessions: asSessionArray(payload.sessions),
+      sessions,
       watchList: asSessionArray(payload.watchList),
-      history: payload.history && typeof payload.history === 'object' ? payload.history : {},
+      history: payload.history && typeof payload.history === 'object' ? payload.history : data.history || {},
     };
     mergeWatchlistFromServer(data.watchList);
     data.watchList = watchlistForUi();
+    saveStatusCache();
     const withSlots = data.sessions.filter(s => s.slots != null).length;
     console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
+    updateDateNavButtons();
     scheduleRefreshPoll();
   } catch {
+    if (prevSessions.length) renderAll();
     document.getElementById('status-text').innerHTML =
-      '<span class="check-time">Connection error</span>';
+      '<span class="check-time">Connection error · showing saved data</span>';
   } finally {
     btn.classList.remove('spinning');
   }
@@ -907,14 +1034,18 @@ function renderStatusBar() {
     scrapeInProgress,
     isUsingCachedData,
     dataAgeMinutes,
+    minutesSinceLastScrape,
     lastScrapeError,
     sessionsCount,
     currentSessionsCount,
     lastSuccessfulScrape,
     source,
+    dataSource,
   } = data;
 
-  const trackedCount = currentSessionsCount ?? sessionsCount ?? 0;
+  const trackedCount = currentSessionsCount ?? sessionsCount ?? asSessionArray(data.sessions).length;
+  const ageMins = minutesSinceLastScrape ?? dataAgeMinutes;
+  const src = source || dataSource;
 
   const ageLabel = (mins) => {
     if (mins == null) return null;
@@ -923,16 +1054,18 @@ function renderStatusBar() {
   };
 
   let detail;
-  if (scrapeInProgress) {
-    detail = `checked ${ageLabel(dataAgeMinutes) || 'recently'} · refreshing…`;
+  if (scrapeInProgress && trackedCount > 0) {
+    detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
+  } else if (scrapeInProgress) {
+    detail = 'refreshing…';
   } else if (!trackedCount && !lastSuccessfulScrape) {
     detail = 'waiting for first scrape';
   } else if (lastScrapeError && trackedCount > 0) {
     detail = 'showing saved data · refresh failed';
-  } else if (isUsingCachedData || source === 'supabase-current' || source === 'supabase-cache') {
-    detail = `showing saved data · checked ${ageLabel(dataAgeMinutes) || 'earlier'}`;
+  } else if (isUsingCachedData || src === 'supabase') {
+    detail = `showing saved data · checked ${ageLabel(ageMins) || 'earlier'}`;
   } else {
-    detail = `checked ${ageLabel(dataAgeMinutes) || 'just now'}`;
+    detail = `checked ${ageLabel(ageMins) || 'just now'}`;
   }
 
   if (!trackedCount && !lastSuccessfulScrape) {
@@ -947,6 +1080,7 @@ function renderStatusBar() {
 
 function renderBrowse() {
   document.getElementById('date-label').textContent = dateLabel(activeDayKey);
+  updateDateNavButtons();
 
   document.getElementById('wave-chips').innerHTML = WAVE_FILTERS.map(f =>
     `<button type="button" class="chip chip-sm${activeWave === f.wave ? ' on' : ''}" data-wave="${f.wave ?? ''}">${f.label}</button>`
@@ -957,7 +1091,7 @@ function renderBrowse() {
 
   let levelScope = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
   levelScope = levelScope.filter(matchesWaveFilter);
-  const levels = [...new Set(levelScope.map(s => s.level))];
+  const levels = sortLevels([...new Set(levelScope.map(s => s.level))]);
 
   document.getElementById('level-chips').innerHTML = [
     `<button type="button" class="chip chip-lvl${activeLevels.size === 0 ? ' on' : ''}" data-level="__all__">All</button>`,
@@ -974,10 +1108,11 @@ function renderBrowse() {
   if (!filtered.length) {
     const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
     const checked = isDateChecked(activeDayKey);
+    const hasSavedForDay = daySessions.length > 0;
     let msg;
-    if (!checked && data.scrapeInProgress) {
+    if (!checked && data.scrapeInProgress && !hasSavedForDay) {
       msg = 'Still checking this date…';
-    } else if (!checked) {
+    } else if (!checked && !hasSavedForDay) {
       msg = 'Not checked yet';
     } else if (!daySessions.length) {
       msg = 'No sessions found for this date';
@@ -1013,14 +1148,19 @@ function sessionCardHtml(s) {
   }));
 
   const fresh = freshnessLabel(s);
+  const sideLabel = s.waveSide || waveLabel(s.wave);
+  const price = formatPrice(s);
+  const booked = formatBookedLine(s, hist);
 
   return `<div class="sc${watched ? ' watching' : ''}" style="background:linear-gradient(90deg,${tint} 0%,var(--card) 55%)">
     <div class="sc-accent" style="background:${accent}"></div>
     <div class="sc-body">
       <div class="sc-time" style="color:${dimmed ? '#5d8aa8' : '#e8f4f8'}">${s.time.toUpperCase()}</div>
       <div class="sc-level" style="color:${dimmed ? '#1a3a55' : cfg.c}">${s.level}</div>
-      ${slotBarHtml(slots, s.level, cfg.c, dimmed)}
-      <div class="sc-wave">${waveLabel(s.wave)}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
+      ${slotBarHtml(slots, s.level, cfg.c, dimmed, s)}
+      <div class="sc-wave">${sideLabel}${fresh ? `<span class="sc-fresh">${fresh}</span>` : ''}</div>
+      ${booked ? `<div class="sc-booked">${booked}</div>` : ''}
+      ${price ? `<div class="sc-price">${price}</div>` : ''}
       <a class="book-link" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
     </div>
     <div class="sc-right">
@@ -1054,8 +1194,10 @@ function renderWatching() {
     const sessionKey = w.session_key || w.key;
     const live = data.sessions.find(s => s.key === sessionKey);
     const hist = data.history[sessionKey] || {};
-    const slots = live?.slots ?? hist.slots;
-    const side = w.wave_side || waveLabel(w.wave);
+    const slots = live?.slots ?? w.slots ?? hist.slots;
+    const side = w.waveSide || w.wave_side || (live ? (live.waveSide || waveLabel(live.wave)) : waveLabel(w.wave));
+    const booked = live ? formatBookedLine(live, hist) : (slots != null ? `${slots} spot${slots === 1 ? '' : 's'}` : '');
+    const price = live ? formatPrice(live) : (w.priceText ? w.priceText : '');
     let statusHtml = '<div class="wc-status" style="color:var(--sub)">AWAITING CHECK...</div>';
 
     if (live) {
@@ -1067,14 +1209,15 @@ function renderWatching() {
       }
     }
 
-    const slotsText = slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '';
+    const slotsText = booked ? ` · ${booked}` : (slots != null ? ` · ${slots} slot${slots === 1 ? '' : 's'}` : '');
+    const priceText = price ? ` · ${price}` : '';
     const dateLine = w.dayLabel || w.date || w.iso_date || '';
 
     return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
         <div>
           <div class="wc-title" style="color:${cfg.c}">${w.level || w.session_type}</div>
-          <div class="wc-meta">${dateLine} · ${(w.time || '').toUpperCase()} · ${side}${slotsText}</div>
+          <div class="wc-meta">${dateLine} · ${(w.time || '').toUpperCase()} · ${side}${slotsText}${priceText}</div>
         </div>
         <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>
@@ -1277,6 +1420,8 @@ document.getElementById('lessons-toggle-row').addEventListener('click', (e) => {
 });
 
 document.getElementById('cal-btn').addEventListener('click', openPicker);
+document.getElementById('date-prev').addEventListener('click', () => shiftActiveDay(-1));
+document.getElementById('date-next').addEventListener('click', () => shiftActiveDay(1));
 document.getElementById('picker-backdrop').addEventListener('click', closePicker);
 document.getElementById('picker-apply').addEventListener('click', applyPicker);
 
@@ -1308,6 +1453,7 @@ document.getElementById('picker-to').addEventListener('change', (e) => {
 initTimeSelects();
 
 getUserKey();
+loadStatusCache();
 refresh().then(() => syncWatchlistToServer());
 scheduleRefreshPoll();
 
