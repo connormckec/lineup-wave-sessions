@@ -58,7 +58,12 @@ const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
 
-let lastWeeksScraped = 0;
+let lastTier1DurationMs = null;
+let lastApiSessionsDurationMs = null;
+let lastSupabaseDateQueryMs = null;
+let scrapeMetaCachedAt = 0;
+const SCRAPE_META_TTL_MS = 60_000;
+const API_SESSIONS_DURATION_SAMPLES = [];
 
 const SCRAPE_OPTS = { excludedLevels: EXCLUDED_LEVELS, excludedWaves: EXCLUDED_WAVES };
 
@@ -530,46 +535,96 @@ async function mergeBroadSnapshotIntoStore() {
   return mergeSessionsIntoStore(snapSessions, { onlyMissing: true });
 }
 
-async function loadSessionsForDateAllSources(isoDate, { skipPrimary = false } = {}) {
-  if (!isoDate) {
-    return { sessions: [], dataSource: 'none', isFallback: false };
+async function queryCurrentSessionsForDate(isoDate, { mergeIntoStore = true } = {}) {
+  if (!isoDate) return { sessions: [], dataSource: 'none', isFallback: false, queryMs: 0 };
+
+  const queryStarted = Date.now();
+  const finish = (result) => {
+    const queryMs = Date.now() - queryStarted;
+    lastSupabaseDateQueryMs = queryMs;
+    return { ...result, queryMs };
+  };
+
+  if (!supabase) {
+    return finish({
+      sessions: sessionsForDate(isoDate),
+      dataSource: normalizeDataSource(dataSource),
+      isFallback: String(dataSource).includes('fallback'),
+    });
   }
 
-  if (!skipPrimary && supabase) {
-    const tableMissing = supabaseSchemaHealth.checkedAt && !supabaseSchemaHealth.currentSessionsAvailable;
-    if (!tableMissing) {
-      try {
-        const { data, error } = await supabase
-          .from('current_sessions')
-          .select('*')
-          .eq('park', PARK)
-          .eq('iso_date', isoDate)
-          .order('start_ts', { ascending: true });
-        if (!error && data?.length) {
-          const dateSessions = data.map(currentRowToSession).filter(s => s?.key);
-          mergeSessionsIntoStore(dateSessions);
-          return {
-            sessions: dateSessions,
-            dataSource: 'supabase/current_sessions',
-            isFallback: false,
-          };
-        }
-        if (error && !isMissingTableError(error)) throw error;
-        if (error && isMissingTableError(error)) {
-          supabaseSchemaHealth.currentSessionsAvailable = false;
-          if (!supabaseSchemaHealth.missingTables.includes('current_sessions')) {
-            supabaseSchemaHealth.missingTables.push('current_sessions');
-          }
-        }
-      } catch (e) {
-        if (!isMissingTableError(e)) console.warn(`  current_sessions date query ${isoDate}:`, e.message);
+  const tableMissing = supabaseSchemaHealth.checkedAt && !supabaseSchemaHealth.currentSessionsAvailable;
+  if (!tableMissing) {
+    try {
+      const { data, error } = await supabase
+        .from('current_sessions')
+        .select('*')
+        .eq('park', PARK)
+        .eq('iso_date', isoDate)
+        .order('start_ts', { ascending: true });
+      if (!error && data?.length) {
+        const dateSessions = data.map(currentRowToSession).filter(s => s?.key);
+        if (mergeIntoStore) mergeSessionsIntoStore(dateSessions);
+        return finish({
+          sessions: dateSessions,
+          dataSource: 'supabase/current_sessions',
+          isFallback: false,
+        });
       }
+      if (error && isMissingTableError(error)) {
+        supabaseSchemaHealth.currentSessionsAvailable = false;
+      } else if (error) {
+        throw error;
+      }
+    } catch (e) {
+      if (!isMissingTableError(e)) console.warn(`  current_sessions date query ${isoDate}:`, e.message);
     }
   }
 
   const fromSnapshot = await loadSessionsForDateFromSnapshotBlob(isoDate);
   if (fromSnapshot.length) {
-    mergeSessionsIntoStore(fromSnapshot);
+    if (mergeIntoStore) mergeSessionsIntoStore(fromSnapshot);
+    return finish({
+      sessions: fromSnapshot,
+      dataSource: 'supabase/scrape_snapshots_fallback',
+      isFallback: true,
+    });
+  }
+
+  const fromAvailability = await loadSessionsForDateFromAvailabilitySnapshots(isoDate);
+  if (fromAvailability.length) {
+    if (mergeIntoStore) mergeSessionsIntoStore(fromAvailability);
+    return finish({
+      sessions: fromAvailability,
+      dataSource: 'supabase/availability_snapshots_fallback',
+      isFallback: true,
+    });
+  }
+
+  const mem = sessionsForDate(isoDate);
+  if (mem.length) {
+    return finish({
+      sessions: mem,
+      dataSource: normalizeDataSource(dataSource),
+      isFallback: String(dataSource).includes('fallback'),
+    });
+  }
+
+  return finish({ sessions: [], dataSource: 'none', isFallback: false });
+}
+
+async function loadSessionsForDateAllSources(isoDate, { skipPrimary = false, mergeIntoStore = true } = {}) {
+  if (!isoDate) {
+    return { sessions: [], dataSource: 'none', isFallback: false };
+  }
+
+  if (!skipPrimary) {
+    return queryCurrentSessionsForDate(isoDate, { mergeIntoStore });
+  }
+
+  const fromSnapshot = await loadSessionsForDateFromSnapshotBlob(isoDate);
+  if (fromSnapshot.length) {
+    if (mergeIntoStore) mergeSessionsIntoStore(fromSnapshot);
     return {
       sessions: fromSnapshot,
       dataSource: 'supabase/scrape_snapshots_fallback',
@@ -579,7 +634,7 @@ async function loadSessionsForDateAllSources(isoDate, { skipPrimary = false } = 
 
   const fromAvailability = await loadSessionsForDateFromAvailabilitySnapshots(isoDate);
   if (fromAvailability.length) {
-    mergeSessionsIntoStore(fromAvailability);
+    if (mergeIntoStore) mergeSessionsIntoStore(fromAvailability);
     return {
       sessions: fromAvailability,
       dataSource: 'supabase/availability_snapshots_fallback',
@@ -966,14 +1021,9 @@ function resolveDateUiDisplay(isoDate, { sessions, statusReason, isFallback = fa
   return { statusReason: statusReason || 'not_checked', uiDisplay: 'not_checked', uiMessage: 'Not checked yet' };
 }
 
-async function buildSessionsForDatePayload(isoDate) {
-  if (supabase) {
-    if (!supabaseSchemaHealth.checkedAt) await auditSupabaseSchema();
-    await loadScrapeMetaFromSupabase();
-  }
-
-  const { sessions: dateSessions, dataSource: src, schemaError, isFallback = false } =
-    await loadSessionsForDateFromSupabase(isoDate);
+async function buildSessionsForDatePayload(isoDate, { mergeIntoStore = false } = {}) {
+  const chain = await loadSessionsForDateFromSupabaseFast(isoDate, { mergeIntoStore });
+  const { sessions: dateSessions, dataSource: src, schemaError, isFallback = false, queryMs } = chain;
 
   if (schemaError && !dateSessions.length) {
     return {
@@ -1016,6 +1066,134 @@ async function buildSessionsForDatePayload(isoDate) {
     error: schemaError || null,
     dateCoverage: dateCoverageForIsoDate(isoDate),
     schemaHealth: schemaHealthPayload(),
+    supabaseQueryMs: queryMs ?? lastSupabaseDateQueryMs,
+  };
+}
+
+async function loadSessionsForDateFromSupabaseFast(isoDate, { mergeIntoStore = false } = {}) {
+  if (!isoDate) {
+    return { sessions: [], dataSource: 'none', schemaError: null, isFallback: false, queryMs: 0 };
+  }
+
+  if (!supabase) {
+    const chain = await queryCurrentSessionsForDate(isoDate, { mergeIntoStore });
+    return { ...chain, schemaError: null };
+  }
+
+  if (!supabaseSchemaHealth.checkedAt) {
+    auditSupabaseSchema().catch(console.error);
+  }
+
+  if (!supabaseSchemaHealth.currentSessionsAvailable && supabaseSchemaHealth.checkedAt) {
+    return loadSessionsForDateFallback(isoDate, formatSchemaError('current_sessions'));
+  }
+
+  try {
+    const chain = await queryCurrentSessionsForDate(isoDate, { mergeIntoStore });
+    if (chain.sessions.length || chain.isFallback) {
+      supabaseSchemaHealth.currentSessionsAvailable = true;
+      return { ...chain, schemaError: null };
+    }
+
+    if (persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate)) {
+      return { sessions: [], dataSource: 'supabase/current_sessions', schemaError: null, isFallback: false, queryMs: chain.queryMs };
+    }
+
+    return { sessions: [], dataSource: 'supabase/current_sessions', schemaError: null, isFallback: false, queryMs: chain.queryMs };
+  } catch (e) {
+    if (isMissingTableError(e)) {
+      return loadSessionsForDateFallback(isoDate, formatSchemaError('current_sessions'));
+    }
+    throw e;
+  }
+}
+
+function sessionsMissingDetails(sessions) {
+  return asSessionArray(sessions).filter(s => s?.available && !sessionHasDetailedData(s));
+}
+
+function isTodayOrTomorrowIso(isoDate) {
+  const days = daysFromToday(isoDate);
+  return days >= 0 && days <= 1;
+}
+
+function scheduleBackgroundDateDetail(isoDate, sessions, { reason = 'api_date_request' } = {}) {
+  if (!isoDate) return;
+  const needing = sessionsMissingDetails(sessions);
+  if (!needing.length) return;
+  if (scrapeInProgress || detailEnrichmentInProgress) {
+    const priority = isTodayOrTomorrowIso(isoDate) ? 1 : 2;
+    enqueueSessionsForEnrichment(needing, { priority, reason: `${reason}:${isoDate}` }).catch(console.error);
+    return;
+  }
+  const priority = isTodayOrTomorrowIso(isoDate) ? 1 : enrichmentPriorityForSession(needing[0]);
+  setImmediate(() => {
+    enqueueSessionsForEnrichment(needing, { priority, reason: `${reason}:${isoDate}` })
+      .then(() => runDetailEnrichment({ isoDate, sessions: needing, reason: `${reason}:${isoDate}` }))
+      .catch(console.error);
+  });
+}
+
+function buildDateDetailDiagnostics(isoDate, sessions) {
+  const list = asSessionArray(sessions);
+  const available = list.filter(s => s.available);
+  const withSlots = list.filter(s => s.slots != null);
+  const withCapacity = list.filter(s => s.capacity != null);
+  const withBooked = list.filter(s => s.estimatedBooked != null);
+  const unavailable = available.filter(s => {
+    const status = s.detailStatus || s.detail_status;
+    return !sessionHasDetailedData(s) && (status === 'failed' || s.detailError || s.detail_error);
+  });
+  const pending = available.filter(s => !sessionHasDetailedData(s) && (s.detailStatus || s.detail_status) !== 'failed');
+  const checkTimes = dateCheckTimestamps(list);
+  const detailStatusSummary = {};
+  for (const s of list) {
+    const st = s.detailStatus || s.detail_status || 'unknown';
+    detailStatusSummary[st] = (detailStatusSummary[st] || 0) + 1;
+  }
+
+  let detailsUnavailableReason = null;
+  if (unavailable.length) {
+    const errors = [...new Set(unavailable.map(s => s.detailError || s.detail_error || 'no_details').filter(Boolean))];
+    detailsUnavailableReason = errors.length ? errors.join('; ') : 'detail scrape returned no slots/capacity';
+  } else if (pending.length) {
+    detailsUnavailableReason = 'details pending — enrichment not completed yet';
+  } else if (!available.length) {
+    detailsUnavailableReason = 'no open sessions on this date';
+  }
+
+  const tier1RunForDate = lastTierRun[1] && isTodayOrTomorrowIso(isoDate);
+  const minutesSinceTier1 = lastTierRun[1]
+    ? Math.round((Date.now() - new Date(lastTierRun[1]).getTime()) / 60_000)
+    : null;
+
+  return {
+    sessionsCount: list.length,
+    sessionsWithSlotsCount: withSlots.length,
+    sessionsWithCapacityCount: withCapacity.length,
+    sessionsWithEstimatedBookedCount: withBooked.length,
+    sessionsWithDetailsUnavailableCount: unavailable.length,
+    sessionsDetailsPendingCount: pending.length,
+    lastBasicCheckAt: checkTimes.lastBasicCheckAt,
+    lastDetailedCheckAt: checkTimes.lastDetailedCheckAt,
+    detailStatusSummary,
+    sampleSessionsMissingDetails: available.filter(s => !sessionHasDetailedData(s)).slice(0, 8).map(s => ({
+      key: s.key,
+      time: s.time,
+      level: s.level,
+      detailStatus: s.detailStatus || s.detail_status,
+      detailError: s.detailError || s.detail_error,
+      lastBasicCheckAt: s.lastBasicCheckAt,
+      lastDetailedCheckAt: s.lastDetailedCheckAt,
+      slots: s.slots,
+    })),
+    detailsUnavailableReason,
+    tier1DetailScrapeExpected: isTodayOrTomorrowIso(isoDate),
+    tier1HasRunRecently: tier1RunForDate && minutesSinceTier1 != null && minutesSinceTier1 <= CHECK_MINS * 2,
+    lastTier1Scrape: lastTierRun[1],
+    minutesSinceTier1Scrape: minutesSinceTier1,
+    lastTier1DurationMs,
+    latestDetailEnrichmentErrors: enrichmentMetrics.recentErrors.slice(-5),
   };
 }
 
@@ -3486,21 +3664,28 @@ function slotCheckDecision(s, prevSession, watchKeys) {
 
 function prioritizeForSlotCheck(batch) {
   const todayKey = todayDateKey();
+  const tomorrowKey = addDaysToParkIso(todayKey, 1);
   const reasonScore = { watched: 0, opened: 1, deferred: 2, stale: 3, uncached: 4 };
+
+  function dayScore(s) {
+    const dk = s.dateKey || s.isoDate;
+    if (dk === todayKey) return 0;
+    if (dk === tomorrowKey) return 1;
+    return 2;
+  }
 
   return batch.sort((a, b) => {
     const ra = a._recheckReason || 'uncached';
     const rb = b._recheckReason || 'uncached';
     const rDiff = (reasonScore[ra] ?? 5) - (reasonScore[rb] ?? 5);
     if (rDiff) return rDiff;
-    const aToday = a.dateKey === todayKey ? 0 : 1;
-    const bToday = b.dateKey === todayKey ? 0 : 1;
-    if (aToday !== bToday) return aToday - bToday;
+    const dDiff = dayScore(a) - dayScore(b);
+    if (dDiff) return dDiff;
     return a.ts - b.ts;
   });
 }
 
-async function fillSlotCounts(page, batch, byKey, prevByKey, stats) {
+async function fillSlotCounts(page, batch, byKey, prevByKey, stats, { networkCapture = null } = {}) {
   const watchKeys = watchedSessionKeys();
   const toRecheck = [];
 
@@ -3536,24 +3721,29 @@ async function fillSlotCounts(page, batch, byKey, prevByKey, stats) {
     const s = ordered[i];
     const entry = byKey.get(s.key);
     const reason = s._recheckReason;
+    const dk = s.dateKey || s.isoDate;
+    const highPriority = daysFromToday(dk) <= 1 || watchKeys.has(s.key);
 
-    if (slotChecksThisCycle >= MAX_SLOT_CHECKS) {
-      const remaining = ordered.slice(i);
-      console.log(`  [fillSlotCounts] MAX_SLOT_CHECKS=${MAX_SLOT_CHECKS} reached — ${remaining.length} recheck(s) deferred to next cycle`);
-      for (const rest of remaining) {
-        deferredThisCycle.add(rest.key);
-        const cached = slotCache[rest.key];
-        if (cached?.slots != null) byKey.get(rest.key).slots = cached.slots;
-      }
-      break;
+    if (slotChecksThisCycle >= MAX_SLOT_CHECKS && !highPriority) {
+      deferredThisCycle.add(s.key);
+      const cached = slotCache[s.key];
+      if (cached?.slots != null) entry.slots = cached.slots;
+      continue;
     }
 
-    const details = await getSessionModalDetails(page, s.ts, s.wave);
+    const details = await getSessionDetailsWithFallback(page, s.ts, s.wave, networkCapture);
     if (details) {
       applyDetailPayloadToSession(entry, details, s.level);
     } else {
       const prev = prevByKey.get(s.key);
-      if (prev?.slots != null) entry.slots = prev.slots;
+      if (prev) {
+        for (const field of ['slots', 'capacity', 'estimatedBooked', 'fillRate', 'priceText', 'priceMin', 'priceMax']) {
+          if (prev[field] != null && entry[field] == null) entry[field] = prev[field];
+        }
+      }
+      entry.lastDetailedCheckAt = new Date().toISOString();
+      entry.detailStatus = sessionHasDetailedData(entry) ? 'checked' : 'failed';
+      entry.detailError = entry.detailError || 'no_details';
     }
     slotChecksThisCycle++;
     stats.rechecked++;
@@ -3928,31 +4118,20 @@ function rebuildSessionsArray() {
   sessions = allStoredSessions().sort((a, b) => a.ts - b.ts || a.wave - b.wave);
 }
 
-function mergeBatchIntoStore(batch, tier, { preserveSlots = true } = {}) {
+function mergeBatchIntoStore(batch, tier, { preserveSlots = true, scrapeKind = null } = {}) {
   const now = new Date().toISOString();
   const updatedKeys = [];
+  const cfg = TIER_CONFIG[tier];
 
   for (const raw of asSessionArray(batch)) {
     if (!sessionInTier(raw, tier)) continue;
     const existing = sessionsByKey.get(raw.key);
-    const merged = {
-      ...(existing || {}),
-      ...raw,
-      tier,
-      lastScraped: now,
-    };
-    if (preserveSlots && existing?.slots != null && merged.slots == null) {
-      merged.slots = existing.slots;
-    }
-    if (existing) {
-      for (const field of ['capacity', 'estimatedBooked', 'fillRate', 'priceText', 'priceMin', 'priceMax', 'currency', 'lastDetailedCheckAt', 'detailStatus', 'detailError']) {
-        if (existing[field] != null && merged[field] == null) merged[field] = existing[field];
-      }
-    }
-    merged.lastBasicCheckAt = now;
-    if (!sessionHasDetailedData(merged) && merged.detailStatus !== 'checking') {
-      merged.detailStatus = merged.detailStatus || (existing?.detailStatus === 'checked' ? 'checked' : 'pending');
-    }
+    const kind = scrapeKind || (cfg?.slotCounts && sessionHasDetailedData(raw) ? 'detailed' : 'basic');
+    const merged = mergeSessionFieldsForUpsert(
+      { ...(existing || {}), ...raw, tier, lastScraped: now },
+      existing,
+      { scrapeKind: kind },
+    );
     if (existing && existing.available !== merged.available) {
       sessionsNeedingDetailAfterBasic.add(raw.key);
     } else if (existing && existing.available && merged.available
@@ -4120,6 +4299,7 @@ async function runTierScrape(tier) {
     return;
   }
 
+  const tierStarted = Date.now();
   console.log(`\n[${new Date().toLocaleTimeString()}] Tier ${tier} scrape (${cfg.label}, week offsets ${startWeek}–${endWeek})`);
 
   lastScrapeAttempt = new Date().toISOString();
@@ -4138,6 +4318,7 @@ async function runTierScrape(tier) {
   try {
     launched = await launchBrowser();
     const { page } = launched;
+    const networkCapture = cfg.slotCounts ? installBookingNetworkCapture(page) : null;
     await openBookingPage(page);
 
     const tierRequiredDates = expectedDatesForTier(tier);
@@ -4148,12 +4329,15 @@ async function runTierScrape(tier) {
     const byKey = new Map(batch.map(s => [s.key, s]));
 
     if (cfg.slotCounts) {
-      await fillSlotCounts(page, batch, byKey, prevByKey, slotStats);
+      await fillSlotCounts(page, batch, byKey, prevByKey, slotStats, { networkCapture });
       applySlotCacheFallback(byKey);
     }
 
     const merged = [...byKey.values()];
-    const updatedKeys = mergeBatchIntoStore(merged, tier, { preserveSlots: !cfg.slotCounts });
+    const updatedKeys = mergeBatchIntoStore(merged, tier, {
+      preserveSlots: true,
+      scrapeKind: cfg.slotCounts ? 'detailed' : 'basic',
+    });
     if (datesSeen) recordTierDateCoverage(datesSeen);
 
     if (cfg.slotCounts) {
@@ -4168,6 +4352,7 @@ async function runTierScrape(tier) {
     await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: cfg.slotCounts });
 
     lastTierRun[tier] = new Date().toISOString();
+    if (tier === 1) lastTier1DurationMs = Date.now() - tierStarted;
     lastSuccessfulScrape = new Date().toISOString();
     lastCheck = lastSuccessfulScrape;
     lastScrapeError = null;
@@ -4196,6 +4381,16 @@ async function runTierScrape(tier) {
     await refreshCoverageFlags();
     if (tier >= 2) lastFullCoverageScrape = lastSuccessfulScrape;
     if (tier === 1) await prunePastSessionsFromSupabase();
+
+    if (cfg.slotCounts) {
+      const stillNeeding = merged.filter(s => s.available && !sessionHasDetailedData(s) && daysFromToday(sessionDateKey(s)) <= 1);
+      if (stillNeeding.length) {
+        console.log(`  tier 1 follow-up: ${stillNeeding.length} today/tomorrow session(s) still missing details`);
+        setImmediate(() => {
+          runDetailEnrichment({ sessions: stillNeeding, reason: 'tier1_followup' }).catch(console.error);
+        });
+      }
+    }
 
     await finishScrapeRun(scrapeRunId, {
       success: true,
@@ -4325,9 +4520,15 @@ app.get('/api/sessions', async (req, res) => {
 
   if (isoDate) {
     lastRequestedDateForEnrichment = isoDate;
+    const apiStarted = Date.now();
     try {
-      const payload = await buildSessionsForDatePayload(isoDate);
-      res.json(payload);
+      const payload = await buildSessionsForDatePayload(isoDate, { mergeIntoStore: false });
+      const apiDurationMs = Date.now() - apiStarted;
+      lastApiSessionsDurationMs = apiDurationMs;
+      API_SESSIONS_DURATION_SAMPLES.push(apiDurationMs);
+      if (API_SESSIONS_DURATION_SAMPLES.length > 20) API_SESSIONS_DURATION_SAMPLES.shift();
+      res.json({ ...payload, apiDurationMs, supabaseQueryMs: payload.supabaseQueryMs ?? lastSupabaseDateQueryMs });
+      scheduleBackgroundDateDetail(isoDate, payload.sessions, { reason: 'api_sessions_date' });
     } catch (e) {
       console.error(`/api/sessions?date=${isoDate} error:`, e.message);
       const schemaErr = isMissingTableError(e) ? formatSchemaError('current_sessions') : null;
@@ -4421,6 +4622,15 @@ async function buildBootDebugPayload(selectedDate = null) {
     dataSource: normalizeDataSource(dataSource),
     hasFreshScrapeThisBoot,
     serverStartedAt,
+    isColdStartLikely: !hasFreshScrapeThisBoot && (Date.now() - new Date(serverStartedAt).getTime()) < 300_000,
+    timeSinceServerStartMs: Date.now() - new Date(serverStartedAt).getTime(),
+    backgroundCollectorEnabled: scrapeScheduleEnabled,
+    lastTier1DurationMs,
+    lastApiSessionsDurationMs,
+    lastSupabaseDateQueryMs,
+    averageApiSessionsDurationMs: API_SESSIONS_DURATION_SAMPLES.length
+      ? Math.round(API_SESSIONS_DURATION_SAMPLES.reduce((a, b) => a + b, 0) / API_SESSIONS_DURATION_SAMPLES.length)
+      : null,
     dateQuery: {
       isoDate,
       sessionsCount: datePayload?.sessionsCount ?? 0,
@@ -4516,9 +4726,11 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
       statusReason: apiPayload.statusReason,
       isFallback: apiPayload.isFallback,
     });
+    const detailDiag = buildDateDetailDiagnostics(isoDate, apiPayload.sessions);
     const payload = {
       isoDate,
       parkTodayIso: getParkTodayIso(),
+      ...detailDiag,
       reasonBrowseWouldShowNotChecked: reasonBrowseWouldShowNotChecked(
         isoDate,
         apiPayload.sessions,
@@ -4632,6 +4844,28 @@ app.post('/api/admin/enrich-date', async (req, res) => {
     }
 
     await enqueueDateForEnrichment(isoDate, { priority: 1, reason: 'admin_enrich_date' });
+    const waitForResult = req.body?.wait === true || req.query?.wait === 'true';
+
+    if (!waitForResult) {
+      setImmediate(() => {
+        runDetailEnrichment({
+          isoDate,
+          sessions: dateSessions,
+          reason: 'admin_enrich_date',
+        }).catch(console.error);
+      });
+      return res.json({
+        isoDate,
+        queued: true,
+        sessionsQueued: dateSessions.length,
+        sessionsAttempted: 0,
+        sessionsUpdatedWithSlots: 0,
+        sessionsUpdatedWithCapacity: 0,
+        sessionsUpdatedWithPrice: 0,
+        errors: [],
+      });
+    }
+
     const result = await runDetailEnrichment({
       isoDate,
       sessions: dateSessions,
@@ -4649,6 +4883,47 @@ app.post('/api/admin/enrich-date', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ isoDate, error: e.message, errors: [{ error: e.message }] });
+  }
+});
+
+app.get('/api/debug/collector', async (_req, res) => {
+  try {
+    const msSinceStart = Date.now() - new Date(serverStartedAt).getTime();
+    const minutesSinceStart = Math.round(msSinceStart / 60_000);
+    const minutesSinceTier1 = lastTierRun[1]
+      ? Math.round((Date.now() - new Date(lastTierRun[1]).getTime()) / 60_000)
+      : null;
+    const minutesSinceTier2 = lastTierRun[2]
+      ? Math.round((Date.now() - new Date(lastTierRun[2]).getTime()) / 60_000)
+      : null;
+    const likelySleepingOrRestarted = !hasFreshScrapeThisBoot
+      && minutesSinceTier1 != null
+      && minutesSinceTier1 > CHECK_MINS * 3;
+
+    res.json({
+      serverStartedAt,
+      minutesSinceServerStart: minutesSinceStart,
+      backgroundCollectorEnabled: scrapeScheduleEnabled,
+      scrapeInProgress,
+      detailEnrichmentInProgress,
+      lastSuccessfulScrape,
+      lastTier1Scrape: lastTierRun[1],
+      minutesSinceLastTier1: minutesSinceTier1,
+      lastTier1DurationMs,
+      lastTier2Scrape: lastTierRun[2],
+      minutesSinceLastTier2: minutesSinceTier2,
+      lastTier3Scrape: lastTierRun[3],
+      lastTier4Scrape: lastTierRun[4],
+      likelySleepingOrRestarted,
+      railwayNote: 'Disable Railway Serverless/App Sleep for continuous scraping and fast boot.',
+      lastApiSessionsDurationMs,
+      lastSupabaseDateQueryMs,
+      averageApiSessionsDurationMs: API_SESSIONS_DURATION_SAMPLES.length
+        ? Math.round(API_SESSIONS_DURATION_SAMPLES.reduce((a, b) => a + b, 0) / API_SESSIONS_DURATION_SAMPLES.length)
+        : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

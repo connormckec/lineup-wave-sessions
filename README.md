@@ -170,13 +170,13 @@ See [TESTING.md](TESTING.md) for verification steps.
 
 The scraper must run continuously — **disable Railway Serverless/App Sleep** on this service. If the process sleeps, `lastScrapeAttempt` in `/api/status` will go stale and availability snapshots stop accumulating.
 
-Check collector health via `/api/status`:
+Check collector health via `/api/status` and `/api/debug/collector`:
 
-- `lastScrapeAttempt` / `lastSuccessfulScrape` — should update every few minutes (tier 1)
-- `minutesSinceLastScrape` — alert if this grows beyond ~2× `CHECK_EVERY_MINS`
-- `scrapeScheduleEnabled` — should be `true`
-- `serverStartedAt` — when the current process booted
-- `waveSideDebug` — recent side parses and any ambiguous mappings
+- `likelySleepingOrRestarted` — true if Tier 1 hasn't run in 3× `CHECK_EVERY_MINS` since boot
+- `minutesSinceLastTier1` — should stay below ~10 when Railway is awake
+- `lastApiSessionsDurationMs` — `/api/sessions?date=` should respond in milliseconds, not wait on Playwright
+
+**Railway Serverless/App Sleep must be disabled.** If enabled, scraping and notifications pause while the service sleeps, and morning boot depends entirely on saved Supabase rows until the next cron wake.
 
 ## API endpoints
 

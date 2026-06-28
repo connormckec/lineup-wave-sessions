@@ -83,6 +83,24 @@ curl -s "http://localhost:3000/api/sessions?date=$(curl -s http://localhost:3000
 
 ---
 
+4. Past watched sessions disappear from active Lineup and stop alerting.
+
+---
+
+## Today/tomorrow detail reliability
+
+```bash
+curl -s http://localhost:3000/api/debug/date/$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso) | jq '{sessionsCount,sessionsWithSlotsCount,sessionsWithDetailsUnavailableCount,detailsUnavailableReason,tier1HasRunRecently,lastTier1Scrape,sampleSessionsMissingDetails}'
+curl -s http://localhost:3000/api/debug/collector | jq '{minutesSinceLastTier1,lastTier1DurationMs,likelySleepingOrRestarted,lastApiSessionsDurationMs}'
+```
+
+1. `/api/sessions?date=<today>` returns in under 1s (check `apiDurationMs` in response).
+2. Today cards render immediately; refresh triggers background detail check (does not block).
+3. After Tier 1 runs, today sessions should have slots/booked where the booking site exposes them.
+4. Cards show `details updated Xm ago` when slots known; `schedule updated Xm ago · details pending` when not.
+
+---
+
 ## Future session detail enrichment
 
 After deploying schema changes, run updated [`supabase/schema.sql`](supabase/schema.sql) (adds `detail_status`, `session_enrichment_queue`, `snapshot_type`).

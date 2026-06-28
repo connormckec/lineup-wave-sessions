@@ -571,7 +571,7 @@ const STORAGE = {
 };
 
 const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
-const SW_CACHE_VERSION = '4';
+const SW_CACHE_VERSION = '5';
 let cachedUserKey = null;
 let lastFocusRefreshAt = 0;
 let serverWatchlistCount = null;
@@ -738,8 +738,10 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
   }, BOOT_FAILSAFE_MS);
 
   try {
+    const fetchStarted = performance.now();
     const res = await fetchApi(endpoint, {}, 20000);
     const payload = await res.json();
+    const fetchMs = Math.round(performance.now() - fetchStarted);
     if (token !== selectedDateFetchToken) return;
 
     if (!res.ok) {
@@ -793,6 +795,9 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       count: sessions.length,
       statusReason: selectedDateMeta.statusReason,
       dataSource: selectedDateMeta.dataSource,
+      fetchMs,
+      apiDurationMs: payload.apiDurationMs,
+      supabaseQueryMs: payload.supabaseQueryMs,
     });
   } catch (err) {
     if (token !== selectedDateFetchToken) return;
@@ -1700,21 +1705,38 @@ function daysFromTodayKey(dateKey) {
   return Math.round((d - today) / 86_400_000);
 }
 
-function sessionUpdatedAt(s) {
-  return s.lastDetailedCheckAt || s.last_detailed_check_at
-    || s.lastBasicCheckAt || s.last_basic_check_at
-    || s.lastScraped || null;
+function formatRelativeTime(iso) {
+  if (!iso) return null;
+  const mins = Math.round((Date.now() - new Date(iso)) / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
 }
 
 function freshnessLabel(s) {
-  const updated = sessionUpdatedAt(s);
-  if (!updated) return '';
-  const mins = Math.round((Date.now() - new Date(updated)) / 60_000);
-  if (mins < 1) return 'Updated just now';
-  if (mins < 60) return `Updated ${mins}m ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `Updated ${hrs}h ago`;
-  return `Updated ${Math.round(hrs / 24)}d ago`;
+  const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
+  const basicAt = s.lastBasicCheckAt || s.last_basic_check_at || s.lastScraped;
+  const hasDetails = s.slots != null || s.capacity != null || s.priceText || s.priceMin != null;
+  const detailStatus = s.detailStatus || s.detail_status;
+
+  if (hasDetails && detailedAt) {
+    const rel = formatRelativeTime(detailedAt);
+    return rel ? `details updated ${rel}` : '';
+  }
+  if (detailStatus === 'failed') {
+    if (basicAt) {
+      const rel = formatRelativeTime(basicAt);
+      return rel ? `schedule updated ${rel}` : '';
+    }
+    return '';
+  }
+  if (basicAt) {
+    const rel = formatRelativeTime(basicAt);
+    return rel ? `schedule updated ${rel} · details pending` : 'details pending';
+  }
+  return '';
 }
 
 function sessionDaysSet() {
@@ -1842,10 +1864,20 @@ function scheduleRefreshPoll() {
   refreshPollTimer = setInterval(refresh, ms);
 }
 
-async function refresh({ silent = false } = {}) {
-  const btn = document.getElementById('refresh-btn');
-  if (btn && !silent) btn.classList.add('spinning');
-  const prevSessions = normalizeSessions(data.sessions);
+async function triggerBackgroundDetailRefresh(isoDate) {
+  if (!isoDate) return;
+  try {
+    await fetchApi('/api/admin/enrich-date', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isoDate }),
+    }, 8000);
+  } catch (e) {
+    console.warn('[detailRefresh]', e?.message || e);
+  }
+}
+
+async function refreshStatusInBackground({ silent = true } = {}) {
   try {
     const params = new URLSearchParams({
       user_key: getUserKey(),
@@ -1853,16 +1885,16 @@ async function refresh({ silent = false } = {}) {
     });
     const profileCode = getSavedProfileCode();
     if (profileCode) params.set('profile_code', profileCode);
-
     const { payload, sessions: incomingRaw } = await fetchSessionsPayload(params);
     const incoming = normalizeSessions(incomingRaw);
+    const prevSessions = normalizeSessions(data.sessions);
     const sessions = normalizeSessions(mergeSessionsFromServer(prevSessions, incoming, {
       scrapeInProgress: !!payload.scrapeInProgress,
       dataSource: payload.dataSource || payload.source,
     }));
-
     serverWatchlistCount = payload.watchlistCount ?? payload.watchList?.length ?? null;
     data = {
+      ...data,
       ...payload,
       sessions,
       watchList: asSessionArray(payload.watchList),
@@ -1871,34 +1903,35 @@ async function refresh({ silent = false } = {}) {
     mergeWatchlistFromServer(data.watchList);
     data.watchList = watchlistForUi();
     saveStatusCache();
-    try {
-      validateActiveDayKey();
-    } catch (e) {
-      console.warn('[refresh] validateActiveDayKey', e);
-      activeDayKey = todayKey();
-      saveActiveDayKey(activeDayKey);
-    }
-    lastFetchError = null;
-    finishLoading('ready');
-    logRenderDebug('refresh');
-    if (!activeDayKey) activeDayKey = todayKey();
     await loadSelectedDateSessions(activeDayKey, { silent: true });
+    if (!silent) safeRenderAll();
+  } catch (e) {
+    console.warn('[refreshStatusInBackground]', e?.message || e);
+  }
+}
+
+async function refresh({ silent = false } = {}) {
+  const btn = document.getElementById('refresh-btn');
+  if (btn && !silent) btn.classList.add('spinning');
+  const prevSessions = selectedDateSessions.slice();
+  try {
+    await loadSelectedDateSessions(activeDayKey, { silent: true });
+    triggerBackgroundDetailRefresh(activeDayKey);
+    refreshStatusInBackground({ silent: true }).then(() => {
+      safeRenderAll();
+      scheduleRefreshPoll();
+    });
+    finishLoading('ready');
     safeRenderAll();
-    updateDateNavButtons();
-    scheduleRefreshPoll();
   } catch (err) {
     lastFetchError = err?.message || String(err);
     console.error('[refresh]', err);
     finishLoading(prevSessions.length ? 'ready' : 'error');
-    const cached = readStatusCacheFallback();
-    const cachedSessions = normalizeSessions(cached?.sessions);
-    if (cachedSessions.length) {
-      data.sessions = cachedSessions;
-    } else if (prevSessions.length) {
-      data.sessions = prevSessions;
+    if (!selectedDateSessions.length && prevSessions.length) {
+      selectedDateSessions = prevSessions;
     }
     showStatusMessage(
-      `<span class="check-time">${data.sessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${lastFetchError}`}</span>`
+      `<span class="check-time">${selectedDateSessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${lastFetchError}`}</span>`
     );
     safeRenderAll();
   } finally {
@@ -2600,13 +2633,10 @@ initTimeSelects();
     finishLoading(selectedDateSessions.length ? 'ready' : 'loading');
     safeRenderAll();
 
-    await Promise.race([
-      refresh({ silent: true }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Background refresh timeout 8s')), 8000)),
-    ]).catch((err) => {
-      console.warn('[boot] background refresh', err?.message || err);
-      if (selectedDateSessions.length) finishLoading('ready');
+    refreshStatusInBackground({ silent: true }).catch((err) => {
+      console.warn('[boot] background status', err?.message || err);
     });
+    triggerBackgroundDetailRefresh(activeDayKey);
 
     profilePromise.catch(() => {});
     loadWatchlistFromServer().then(() => {
