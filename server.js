@@ -1099,9 +1099,10 @@ async function buildSessionsForDatePayload(isoDate, { mergeIntoStore = false } =
   const wasChecked = hasSaved || persistedDatesChecked.has(isoDate) || datesCheckedEmpty.has(isoDate);
   const statusReason = statusReasonForDate(isoDate, dateSessions, { isFallback });
   const checkTimes = dateCheckTimestamps(dateSessions);
+  const sanitizedSessions = dateSessions.map(s => sanitizeSessionForApi(s));
   return {
     isoDate,
-    sessions: dateSessions,
+    sessions: sanitizedSessions,
     sessionsCount: dateSessions.length,
     dataSource: src,
     isFallback,
@@ -1287,6 +1288,7 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     lastTier1DurationMs,
     latestDetailEnrichmentErrors: enrichmentMetrics.recentErrors.slice(-5),
     ...cookieDiagnosticsPayload(),
+    ...buildDetailAssociationDiagnostics(isoDate, list),
   };
 }
 
@@ -1459,6 +1461,14 @@ function currentRowToSession(row) {
     detailRawText: raw.detailRawText ?? null,
     detailRawTileText: raw.detailRawTileText ?? null,
     detailParseReason: raw.detailParseReason ?? null,
+    detailParseOutput: raw.detailParseOutput ?? null,
+    detailVerified: raw.detailVerified ?? false,
+    detailConfidence: raw.detailConfidence ?? null,
+    detailSourceSessionKey: raw.detailSourceSessionKey ?? null,
+    detailSourceIsoDate: raw.detailSourceIsoDate ?? null,
+    detailSourceStartTime: raw.detailSourceStartTime ?? null,
+    detailSourceSessionType: raw.detailSourceSessionType ?? null,
+    detailSourceWaveSide: raw.detailSourceWaveSide ?? null,
     tileText: raw.tileText ?? null,
   };
 }
@@ -1469,7 +1479,7 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
     s.slots ?? null,
     s.capacity ?? null,
     s.level,
-    { inferCapacityFromLevel: scrapeKind === 'detailed' && s.slots != null },
+    { inferCapacityFromLevel: false },
   );
   return {
     park: PARK,
@@ -1500,6 +1510,13 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       detailParseReason: s.detailParseReason ?? null,
       detailParseOutput: s.detailParseOutput ?? null,
       detailFailedSelector: s.detailFailedSelector ?? null,
+      detailVerified: s.detailVerified ?? false,
+      detailConfidence: s.detailConfidence ?? null,
+      detailSourceSessionKey: s.detailSourceSessionKey ?? null,
+      detailSourceIsoDate: s.detailSourceIsoDate ?? null,
+      detailSourceStartTime: s.detailSourceStartTime ?? null,
+      detailSourceSessionType: s.detailSourceSessionType ?? null,
+      detailSourceWaveSide: s.detailSourceWaveSide ?? null,
       tileText: s.tileText ?? s.detailRawTileText ?? null,
     },
     last_seen_at: now,
@@ -2111,8 +2128,12 @@ function inferDetailStatusFromPayload(details) {
   if (details.detailStatus) return details.detailStatus;
   if (details.failureType) return details.failureType;
   if (details.packed || details.slots === 0) return 'checked_packed';
-  if (details.openNoCount) return 'checked_open_no_slots_visible';
-  if (details.slots != null || details.capacity != null || details.price_text) return 'checked_with_slots';
+  if (details.openNoCount) {
+    return details.parseReason === 'text_open_or_available'
+      ? 'checked_available_no_slot_count'
+      : 'checked_open_no_slots_visible';
+  }
+  if (details.slots != null && details.verified !== false) return 'checked_with_slots';
   if (details.rawModalText && String(details.rawModalText).trim().length > 8) return 'failed_parse';
   return 'failed_parse';
 }
@@ -2152,6 +2173,8 @@ function isCookieBannerText(text) {
 
 function modalTextLooksLikeSessionDetail(text, session) {
   if (!text || isCookieBannerText(text)) return false;
+  const validation = validateModalAssociation(session, text);
+  if (validation.confidence === 'mismatch') return false;
   const low = text.toLowerCase();
   if (/session level|from\s*:|qty|spot|book|packed|sold out|\$\d/i.test(text)) return true;
   if (session?.level && low.includes(String(session.level).toLowerCase())) return true;
@@ -2160,6 +2183,322 @@ function modalTextLooksLikeSessionDetail(text, session) {
     if (t && t !== '?' && low.includes(t.replace(/\s/g, ''))) return true;
   }
   return text.trim().length > 40 && !isCookieBannerText(text);
+}
+
+const MODAL_MONTHS = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+function normalizeTimeToken(t) {
+  if (!t) return null;
+  const s = String(t).toLowerCase().replace(/\s+/g, ' ').trim();
+  const m = s.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/);
+  if (!m) return s.replace(/\s/g, '');
+  let hr = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  if (m[3] === 'pm' && hr !== 12) hr += 12;
+  if (m[3] === 'am' && hr === 12) hr = 0;
+  return `${String(hr).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+function parseModalDateLabel(text) {
+  if (!text) return null;
+  const m = String(text).match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})\b/);
+  if (!m) return null;
+  const mon = MODAL_MONTHS[m[1].slice(0, 3).toLowerCase()];
+  if (mon == null) return null;
+  const day = parseInt(m[2], 10);
+  const year = parseInt(m[3], 10);
+  if (!Number.isFinite(day) || !Number.isFinite(year)) return null;
+  return `${year}-${String(mon + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function parseModalSessionType(text) {
+  if (!text) return null;
+  const t = String(text);
+  const patterns = [
+    'Expert Turns', 'Pro Turns', 'Progressive', 'Lesson Only',
+    'Cruiser', 'Beginner', 'Intermediate', 'Advanced',
+  ];
+  for (const p of patterns) {
+    if (new RegExp(`\\b${p.replace(/\s+/g, '\\s+')}\\b`, 'i').test(t)) return p;
+  }
+  const m = t.match(/Session level\s*:?\s*([^|<\n]+)/i);
+  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+}
+
+function parseModalWaveSide(text) {
+  if (!text) return null;
+  const t = String(text);
+  const m = t.match(/\b(Left|Right)\s+(Wave(?:\s+Sessions)?|Lesson)\b/i);
+  if (m) {
+    const side = m[1];
+    const kind = /lesson/i.test(m[2]) ? 'Lesson' : 'Wave';
+    return `${side} ${kind}`;
+  }
+  return null;
+}
+
+function parseModalIdentityFromText(text) {
+  if (!text) return {};
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  const isoDate = parseModalDateLabel(t);
+  const timeMatch = t.match(/\bat\s+([\d]{1,2}(?::\d{2})?\s*[ap]m)\b/i)
+    || t.match(/\b([\d]{1,2}(?::\d{2})?\s*[ap]m)\b/i);
+  const startTime = timeMatch ? timeMatch[1].replace(/\s+/g, ' ').trim().toLowerCase() : null;
+  return {
+    isoDate,
+    startTime,
+    sessionType: parseModalSessionType(t),
+    waveSide: parseModalWaveSide(t),
+    dateLabel: isoDate ? t.match(/\b[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}\b/i)?.[0] || null : null,
+  };
+}
+
+function normalizeLevelToken(level) {
+  return String(level || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function levelsMatch(expected, found) {
+  if (!expected || !found) return !expected && !found;
+  const e = normalizeLevelToken(expected);
+  const f = normalizeLevelToken(found);
+  return e === f || f.includes(e) || e.includes(f);
+}
+
+function waveSidesMatch(expected, found) {
+  if (!expected || !found) return !expected && !found;
+  const e = normalizeLevelToken(expected);
+  const f = normalizeLevelToken(found);
+  return e === f || f.includes(e) || e.includes(f);
+}
+
+function validateModalAssociation(session, rawModalText) {
+  const parsed = parseModalIdentityFromText(rawModalText);
+  const expected = {
+    isoDate: session?.isoDate || session?.dateKey || null,
+    startTime: session?.time || null,
+    sessionType: session?.level || session?.session_type || null,
+    waveSide: session?.waveSide || null,
+    sessionKey: session?.key || null,
+  };
+  const mismatches = [];
+
+  if (parsed.isoDate && expected.isoDate && parsed.isoDate !== expected.isoDate) {
+    mismatches.push({ field: 'isoDate', expected: expected.isoDate, found: parsed.isoDate });
+  }
+  if (parsed.startTime && expected.startTime) {
+    if (normalizeTimeToken(parsed.startTime) !== normalizeTimeToken(expected.startTime)) {
+      mismatches.push({ field: 'startTime', expected: expected.startTime, found: parsed.startTime });
+    }
+  }
+  if (parsed.sessionType && expected.sessionType && !levelsMatch(expected.sessionType, parsed.sessionType)) {
+    mismatches.push({ field: 'sessionType', expected: expected.sessionType, found: parsed.sessionType });
+  }
+  if (parsed.waveSide && expected.waveSide && !waveSidesMatch(expected.waveSide, parsed.waveSide)) {
+    mismatches.push({ field: 'waveSide', expected: expected.waveSide, found: parsed.waveSide });
+  }
+
+  if (mismatches.length) {
+    return { match: false, confidence: 'mismatch', parsedFromModal: parsed, mismatches, expected };
+  }
+  const hasIdentity = !!(parsed.isoDate && parsed.startTime);
+  if (hasIdentity) {
+    return { match: true, confidence: 'exact_match', parsedFromModal: parsed, mismatches: [], expected };
+  }
+  return { match: false, confidence: 'weak_match', parsedFromModal: parsed, mismatches: [{ field: 'identity', expected: 'date_and_time', found: 'insufficient' }], expected };
+}
+
+function sessionDetailVerified(s) {
+  if (!s) return false;
+  return s.detailVerified === true || s.raw?.detailVerified === true;
+}
+
+function isDefaultLikeDetailValues(slots, capacity, estimatedBooked) {
+  if (slots === 10 && capacity === 12 && estimatedBooked === 2) return true;
+  if (slots === 10 && capacity === 12) return true;
+  if (slots === 10 && estimatedBooked === 2) return true;
+  return false;
+}
+
+function applyDetailSourceFields(entry, session, validation) {
+  const src = validation?.parsedFromModal || {};
+  entry.detailSourceSessionKey = session?.key || null;
+  entry.detailSourceIsoDate = src.isoDate || session?.isoDate || session?.dateKey || null;
+  entry.detailSourceStartTime = src.startTime || session?.time || null;
+  entry.detailSourceSessionType = src.sessionType || session?.level || null;
+  entry.detailSourceWaveSide = src.waveSide || session?.waveSide || null;
+}
+
+function clearUnverifiedDetailMetrics(entry) {
+  entry.slots = null;
+  entry.capacity = null;
+  entry.estimatedBooked = null;
+  entry.fillRate = null;
+  entry.priceText = null;
+  entry.priceMin = null;
+  entry.priceMax = null;
+  entry.detailVerified = false;
+}
+
+function preservePriorVerifiedDetailFields(entry, prior) {
+  if (!prior || prior.key !== entry.key || !sessionDetailVerified(prior)) return;
+  for (const field of [
+    'slots', 'capacity', 'estimatedBooked', 'fillRate',
+    'priceText', 'priceMin', 'priceMax', 'currency', 'available',
+    'detailVerified', 'detailConfidence',
+    'detailSourceSessionKey', 'detailSourceIsoDate', 'detailSourceStartTime',
+    'detailSourceSessionType', 'detailSourceWaveSide',
+    'detailStatus',
+  ]) {
+    if (prior[field] != null) entry[field] = prior[field];
+  }
+}
+
+function sanitizeSessionForApi(s, { debug = false } = {}) {
+  if (!s) return s;
+  const out = { ...s };
+  const verified = sessionDetailVerified(s);
+  const parserOutput = out.detailParseOutput || out.raw?.detailParseOutput
+    || buildParserOutputFromText(out.detailRawText || out.raw?.detailRawText || '');
+
+  if (!debug) {
+    if (!verified) {
+      if (out.detailStatus !== 'checked_packed' || !verified) {
+        out.slots = null;
+        out.capacity = null;
+        out.estimatedBooked = null;
+        out.fillRate = null;
+        out.priceText = null;
+        out.priceMin = null;
+        out.priceMax = null;
+      }
+    } else if (isDefaultLikeDetailValues(out.slots, out.capacity, out.estimatedBooked)) {
+      out.slots = null;
+      out.capacity = null;
+      out.estimatedBooked = null;
+      out.fillRate = null;
+      out.detailVerified = false;
+      out.detailConfidence = 'default_suppressed';
+    }
+  }
+
+  out.detailParseOutput = parserOutput;
+  out.detailVerified = verified;
+  out.detailConfidence = out.detailConfidence || out.raw?.detailConfidence || (verified ? 'exact_match' : null);
+  out.detailSourceSessionKey = out.detailSourceSessionKey || out.raw?.detailSourceSessionKey || null;
+  out.detailSourceIsoDate = out.detailSourceIsoDate || out.raw?.detailSourceIsoDate || null;
+  out.detailSourceStartTime = out.detailSourceStartTime || out.raw?.detailSourceStartTime || null;
+  out.detailSourceSessionType = out.detailSourceSessionType || out.raw?.detailSourceSessionType || null;
+  out.detailSourceWaveSide = out.detailSourceWaveSide || out.raw?.detailSourceWaveSide || null;
+  return out;
+}
+
+function buildDetailAssociationDiagnostics(isoDate, sessions) {
+  const list = asSessionArray(sessions);
+  const modalMismatch = [];
+  const defaultLike = [];
+  const unparsedButDisplayed = [];
+  const dateDiffers = [];
+  const timeDiffers = [];
+  const detailValueGroups = new Map();
+  const rawModalGroups = new Map();
+  const associationSamples = [];
+
+  for (const s of list) {
+    const rawModal = s.detailRawText || s.raw?.detailRawText || '';
+    const parserOutput = s.detailParseOutput || s.raw?.detailParseOutput
+      || buildParserOutputFromText(rawModal);
+    const validation = rawModal ? validateModalAssociation(s, rawModal) : null;
+
+    if (validation?.confidence === 'mismatch') {
+      modalMismatch.push({
+        key: s.key,
+        isoDate: s.isoDate || s.dateKey,
+        time: s.time,
+        sessionType: s.level,
+        waveSide: s.waveSide,
+        detailStatus: effectiveDetailStatus(s),
+        mismatches: validation.mismatches,
+        rawModalSample: truncateDetailText(rawModal, 200),
+      });
+    }
+
+    if (isDefaultLikeDetailValues(s.slots, s.capacity, s.estimatedBooked)) {
+      defaultLike.push({
+        key: s.key, time: s.time, sessionType: s.level,
+        slots: s.slots, capacity: s.capacity, estimatedBooked: s.estimatedBooked,
+        detailVerified: sessionDetailVerified(s),
+      });
+    }
+
+    if ((s.slots != null || s.capacity != null)
+      && parserOutput.parsed_slots_available == null
+      && parserOutput.parsed_capacity == null
+      && !sessionDetailVerified(s)) {
+      unparsedButDisplayed.push({
+        key: s.key, time: s.time, slots: s.slots, capacity: s.capacity,
+        parseReason: parserOutput.parse_reason,
+      });
+    }
+
+    const parsedId = parseModalIdentityFromText(rawModal);
+    if (parsedId.isoDate && (s.isoDate || s.dateKey) && parsedId.isoDate !== (s.isoDate || s.dateKey)) {
+      dateDiffers.push({ key: s.key, expected: s.isoDate || s.dateKey, found: parsedId.isoDate });
+    }
+    if (parsedId.startTime && s.time && normalizeTimeToken(parsedId.startTime) !== normalizeTimeToken(s.time)) {
+      timeDiffers.push({ key: s.key, expected: s.time, found: parsedId.startTime });
+    }
+
+    const dvKey = `${s.slots}|${s.capacity}|${s.estimatedBooked}|${s.priceText || ''}`;
+    if (s.slots != null || s.capacity != null) {
+      if (!detailValueGroups.has(dvKey)) detailValueGroups.set(dvKey, []);
+      detailValueGroups.get(dvKey).push(s.key);
+    }
+    if (rawModal) {
+      const rmKey = rawModal.slice(0, 120);
+      if (!rawModalGroups.has(rmKey)) rawModalGroups.set(rmKey, []);
+      rawModalGroups.get(rmKey).push(s.key);
+    }
+
+    if (validation || rawModal) {
+      associationSamples.push({
+        key: s.key,
+        isoDate: s.isoDate || s.dateKey,
+        time: s.time,
+        sessionType: s.level,
+        waveSide: s.waveSide,
+        detailVerified: sessionDetailVerified(s),
+        detailConfidence: s.detailConfidence || s.raw?.detailConfidence || null,
+        detailStatus: effectiveDetailStatus(s),
+        validationConfidence: validation?.confidence || null,
+        mismatches: validation?.mismatches || [],
+      });
+    }
+  }
+
+  const duplicateDetailValueGroups = [...detailValueGroups.entries()]
+    .filter(([, keys]) => keys.length > 1)
+    .map(([values, keys]) => ({ values, sessionKeys: keys, count: keys.length }))
+    .slice(0, 12);
+
+  const duplicateRawModalGroups = [...rawModalGroups.entries()]
+    .filter(([, keys]) => keys.length > 1)
+    .map(([rawSample, keys]) => ({ rawSample: rawSample.slice(0, 120), sessionKeys: keys, count: keys.length }))
+    .slice(0, 12);
+
+  return {
+    modalMismatchCount: modalMismatch.length,
+    failedModalMismatchSample: modalMismatch.slice(0, 12),
+    rowsWithDefaultLikeDetailsSample: defaultLike.slice(0, 12),
+    rowsWithUnparsedButDisplayedSlotsSample: unparsedButDisplayed.slice(0, 12),
+    rowsWhereDetailRawTextDateDiffersFromIsoDate: dateDiffers.slice(0, 12),
+    rowsWhereDetailRawTextTimeDiffersFromStartTime: timeDiffers.slice(0, 12),
+    duplicateDetailValueGroups,
+    duplicateRawModalGroups,
+    detailAssociationSamples: associationSamples.slice(0, 20),
+  };
 }
 
 function computeSessionMetrics(slots, capacity, level, { inferCapacityFromLevel = false } = {}) {
@@ -2186,6 +2525,7 @@ function computeSessionMetrics(slots, capacity, level, { inferCapacityFromLevel 
 
 function sessionHasDetailedData(s) {
   if (!s) return false;
+  if (!sessionDetailVerified(s)) return false;
   if (s.slots === 0) return true;
   return s.slots != null || s.capacity != null || s.priceText != null || s.priceMin != null;
 }
@@ -2270,6 +2610,15 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
     for (const field of preserveFields) {
       if (existing[field] != null && incoming[field] == null) merged[field] = existing[field];
     }
+    if (sessionDetailVerified(existing)) {
+      merged.detailVerified = existing.detailVerified;
+      merged.detailConfidence = existing.detailConfidence;
+      merged.detailSourceSessionKey = existing.detailSourceSessionKey;
+      merged.detailSourceIsoDate = existing.detailSourceIsoDate;
+      merged.detailSourceStartTime = existing.detailSourceStartTime;
+      merged.detailSourceSessionType = existing.detailSourceSessionType;
+      merged.detailSourceWaveSide = existing.detailSourceWaveSide;
+    }
     if (isDetailSuccessStatus(existing.detailStatus) && sessionHasDetailedData(merged)) {
       merged.detailStatus = existing.detailStatus;
     }
@@ -2286,10 +2635,17 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
     merged.lastDetailedCheckAt = incoming.lastDetailedCheckAt || now;
     const incomingStatus = incoming.detailStatus;
     const failed = isDetailFailureStatus(incomingStatus);
-    if (failed && existing && sessionHasDetailedData(existing) && !sessionHasDetailedData(incoming)) {
+    if (failed && existing && sessionDetailVerified(existing) && !sessionDetailVerified(incoming)) {
       for (const field of preserveFields) {
         if (existing[field] != null) merged[field] = existing[field];
       }
+      merged.detailVerified = existing.detailVerified;
+      merged.detailConfidence = existing.detailConfidence;
+      merged.detailSourceSessionKey = existing.detailSourceSessionKey;
+      merged.detailSourceIsoDate = existing.detailSourceIsoDate;
+      merged.detailSourceStartTime = existing.detailSourceStartTime;
+      merged.detailSourceSessionType = existing.detailSourceSessionType;
+      merged.detailSourceWaveSide = existing.detailSourceWaveSide;
     }
     if (failed) {
       merged.detailStatus = incomingStatus || merged.detailStatus;
@@ -2321,25 +2677,57 @@ function detailCoverageStats() {
   };
 }
 
-function applyDetailPayloadToSession(entry, details, level, { prior = null } = {}) {
+function applyDetailPayloadToSession(entry, details, level, { prior = null, session = null } = {}) {
   if (!entry || !details) return { ok: false, category: 'failed' };
 
   const priorSnapshot = prior || { ...entry };
   const now = new Date().toISOString();
   const status = inferDetailStatusFromPayload(details);
+  const sourceSession = session || entry;
+  const rawModal = details.rawModalText || null;
 
   if (details.rawModalText) entry.detailRawText = truncateDetailText(details.rawModalText);
   if (details.rawTileText) entry.detailRawTileText = truncateDetailText(details.rawTileText);
   if (details.parseReason) entry.detailParseReason = details.parseReason;
   if (details.failedSelector) entry.detailFailedSelector = details.failedSelector;
   entry.detailParseOutput = buildParserOutputFromText(details.rawModalText || details.rawTileText || '');
-
   entry.lastDetailedCheckAt = now;
+
+  if (rawModal) {
+    const validation = details.modalValidation || validateModalAssociation(sourceSession, rawModal);
+    entry.modalValidation = validation;
+    applyDetailSourceFields(entry, sourceSession, validation);
+
+    if (validation.confidence === 'mismatch') {
+      entry.detailStatus = 'failed_modal_mismatch';
+      entry.detailError = `modal_mismatch: ${validation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`;
+      entry.detailVerified = false;
+      entry.detailConfidence = 'mismatch';
+      clearUnverifiedDetailMetrics(entry);
+      preservePriorVerifiedDetailFields(entry, priorSnapshot);
+      ensureDetailStatusRecorded(entry, 'failed_modal_mismatch');
+      return { ok: false, category: 'failed', status: 'failed_modal_mismatch', validation };
+    }
+
+    if (validation.confidence === 'weak_match' && (details.slots != null || details.capacity != null || details.slotsFromClicks != null)) {
+      entry.detailStatus = 'failed_modal_mismatch';
+      entry.detailError = 'modal_identity_not_confirmed';
+      entry.detailVerified = false;
+      entry.detailConfidence = 'weak_match';
+      clearUnverifiedDetailMetrics(entry);
+      preservePriorVerifiedDetailFields(entry, priorSnapshot);
+      ensureDetailStatusRecorded(entry, 'failed_modal_mismatch');
+      return { ok: false, category: 'failed', status: 'failed_modal_mismatch', validation };
+    }
+  }
 
   if (status === 'unknown') {
     entry.detailStatus = 'failed_parse';
     entry.detailError = details.detailError || details.parseReason || 'insufficient_detail_signal';
-    preservePriorDetailFields(entry, priorSnapshot);
+    entry.detailVerified = false;
+    entry.detailConfidence = 'default_suppressed';
+    clearUnverifiedDetailMetrics(entry);
+    preservePriorVerifiedDetailFields(entry, priorSnapshot);
     ensureDetailStatusRecorded(entry, 'failed_parse');
     return { ok: false, category: 'failed', status: 'failed_parse' };
   }
@@ -2347,73 +2735,127 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null } = {
   if (isDetailFailureStatus(status)) {
     entry.detailStatus = normalizeDetailStatus(status) || status;
     entry.detailError = details.detailError || status;
-    preservePriorDetailFields(entry, priorSnapshot);
+    entry.detailVerified = false;
+    preservePriorVerifiedDetailFields(entry, priorSnapshot);
+    if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
     ensureDetailStatusRecorded(entry, entry.detailStatus);
     return { ok: false, category: 'failed', status: entry.detailStatus };
   }
 
+  const parserOutput = entry.detailParseOutput || {};
+  const hasParsedSlots = parserOutput.parsed_slots_available != null;
+  const hasParsedCapacity = parserOutput.parsed_capacity != null;
+
   if (details.available === false || status === 'checked_packed' || details.packed || details.slots === 0) {
     entry.available = false;
     entry.slots = 0;
-    if (details.capacity != null) entry.capacity = details.capacity;
-    else if (entry.capacity == null && level) entry.capacity = sessionCapacityForLevel(level);
-    attachSessionMetrics(entry, { slots: 0, capacity: entry.capacity }, level, { scrapeKind: 'detailed' });
+    if (details.capacity != null && hasParsedCapacity) entry.capacity = details.capacity;
+    else entry.capacity = null;
     if (entry.capacity != null) {
       entry.estimatedBooked = entry.capacity;
       entry.fillRate = 1;
+    } else {
+      entry.estimatedBooked = null;
+      entry.fillRate = null;
     }
-    if (details.price_text || details.price_min != null) {
-      entry.priceText = details.price_text ?? entry.priceText;
-      entry.priceMin = details.price_min ?? entry.priceMin;
-      entry.priceMax = details.price_max ?? entry.priceMax;
-      entry.currency = details.currency || entry.currency || 'USD';
+    if (details.price_text && hasParsedSlots) {
+      entry.priceText = details.price_text;
+      entry.priceMin = details.price_min;
+      entry.priceMax = details.price_max;
+      entry.currency = details.currency || 'USD';
     }
     entry.detailStatus = 'checked_packed';
     entry.detailError = null;
-    return { ok: true, category: 'packed' };
+    entry.detailVerified = rawModal ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal)).match : false;
+    entry.detailConfidence = entry.detailVerified ? 'exact_match' : 'weak_match';
+    return { ok: entry.detailVerified, category: 'packed' };
   }
 
-  if (status === 'checked_open_no_slots_visible' || details.openNoCount) {
+  if (status === 'checked_open_no_slots_visible' || status === 'checked_available_no_slot_count' || details.openNoCount) {
     entry.available = true;
-    if (priorSnapshot.slots == null) entry.slots = null;
-    entry.detailStatus = 'checked_open_no_slots_visible';
+    entry.slots = null;
+    entry.capacity = null;
+    entry.estimatedBooked = null;
+    entry.fillRate = null;
+    entry.detailStatus = status === 'checked_available_no_slot_count'
+      ? 'checked_available_no_slot_count'
+      : 'checked_open_no_slots_visible';
     entry.detailError = details.parseReason || null;
-    if (details.price_text || details.price_min != null) {
-      entry.priceText = details.price_text ?? entry.priceText;
-      entry.priceMin = details.price_min ?? entry.priceMin;
-      entry.priceMax = details.price_max ?? entry.priceMax;
-      entry.currency = details.currency || entry.currency || 'USD';
+    entry.detailVerified = false;
+    entry.detailConfidence = 'weak_match';
+    if (details.price_text && parserOutput.parsed_price_text) {
+      entry.priceText = details.price_text;
+      entry.priceMin = details.price_min;
+      entry.priceMax = details.price_max;
+      entry.currency = details.currency || 'USD';
+    } else {
+      entry.priceText = null;
+      entry.priceMin = null;
+      entry.priceMax = null;
     }
     return { ok: true, category: 'open_no_slots_visible' };
   }
 
-  if (details.slots != null) entry.slots = details.slots;
-  attachSessionMetrics(entry, details, level, { scrapeKind: 'detailed' });
-  if (details.price_text || details.price_min != null) {
-    entry.priceText = details.price_text ?? entry.priceText;
-    entry.priceMin = details.price_min ?? entry.priceMin;
-    entry.priceMax = details.price_max ?? entry.priceMax;
-    entry.currency = details.currency || entry.currency || 'USD';
+  if (details.slots != null && hasParsedSlots) {
+    entry.slots = details.slots;
+  } else {
+    entry.slots = null;
   }
-  entry.detailStatus = entry.slots != null || entry.capacity != null
-    ? 'checked_with_slots'
-    : 'checked_open_no_slots_visible';
+  if (details.capacity != null && (hasParsedCapacity || hasParsedSlots)) {
+    entry.capacity = details.capacity;
+  } else {
+    entry.capacity = null;
+  }
+  attachSessionMetrics(entry, {
+    slots: entry.slots,
+    capacity: entry.capacity,
+    price_text: hasParsedSlots || hasParsedCapacity ? details.price_text : null,
+    price_min: hasParsedSlots || hasParsedCapacity ? details.price_min : null,
+    price_max: hasParsedSlots || hasParsedCapacity ? details.price_max : null,
+    currency: details.currency,
+  }, level, { scrapeKind: 'detailed' });
+
+  if (!hasParsedSlots && !hasParsedCapacity) {
+    clearUnverifiedDetailMetrics(entry);
+    entry.detailStatus = details.parseReason === 'text_open_or_available'
+      ? 'checked_available_no_slot_count'
+      : 'checked_open_no_slots_visible';
+    entry.detailVerified = false;
+    entry.detailConfidence = 'default_suppressed';
+    return { ok: true, category: 'open_no_slots_visible' };
+  }
+
+  if (isDefaultLikeDetailValues(entry.slots, entry.capacity, entry.estimatedBooked)) {
+    clearUnverifiedDetailMetrics(entry);
+    entry.detailStatus = 'checked_open_no_slots_visible';
+    entry.detailVerified = false;
+    entry.detailConfidence = 'default_suppressed';
+    return { ok: true, category: 'open_no_slots_visible' };
+  }
+
+  const validation = rawModal
+    ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal))
+    : { match: false, confidence: 'weak_match' };
+  entry.detailVerified = validation.match && validation.confidence === 'exact_match';
+  entry.detailConfidence = entry.detailVerified ? 'exact_match' : 'weak_match';
+
+  if (!entry.detailVerified) {
+    clearUnverifiedDetailMetrics(entry);
+    entry.detailStatus = 'checked_open_no_slots_visible';
+    return { ok: true, category: 'open_no_slots_visible' };
+  }
+
+  entry.detailStatus = 'checked_with_slots';
   entry.detailError = entry.detailWarning || null;
-  ensureDetailStatusRecorded(entry, entry.slots != null ? 'checked_with_slots' : 'checked_open_no_slots_visible');
+  ensureDetailStatusRecorded(entry, 'checked_with_slots');
   return {
-    ok: sessionHasDetailedData(entry),
+    ok: true,
     category: entry.slots != null ? 'with_slots' : 'open_no_slots_visible',
   };
 }
 
 function preservePriorDetailFields(entry, prior) {
-  if (!prior) return;
-  for (const field of [
-    'slots', 'capacity', 'estimatedBooked', 'fillRate',
-    'priceText', 'priceMin', 'priceMax', 'currency', 'available',
-  ]) {
-    if (prior[field] != null && entry[field] == null) entry[field] = prior[field];
-  }
+  preservePriorVerifiedDetailFields(entry, prior);
 }
 
 function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
@@ -2424,18 +2866,24 @@ function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
   entry.lastDetailedCheckAt = now;
   entry.detailStatus = status;
   entry.detailError = failure?.detailError || status;
+  entry.detailVerified = false;
+  if (failure?.modalValidation) entry.modalValidation = failure.modalValidation;
   if (failure?.rawModalText) entry.detailRawText = truncateDetailText(failure.rawModalText);
   if (failure?.rawTileText) entry.detailRawTileText = truncateDetailText(failure.rawTileText);
   if (failure?.failedSelector) entry.detailFailedSelector = failure.failedSelector;
   if (failure?.parseReason) entry.detailParseReason = failure.parseReason;
-  preservePriorDetailFields(entry, priorSnapshot);
+  if (failure?.mismatches) entry.modalMismatches = failure.mismatches;
+  entry.detailParseOutput = buildParserOutputFromText(failure?.rawModalText || failure?.rawTileText || '');
+  preservePriorVerifiedDetailFields(entry, priorSnapshot);
+  if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
   ensureDetailStatusRecorded(entry, status);
   return { ok: false, category: 'failed', status: entry.detailStatus };
 }
 
 function incrementDetailFailureStats(stats, status) {
   const st = normalizeDetailStatus(status) || status;
-  if (st === 'failed_cookie_overlay') stats.sessionsFailedCookieOverlay = (stats.sessionsFailedCookieOverlay || 0) + 1;
+  if (st === 'failed_modal_mismatch') stats.sessionsFailedModalMismatch = (stats.sessionsFailedModalMismatch || 0) + 1;
+  else if (st === 'failed_cookie_overlay') stats.sessionsFailedCookieOverlay = (stats.sessionsFailedCookieOverlay || 0) + 1;
   else if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
   else if (st === 'failed_selector') stats.sessionsFailedSelector = (stats.sessionsFailedSelector || 0) + 1;
   else if (st === 'failed_modal_open') stats.sessionsFailedModalOpen = (stats.sessionsFailedModalOpen || 0) + 1;
@@ -2491,7 +2939,7 @@ function emptyEnrichmentStats({ skipped = false, skipReason = null, sessionsQueu
 
 function sessionQualifiesForFailedFirstEnrich(s) {
   const st = effectiveDetailStatus(s);
-  if (['failed_cookie_overlay', 'failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout'].includes(st)) return true;
+  if (['failed_cookie_overlay', 'failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout', 'failed_modal_mismatch'].includes(st)) return true;
   if (st === 'unknown' && (s.lastDetailedCheckAt || s.last_detailed_check_at)) return true;
   if (s.available !== false && !sessionHasDetailedData(s)) return true;
   return false;
@@ -2543,13 +2991,15 @@ function effectiveDetailStatus(s) {
   if (raw && raw !== 'unknown') return raw;
   const attempted = !!(s?.lastDetailedCheckAt || s?.last_detailed_check_at);
   if (!attempted) return 'unknown';
-  if (s?.slots === 0 && s?.available === false) return 'checked_packed';
-  if (s?.slots != null) return 'checked_with_slots';
+  if (s?.slots === 0 && s?.available === false && sessionDetailVerified(s)) return 'checked_packed';
+  if (s?.slots != null && sessionDetailVerified(s)) return 'checked_with_slots';
   const err = String(s?.detailError || s?.detail_error || '').toLowerCase();
+  if (err.includes('modal_mismatch') || err.includes('modal_identity')) return 'failed_modal_mismatch';
   if (err.includes('cookie')) return 'failed_cookie_overlay';
   if (err.includes('tile not found') || err.includes('selector')) return 'failed_selector';
   if (err.includes('timeout')) return 'failed_timeout';
   if (err.includes('modal never')) return 'failed_modal_open';
+  if (err.includes('target_date_not_visible')) return 'failed_selector';
   return 'failed_parse';
 }
 
@@ -2572,6 +3022,10 @@ function reasonForDetailStatus(s) {
       return 'parsed_sold_out_or_packed';
     case 'checked_open_no_slots_visible':
       return err || 'modal_open_session_open_no_slot_count';
+    case 'checked_available_no_slot_count':
+      return err || 'modal_open_available_no_slot_count';
+    case 'failed_modal_mismatch':
+      return err || 'modal_text_does_not_match_session_row';
     case 'failed_selector':
       return err || 'booking_tile_or_modal_selector_missing';
     case 'failed_cookie_overlay':
@@ -2624,9 +3078,9 @@ function sessionDetailDiagnosticsFields(s) {
     raw_tile_text: rawTile ? truncateDetailText(rawTile, 800) : null,
     raw_modal_or_detail_text: rawModal ? truncateDetailText(rawModal, 1500) : null,
     parsed_availability: parserOutput.parsed_availability ?? s.available,
-    parsed_slots_available: parserOutput.parsed_slots_available ?? s.slots,
-    parsed_capacity: parserOutput.parsed_capacity ?? s.capacity,
-    parsed_price_text: parserOutput.parsed_price_text ?? s.priceText ?? null,
+    parsed_slots_available: parserOutput.parsed_slots_available ?? null,
+    parsed_capacity: parserOutput.parsed_capacity ?? null,
+    parsed_price_text: parserOutput.parsed_price_text ?? null,
     parse_reason: s.detailParseReason || s.raw?.detailParseReason || parserOutput.parse_reason,
     failed_selector: s.detailFailedSelector || s.raw?.detailFailedSelector || null,
     last_detailed_check_at: s.lastDetailedCheckAt || s.last_detailed_check_at,
@@ -2639,7 +3093,7 @@ function attachSessionMetrics(entry, details, level, { scrapeKind = 'detailed' }
   const slots = entry.slots ?? details?.slots ?? null;
   const capacityHint = details?.capacity ?? entry.capacity ?? null;
   const metrics = computeSessionMetrics(slots, capacityHint, level, {
-    inferCapacityFromLevel: scrapeKind === 'detailed' && slots != null,
+    inferCapacityFromLevel: false,
   });
   if (metrics.slots != null) entry.slots = metrics.slots;
   if (metrics.capacity != null) entry.capacity = metrics.capacity;
@@ -2970,11 +3424,12 @@ async function getSessionDetailsWithFallback(page, session, networkCapture) {
   const label = ctx.key || `${ctx.ts}_${ctx.wave}`;
   const fromNetwork = networkCapture ? extractDetailsFromNetworkCapture(networkCapture, ctx.ts) : null;
   if (fromNetwork && (fromNetwork.slots != null || fromNetwork.capacity != null || fromNetwork.price_text)) {
-    console.log(`  [details ${label}] from network response`);
+    console.log(`  [details ${label}] from network response (requires modal verification for verified status)`);
     fromNetwork.detailStatus = fromNetwork.slots === 0
       ? 'checked_packed'
-      : 'checked_with_slots';
-    fromNetwork.parseReason = 'network_json';
+      : 'checked_open_no_slots_visible';
+    fromNetwork.parseReason = 'network_json_unverified';
+    fromNetwork.verified = false;
     return fromNetwork;
   }
   return getSessionModalDetails(page, session);
@@ -3193,19 +3648,39 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     const networkCapture = enrichmentNetworkCapture;
     await openBookingPage(page);
 
-    const weekGroups = groupSessionsByWeekOffset(toEnrich);
-    let currentWeek = null;
+    const dateGroups = groupSessionsByIsoDate(toEnrich);
+    let lastNavDate = null;
+    let navDiag = null;
+    stats.navigationDiagnostics = [];
 
-    for (const [weekOffset, sessionsInWeek] of weekGroups) {
-      if (currentWeek !== weekOffset) {
-        await dismissCookieBanner(page);
-        await navigateToWeekOffset(page, weekOffset);
-        currentWeek = weekOffset;
-        await dismissCookieBanner(page);
-        await page.waitForTimeout(300);
+    for (const [targetDate, sessionsOnDate] of dateGroups) {
+      if (lastNavDate !== targetDate) {
+        navDiag = await navigateCalendarToShowDate(page, targetDate);
+        lastNavDate = targetDate;
+        stats.navigationDiagnostics.push(navDiag);
+        console.log(`  calendar nav for ${targetDate}: visible=${navDiag.targetDateVisible} clicks=${navDiag.clickedNextWeekCount} range=${navDiag.visibleWeekStart || '?'}..${navDiag.visibleWeekEnd || '?'}`);
       }
 
-      for (const s of sessionsInWeek) {
+      if (!navDiag?.targetDateVisible) {
+        for (const s of sessionsOnDate) {
+          stats.sessionsAttempted++;
+          await markQueueItemStatus(s.key, 'running', { incrementAttempt: true });
+          const entry = { ...sessionsByKey.get(s.key), ...s };
+          const prior = { ...entry };
+          applyDetailFailureToSession(entry, {
+            detailStatus: 'failed_selector',
+            detailError: navDiag?.navigationError || 'target_date_not_visible',
+            navigationDiagnostics: navDiag,
+          }, { prior });
+          sessionsByKey.set(s.key, entry);
+          incrementDetailFailureStats(stats, entry.detailStatus);
+          await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
+          await markQueueItemStatus(s.key, 'pending', { error: entry.detailError });
+        }
+        continue;
+      }
+
+      for (const s of sessionsOnDate) {
         stats.sessionsAttempted++;
         await markQueueItemStatus(s.key, 'running', { incrementAttempt: true });
 
@@ -3250,7 +3725,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
           const hadCapacity = prior.capacity != null;
           const hadPrice = prior.priceText != null || prior.priceMin != null;
 
-          const result = applyDetailPayloadToSession(entry, details, s.level, { prior });
+          const result = applyDetailPayloadToSession(entry, details, s.level, { prior, session: s });
           sessionsByKey.set(s.key, entry);
 
           if (!hadSlots && entry.slots != null) stats.sessionsUpdatedWithSlots++;
@@ -5002,57 +5477,65 @@ async function closeModal(page, label = '') {
   return gone;
 }
 
-function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capacityFromModal, priceInfo, slotsFromClicks }) {
-  const price = priceInfo || parsePriceFromText(rawModalText || rawTileText || '');
-  const capacity = parsed?.capacity ?? capacityFromModal ?? parseCapacityFromDetailText(rawModalText || rawTileText || '');
+function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capacityFromModal, priceInfo, slotsFromClicks, modalValidation = null, session = null } = {}) {
+  const textSource = rawModalText || rawTileText || '';
+  const price = priceInfo || parsePriceFromText(textSource);
+  const capacity = parsed?.capacity ?? null;
+  const parserOutput = buildParserOutputFromText(textSource);
+
+  const baseMeta = {
+    rawTileText,
+    rawModalText,
+    modalValidation,
+    parserOutput,
+    verified: modalValidation?.match && modalValidation?.confidence === 'exact_match',
+  };
 
   if (parsed?.packed) {
     return {
       slots: 0,
       available: false,
       packed: true,
-      capacity,
+      capacity: parsed.capacity ?? capacity,
       ...price,
       detailStatus: 'checked_packed',
       parseReason: parsed.parseReason,
-      rawTileText,
-      rawModalText,
+      ...baseMeta,
     };
   }
 
   if (parsed?.slots != null) {
     return {
       slots: parsed.slots,
-      capacity,
+      capacity: parsed.capacity ?? capacity,
       estimatedBooked: parsed.estimatedBooked,
       ...price,
       detailStatus: 'checked_with_slots',
       parseReason: parsed.parseReason,
-      rawTileText,
-      rawModalText,
+      ...baseMeta,
     };
   }
 
   if (parsed?.openNoCount) {
+    const status = parsed.parseReason === 'text_open_or_available'
+      ? 'checked_available_no_slot_count'
+      : 'checked_open_no_slots_visible';
     return {
       openNoCount: true,
       ...price,
-      detailStatus: 'checked_open_no_slots_visible',
+      detailStatus: status,
       parseReason: parsed.parseReason,
-      rawTileText,
-      rawModalText,
+      ...baseMeta,
     };
   }
 
   if (slotsFromClicks != null && slotsFromClicks > 0) {
     return {
-      slots: slotsFromClicks,
-      capacity,
-      ...price,
-      detailStatus: 'checked_with_slots',
-      parseReason: 'modal_plus_clicks',
-      rawTileText,
-      rawModalText,
+      openNoCount: true,
+      detailStatus: 'checked_available_no_slot_count',
+      parseReason: 'plus_clicks_unverified_no_text_parse',
+      slotsFromClicks,
+      ...baseMeta,
     };
   }
 
@@ -5063,22 +5546,23 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
         slots: 0,
         available: false,
         packed: true,
-        capacity,
+        capacity: modalParsed.capacity ?? capacity,
         ...price,
         detailStatus: 'checked_packed',
         parseReason: modalParsed.parseReason || 'plus_zero_packed',
-        rawTileText,
-        rawModalText,
+        ...baseMeta,
       };
     }
     if (modalParsed?.openNoCount || /\bopen\b/i.test(rawModalText || '') || /\bavailable\b/i.test(rawModalText || '')) {
+      const status = modalParsed?.parseReason === 'text_open_or_available'
+        ? 'checked_available_no_slot_count'
+        : 'checked_open_no_slots_visible';
       return {
         openNoCount: true,
         ...price,
-        detailStatus: 'checked_open_no_slots_visible',
+        detailStatus: status,
         parseReason: modalParsed?.parseReason || 'plus_zero_open_no_count',
-        rawTileText,
-        rawModalText,
+        ...baseMeta,
       };
     }
     if (rawModalText && rawModalText.trim().length > 8) {
@@ -5087,9 +5571,8 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
         failureType: 'failed_parse',
         detailError: 'modal text present but slot count not parsed',
         parseReason: 'no_matching_patterns',
-        rawTileText,
-        rawModalText,
-        ...buildParserOutputFromText(rawModalText),
+        ...baseMeta,
+        ...parserOutput,
       };
     }
   }
@@ -5206,6 +5689,59 @@ async function findSessionTile(page, session, label) {
   return { tile: null, selector: selectors[0], method: 'not_found' };
 }
 
+async function waitForModalGone(page, timeoutMs = 3000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!(await isModalVisible(page))) return true;
+    await page.waitForTimeout(150);
+  }
+  return !(await isModalVisible(page));
+}
+
+function wrapModalDetailPayload(session, rawModalText, rawTileText, payload) {
+  if (!payload) return payload;
+  if (!rawModalText) return payload;
+  const modalValidation = validateModalAssociation(session, rawModalText);
+  payload.modalValidation = modalValidation;
+  payload.rawModalText = rawModalText;
+  payload.rawTileText = rawTileText;
+  if (modalValidation.confidence === 'mismatch') {
+    return {
+      detailStatus: 'failed_modal_mismatch',
+      failureType: 'failed_modal_mismatch',
+      detailError: `modal_mismatch: ${modalValidation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`,
+      rawTileText,
+      rawModalText: truncateDetailText(rawModalText, 1500),
+      modalValidation,
+      mismatches: modalValidation.mismatches,
+      parseReason: 'failed_modal_mismatch',
+    };
+  }
+  return buildDetailPayloadFromParsed(
+    payload.slots != null || payload.packed ? {
+      slots: payload.slots,
+      capacity: payload.capacity,
+      estimatedBooked: payload.estimatedBooked,
+      packed: payload.packed,
+      openNoCount: payload.openNoCount,
+      parseReason: payload.parseReason,
+    } : parseDetailAvailabilityFromText(rawModalText),
+    {
+      rawTileText,
+      rawModalText,
+      priceInfo: payload.price_text ? {
+        price_text: payload.price_text,
+        price_min: payload.price_min,
+        price_max: payload.price_max,
+        currency: payload.currency,
+      } : parsePriceFromText(rawModalText || rawTileText),
+      slotsFromClicks: payload.slotsFromClicks,
+      modalValidation,
+      session,
+    },
+  ) || payload;
+}
+
 async function getSessionModalDetails(page, session, { cookieRetryAllowed = true } = {}) {
   const ctx = sessionLookupContext(session);
   const label = ctx.key || `${ctx.ts}_${ctx.wave}`;
@@ -5308,23 +5844,43 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
 
     const modalParsed = parseDetailAvailabilityFromText(rawModalText);
     const priceInfo = parsePriceFromText(rawModalText || rawTileText);
+    const modalValidation = validateModalAssociation(session, rawModalText);
+
+    if (modalValidation.confidence === 'mismatch') {
+      console.log(`  [getSessionModalDetails ${label}] modal mismatch — ${modalValidation.mismatches.map(m => m.field).join(', ')}`);
+      await closeModal(page, label);
+      await waitForModalGone(page, 3000);
+      return {
+        detailStatus: 'failed_modal_mismatch',
+        failureType: 'failed_modal_mismatch',
+        detailError: `modal_mismatch: ${modalValidation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`,
+        rawTileText,
+        rawModalText: truncateDetailText(rawModalText, 1500),
+        modalValidation,
+        mismatches: modalValidation.mismatches,
+        parseReason: 'failed_modal_mismatch',
+      };
+    }
 
     if (modalParsed?.packed) {
-      const payload = buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, capacityFromModal, priceInfo });
+      const payload = wrapModalDetailPayload(session, rawModalText, rawTileText, buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, priceInfo, modalValidation, session }));
       console.log(`  [getSessionModalDetails ${label}] packed from modal text`);
       await closeModal(page, label);
+      await waitForModalGone(page, 3000);
       return payload;
     }
     if (modalParsed?.slots != null) {
-      const payload = buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, capacityFromModal, priceInfo });
-      console.log(`  [getSessionModalDetails ${label}] ${payload.slots} slot(s) from modal text`);
+      const payload = wrapModalDetailPayload(session, rawModalText, rawTileText, buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, priceInfo, modalValidation, session }));
+      console.log(`  [getSessionModalDetails ${label}] ${payload?.slots ?? 'n/a'} slot(s) from modal text`);
       await closeModal(page, label);
+      await waitForModalGone(page, 3000);
       return payload;
     }
     if (modalParsed?.openNoCount) {
-      const payload = buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, capacityFromModal, priceInfo });
+      const payload = wrapModalDetailPayload(session, rawModalText, rawTileText, buildDetailPayloadFromParsed(modalParsed, { rawTileText, rawModalText, priceInfo, modalValidation, session }));
       console.log(`  [getSessionModalDetails ${label}] open with no slot count visible`);
       await closeModal(page, label);
+      await waitForModalGone(page, 3000);
       return payload;
     }
 
@@ -5352,15 +5908,17 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
       console.warn(`  [getSessionModalDetails ${label}] WARNING: ${n} clicks — exceeds expected max; + button detection may have run away`);
     }
 
-    const payload = buildDetailPayloadFromParsed(null, {
+    const payload = wrapModalDetailPayload(session, rawModalText, rawTileText, buildDetailPayloadFromParsed(null, {
       rawTileText,
       rawModalText,
-      capacityFromModal,
       priceInfo,
       slotsFromClicks: n,
-    });
+      modalValidation,
+      session,
+    }));
 
     await closeModal(page, label);
+    await waitForModalGone(page, 3000);
 
     if (payload) {
       console.log(`  [getSessionModalDetails ${label}] result: ${payload.detailStatus} slots=${payload.slots ?? 'n/a'}`);
@@ -6062,6 +6620,91 @@ async function retreatCalendarWeek(page) {
   return true;
 }
 
+function groupSessionsByIsoDate(sessions) {
+  const groups = new Map();
+  for (const s of asSessionArray(sessions)) {
+    const dk = s.isoDate || s.dateKey;
+    if (!dk) continue;
+    if (!groups.has(dk)) groups.set(dk, []);
+    groups.get(dk).push(s);
+  }
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+async function navigateCalendarToShowDate(page, targetIsoDate) {
+  const diag = {
+    targetIsoDate: targetIsoDate || null,
+    visibleWeekStart: null,
+    visibleWeekEnd: null,
+    visibleDateLabels: [],
+    clickedNextWeekCount: 0,
+    targetDateVisible: false,
+    navigationError: null,
+  };
+
+  if (!targetIsoDate) {
+    diag.navigationError = 'missing_target_iso_date';
+    return diag;
+  }
+
+  let visible = await getVisibleDateKeysFromPage(page);
+  diag.visibleDateLabels = visible;
+  if (visible.length) {
+    diag.visibleWeekStart = visible[0];
+    diag.visibleWeekEnd = visible[visible.length - 1];
+  }
+  if (visible.includes(targetIsoDate)) {
+    diag.targetDateVisible = true;
+    return diag;
+  }
+
+  await openBookingPage(page);
+  await dismissCookieBanner(page);
+  visible = await getVisibleDateKeysFromPage(page);
+  diag.visibleDateLabels = visible;
+  if (visible.length) {
+    diag.visibleWeekStart = visible[0];
+    diag.visibleWeekEnd = visible[visible.length - 1];
+  }
+  if (visible.includes(targetIsoDate)) {
+    diag.targetDateVisible = true;
+    return diag;
+  }
+
+  const maxSteps = effectiveWeeksAhead + 3;
+  for (let step = 0; step < maxSteps; step++) {
+    if (!await advanceCalendarWeek(page)) break;
+    diag.clickedNextWeekCount++;
+    visible = await getVisibleDateKeysFromPage(page);
+    diag.visibleDateLabels = visible;
+    if (visible.length) {
+      diag.visibleWeekStart = visible[0];
+      diag.visibleWeekEnd = visible[visible.length - 1];
+    }
+    if (visible.includes(targetIsoDate)) {
+      diag.targetDateVisible = true;
+      return diag;
+    }
+  }
+
+  for (let step = 0; step < maxSteps; step++) {
+    if (!await retreatCalendarWeek(page)) break;
+    visible = await getVisibleDateKeysFromPage(page);
+    diag.visibleDateLabels = visible;
+    if (visible.length) {
+      diag.visibleWeekStart = visible[0];
+      diag.visibleWeekEnd = visible[visible.length - 1];
+    }
+    if (visible.includes(targetIsoDate)) {
+      diag.targetDateVisible = true;
+      return diag;
+    }
+  }
+
+  diag.navigationError = 'target_date_not_visible_after_navigation';
+  return diag;
+}
+
 async function navigateToWeekOffset(page, weekOffset) {
   await openBookingPage(page);
   await dismissCookieBanner(page);
@@ -6760,12 +7403,39 @@ app.get('/api/sessions', async (req, res) => {
   if (isoDate) {
     lastRequestedDateForEnrichment = isoDate;
     const apiStarted = Date.now();
+    const debugMode = req.query.debug === '1' || req.query.debug === 'true';
     try {
       const payload = await buildSessionsForDatePayload(isoDate, { mergeIntoStore: false });
       const apiDurationMs = Date.now() - apiStarted;
       lastApiSessionsDurationMs = apiDurationMs;
       API_SESSIONS_DURATION_SAMPLES.push(apiDurationMs);
       if (API_SESSIONS_DURATION_SAMPLES.length > 20) API_SESSIONS_DURATION_SAMPLES.shift();
+
+      if (debugMode) {
+        payload.sessions = payload.sessions.map(s => sanitizeSessionForApi(s, { debug: true }));
+        payload.debugSessions = payload.sessions.map(s => ({
+          key: s.key,
+          isoDate: s.isoDate || s.dateKey,
+          time: s.time,
+          sessionType: s.level,
+          waveSide: s.waveSide,
+          slots: s.slots,
+          capacity: s.capacity,
+          estimatedBooked: s.estimatedBooked,
+          detailStatus: effectiveDetailStatus(s),
+          detailVerified: sessionDetailVerified(s),
+          detailConfidence: s.detailConfidence || s.raw?.detailConfidence || null,
+          detailRawText: truncateDetailText(s.detailRawText || s.raw?.detailRawText || null, 1500),
+          detailParseOutput: s.detailParseOutput || s.raw?.detailParseOutput || buildParserOutputFromText(s.detailRawText || ''),
+          detailSourceSessionKey: s.detailSourceSessionKey || s.raw?.detailSourceSessionKey || null,
+          detailSourceIsoDate: s.detailSourceIsoDate || s.raw?.detailSourceIsoDate || null,
+          detailSourceStartTime: s.detailSourceStartTime || s.raw?.detailSourceStartTime || null,
+          detailSourceSessionType: s.detailSourceSessionType || s.raw?.detailSourceSessionType || null,
+          detailSourceWaveSide: s.detailSourceWaveSide || s.raw?.detailSourceWaveSide || null,
+        }));
+        payload.detailAssociationDiagnostics = buildDetailAssociationDiagnostics(isoDate, payload.sessions);
+      }
+
       res.json({ ...payload, apiDurationMs, supabaseQueryMs: payload.supabaseQueryMs ?? lastSupabaseDateQueryMs });
       scheduleBackgroundDateDetail(isoDate, payload.sessions, { reason: 'api_sessions_date' });
     } catch (e) {
@@ -7086,6 +7756,81 @@ app.get('/api/debug/session/:sessionKey', async (req, res) => {
     res.json(payload);
   } catch (e) {
     res.status(500).json({ sessionKey, error: e.message });
+  }
+});
+
+app.post('/api/admin/repair-detail-data', async (req, res) => {
+  const isoDate = normalizeIsoDateParam(req.body?.isoDate || req.body?.iso_date);
+  const dryRun = req.body?.dryRun === true || req.query?.dryRun === 'true';
+  try {
+    await ensureSessionsForStatus();
+    let candidates = allStoredSessions();
+    if (isoDate) candidates = candidates.filter(s => (s.isoDate || s.dateKey) === isoDate);
+
+    const repaired = [];
+    const preserved = [];
+    const skipped = [];
+
+    for (const s of candidates) {
+      const rawModal = s.detailRawText || s.raw?.detailRawText || '';
+      const parserOutput = s.detailParseOutput || s.raw?.detailParseOutput
+        || buildParserOutputFromText(rawModal);
+      const validation = rawModal ? validateModalAssociation(s, rawModal) : null;
+      const verified = sessionDetailVerified(s);
+      const defaultLike = isDefaultLikeDetailValues(s.slots, s.capacity, s.estimatedBooked);
+      const unparsedDisplayed = (s.slots != null || s.capacity != null)
+        && parserOutput.parsed_slots_available == null
+        && parserOutput.parsed_capacity == null;
+      const mismatch = validation?.confidence === 'mismatch';
+
+      if (verified && !defaultLike && !mismatch && !unparsedDisplayed) {
+        preserved.push(s.key);
+        continue;
+      }
+      if (!s.slots && !s.capacity && !s.estimatedBooked && !s.priceText && !rawModal) {
+        skipped.push(s.key);
+        continue;
+      }
+
+      const entry = { ...s };
+      if (mismatch) {
+        entry.detailStatus = 'failed_modal_mismatch';
+        entry.detailError = entry.detailError || 'repaired_modal_mismatch';
+        entry.detailConfidence = 'mismatch';
+      } else if (defaultLike || unparsedDisplayed) {
+        entry.detailStatus = entry.detailStatus === 'checked_with_slots'
+          ? 'checked_open_no_slots_visible'
+          : entry.detailStatus;
+        entry.detailConfidence = 'default_suppressed';
+        entry.detailError = entry.detailError || 'repaired_unverified_defaults';
+      }
+      entry.detailVerified = false;
+      clearUnverifiedDetailMetrics(entry);
+      repaired.push({
+        key: s.key,
+        isoDate: s.isoDate || s.dateKey,
+        time: s.time,
+        reason: mismatch ? 'modal_mismatch' : (defaultLike ? 'default_like' : 'unparsed_displayed'),
+        prior: { slots: s.slots, capacity: s.capacity, estimatedBooked: s.estimatedBooked },
+      });
+
+      if (!dryRun) {
+        sessionsByKey.set(entry.key, entry);
+        await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
+      }
+    }
+
+    res.json({
+      isoDate: isoDate || null,
+      dryRun,
+      candidatesCount: candidates.length,
+      repairedCount: repaired.length,
+      preservedVerifiedCount: preserved.length,
+      skippedCount: skipped.length,
+      repairedSample: repaired.slice(0, 20),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

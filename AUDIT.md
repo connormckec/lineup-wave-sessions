@@ -137,10 +137,12 @@ If fallback rows exist, API returns `statusReason: fallback_sessions_found` — 
 | `last_scraped_at` | timestamptz | |
 | `last_basic_check_at` | timestamptz | Set on basic tile scrape |
 | `last_detailed_check_at` | timestamptz | Set on modal/network detail scrape |
-| `detail_status` | text | `pending`, `checking`, `checked_with_slots`, `checked_packed`, `checked_open_no_slots_visible`, `failed_modal_open`, `failed_selector`, `failed_cookie_overlay`, `failed_parse`, `failed_timeout`, `unknown` (legacy: `checked_packed_no_slots`, `checked_no_slots_visible`, `checked`, `failed`) |
-| `detail_error` | text | e.g. `slots_exceed_capacity` |
+| `detail_status` | text | `pending`, `checking`, `checked_with_slots`, `checked_packed`, `checked_open_no_slots_visible`, `checked_available_no_slot_count`, `failed_modal_mismatch`, `failed_modal_open`, `failed_selector`, `failed_cookie_overlay`, `failed_parse`, `failed_timeout`, `unknown` (legacy: `checked_packed_no_slots`, `checked_no_slots_visible`, `checked`, `failed`) |
+| `detail_error` | text | e.g. `slots_exceed_capacity`, `modal_mismatch: …` |
 
-**Critical rule:** Basic scrapes must not null out `slots_available`, `capacity`, `estimated_booked`, `fill_rate`, or price fields when a newer detailed check exists.
+**Verification fields (stored in `raw` jsonb):** `detailVerified`, `detailConfidence` (`exact_match`, `weak_match`, `mismatch`, `default_suppressed`), `detailSourceSessionKey`, `detailSourceIsoDate`, `detailSourceStartTime`, `detailSourceSessionType`, `detailSourceWaveSide`, `detailParseOutput`.
+
+**Critical rule:** Basic scrapes must not null out verified detail fields (`detailVerified: true`) for the same `session_key`. API responses suppress unverified slots/capacity/booked/price — UI shows *details pending* instead of inferred defaults (10/12/2).
 
 ### `scrape_snapshots`
 
@@ -189,6 +191,7 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `GET /api/debug/enrichment` | Enrichment queue, stale/missing counts, run duration, recent errors |
 | `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
 | `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date. Returns reconciled outcome counts (`sessionsUpdatedWithSlots`, `sessionsFailedCookieOverlay`, etc.), `skipReason` when skipped, cookie diagnostics, and `unchangedReasons`. |
+| `POST /api/admin/repair-detail-data` | Clear unverified/default-like/mismatched detail metrics while preserving basic session rows and verified detail. Optional `{ isoDate, dryRun }`. |
 | `GET /api/debug/coverage` | Expected vs actual dates across sources |
 
 ---

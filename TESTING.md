@@ -193,6 +193,36 @@ curl -s -X POST http://localhost:3000/api/admin/enrich-date \
 10. Confirm app loads saved data immediately on hard refresh.
 11. Confirm cards show separate schedule vs detail freshness (`schedule updated …`, `details updated …`, or `details failed …`).
 
+### Detail verification (association + defaults)
+
+1. **Mismatched modal must not show fake slots** — for a row where `detailRawText` references a different date/time/type than the session row, API must return `slots`, `capacity`, and `estimatedBooked` as null (unless previously verified for the same session key):
+
+```bash
+curl -s "http://localhost:3000/api/sessions?date=2026-06-29&debug=1" | jq '.debugSessions[] | select(.time=="7:30 am") | {key,time,sessionType,waveSide,slots,capacity,detailVerified,detailStatus,detailConfidence}'
+```
+
+2. **Parser null → no default 10/12/2** — when `detailParseOutput.parsed_slots_available` and `parsed_capacity` are null, response must not include `slots: 10` or `capacity: 12`.
+
+3. **`checked_with_slots` only when verified** — status should not be `checked_with_slots` unless modal matched and values were parsed.
+
+4. **Debug association diagnostics:**
+
+```bash
+curl -s http://localhost:3000/api/debug/date/2026-06-29 | jq '{modalMismatchCount,failedModalMismatchSample,rowsWithDefaultLikeDetailsSample,rowsWithUnparsedButDisplayedSlotsSample,duplicateDetailValueGroups}'
+```
+
+5. **Repair unverified/default-like rows** (dry run first):
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/repair-detail-data \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-29","dryRun":true}' | jq .
+```
+
+6. **Future week navigation** — enrichment for 2026-06-29 must navigate until target date is visible (`targetDateVisible: true` in enrichment `navigationDiagnostics`).
+
+7. **UI** — open sessions without verified detail show *details pending* / *Open*; no fake “2/12 booked · 10 spots left”.
+
 ---
 
 ## Supabase availability collector

@@ -678,6 +678,8 @@ function normalizeSessionRow(s) {
     time,
     wave: Number.isFinite(wave) ? wave : s.wave,
     detailStatus: s.detailStatus || s.detail_status || null,
+    detailVerified: s.detailVerified === true || s.raw?.detailVerified === true,
+    detailConfidence: s.detailConfidence || s.raw?.detailConfidence || null,
     lastDetailedCheckAt: s.lastDetailedCheckAt || s.last_detailed_check_at || null,
     lastBasicCheckAt: s.lastBasicCheckAt || s.last_basic_check_at || null,
   };
@@ -1304,6 +1306,7 @@ function sessionCapacity(level, session) {
 }
 
 function formatPrice(s) {
+  if (!sessionDetailVerified(s)) return '';
   if (s.priceText) return s.priceText;
   if (s.priceMin != null && s.priceMax != null && s.priceMin !== s.priceMax) {
     return `$${Math.round(s.priceMin)}–$${Math.round(s.priceMax)}`;
@@ -1312,7 +1315,12 @@ function formatPrice(s) {
   return '';
 }
 
+function sessionDetailVerified(s) {
+  return s?.detailVerified === true;
+}
+
 function formatBookedLine(s, hist) {
+  if (!sessionDetailVerified(s)) return '';
   if (!s.available || s.slots === 0) return '';
   const slots = s.slots ?? hist?.slots;
   if (slots == null) return '';
@@ -1329,11 +1337,13 @@ function isDetailFailedStatus(status) {
 function formatDetailStatusLine(s) {
   const status = s.detailStatus || s.detail_status;
   if (!s.available && s.slots !== 0) return '';
-  if (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null) return '';
+  if (sessionDetailVerified(s) && (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null)) return '';
   if (status === 'checking') return 'details pending';
   if (isDetailFailedStatus(status)) return 'details unavailable';
   if (status === 'checked_no_slots_visible') return 'details unavailable';
   if (status === 'checked_open_no_slots_visible') return 'details unavailable';
+  if (status === 'checked_available_no_slot_count') return 'details unavailable';
+  if (status === 'failed_modal_mismatch') return 'details unavailable';
   if (status === 'pending' || !status) return 'details pending';
   return 'details pending';
 }
@@ -1726,7 +1736,7 @@ function formatRelativeTime(iso) {
 function freshnessLabel(s) {
   const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
   const basicAt = s.lastBasicCheckAt || s.last_basic_check_at || s.lastScraped;
-  const hasDetails = s.slots != null || s.slots === 0 || s.capacity != null || s.priceText || s.priceMin != null;
+  const hasDetails = sessionDetailVerified(s) && (s.slots != null || s.slots === 0 || s.capacity != null || s.priceText || s.priceMin != null);
   const detailStatus = s.detailStatus || s.detail_status;
 
   if (isDetailFailedStatus(detailStatus) && detailedAt) {
@@ -1790,8 +1800,9 @@ function formatSpotCountShort(slots) {
 }
 
 function sessionConditionDisplay(s, hist) {
-  const slots = s.slots ?? hist?.slots;
-  if (!s.available || s.slots === 0) {
+  const verified = sessionDetailVerified(s);
+  const slots = verified ? (s.slots ?? hist?.slots) : null;
+  if (!s.available || (verified && s.slots === 0)) {
     return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots: 0 };
   }
   if (slots == null) {
@@ -2202,7 +2213,7 @@ function sessionCardHtml(s) {
   const cfg     = LEVELS[s.level] || { s:'?', c:'#5d8aa8' };
   const watched = isWatched(s.key);
   const hist    = data.history[s.key] || {};
-  const slots   = s.slots ?? hist.slots;
+  const slots   = sessionDetailVerified(s) ? (s.slots ?? hist.slots) : null;
   const display = sessionConditionDisplay(s, hist);
   const dimmed  = !s.available;
   const tint    = hexAlpha(cfg.c, dimmed ? .04 : .12);

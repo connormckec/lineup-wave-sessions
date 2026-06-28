@@ -106,7 +106,9 @@ Two scrape levels run in parallel:
 
 **Optimizations:** persistent enrichment browser (reused Chromium context), week-grouped navigation, network JSON preferred over modals, images/fonts/media blocked during enrichment, per-session upsert + `availability_snapshots` insert.
 
-**Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors. `GET /api/debug/date/:isoDate` — `failedDetailsSample`, `unknownDetailsSample`, `checkedOpenNoSlotsSample`, `failedCookieOverlaySample`, `detailStatusSummary`. `GET /api/debug/session/:sessionKey` — parse result and latest captured modal/tile text.
+**Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors. `GET /api/debug/date/:isoDate` — `failedDetailsSample`, `unknownDetailsSample`, `checkedOpenNoSlotsSample`, `failedCookieOverlaySample`, `detailStatusSummary`, plus detail-association diagnostics (`modalMismatchCount`, `failedModalMismatchSample`, `rowsWithDefaultLikeDetailsSample`, `duplicateDetailValueGroups`). `GET /api/debug/session/:sessionKey` — parse result and latest captured modal/tile text. `GET /api/sessions?date=YYYY-MM-DD&debug=1` — per-row identity, verification fields, and association diagnostics.
+
+**Detail verification:** Slots, capacity, booked counts, and price are only exposed when `detailVerified: true` (modal identity matched expected row: date, time, session type, wave side). Plus-click counts and level-based capacity defaults are never shown as real data. Mismatched modals get `failed_modal_mismatch`. Unparsed open sessions use `checked_available_no_slot_count` or `checked_open_no_slots_visible` — not `checked_with_slots`. Repair bad rows: `POST /api/admin/repair-detail-data` with optional `{ "isoDate": "2026-06-29", "dryRun": true }`.
 
 Detail tile lookup uses scored matching with multi-stage cookie consent dismissal: precise button targeting inside banner containers, iframe/shadow DOM scans, pointer-event fallback, and DOM overlay removal as last resort. Diagnostics exposed via `cookieDismissLastAttempt` on enrich-date and debug/date.
 
