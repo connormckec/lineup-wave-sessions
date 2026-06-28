@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
@@ -26,27 +26,38 @@
   --accent:#00c9a7;
   --alert:#ff6b35;
   --closed:#1f3a55;
-  --nav-h:64px;
+  --safe-top:env(safe-area-inset-top, 0px);
+  --safe-bottom:env(safe-area-inset-bottom, 0px);
+  --nav-bar:56px;
+  --nav-h:calc(var(--nav-bar) + var(--safe-bottom));
+  --content-pad-bottom:calc(var(--nav-h) + 12px);
   --font-display:'Barlow Condensed',sans-serif;
   --font-body:'Barlow',sans-serif;
   --track:.04em;
 }
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-body);overflow:hidden}
-#app{display:flex;flex-direction:column;height:100dvh;max-width:480px;margin:0 auto}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-body);overflow:hidden;overflow-x:hidden}
+#app{
+  display:flex;flex-direction:column;
+  height:100dvh;max-width:480px;margin:0 auto;
+  padding-top:var(--safe-top);
+  padding-bottom:var(--nav-h);
+  overflow:hidden;
+}
 
 /* ── Header ── */
-#header{padding:18px 16px 0;background:var(--bg);flex-shrink:0}
+#header{padding:10px 16px 0;background:var(--bg);flex-shrink:0}
 .header-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
 .header-brand{display:flex;align-items:center;gap:10px;min-width:0}
 .header-mark{width:36px;height:36px;border-radius:50%;flex-shrink:0;object-fit:cover}
 .header-copy{min-width:0}
-#app-title{font-family:var(--font-display);font-size:26px;font-weight:800;letter-spacing:.1em;color:#fff;text-transform:uppercase;line-height:1}
-.app-sublabel{margin-top:3px;font-size:11px;font-weight:500;letter-spacing:.06em;color:var(--sub);text-transform:none;line-height:1.2}
-.wave-divider{margin:10px -16px 0;height:14px;overflow:hidden;position:relative}
+#app-title{font-family:var(--font-display);font-size:24px;font-weight:800;letter-spacing:.08em;color:#fff;text-transform:uppercase;line-height:1}
+.app-sublabel{margin-top:2px;font-size:10px;font-weight:500;letter-spacing:.05em;color:var(--sub);text-transform:none;line-height:1.2}
+.wave-divider{margin:8px -16px 0;height:12px;overflow:hidden;position:relative}
 .wave-divider svg{display:block;width:200%;height:14px;animation:wave-drift 6s linear infinite}
 .wave-divider path{fill:none;stroke:var(--border);stroke-width:1.5;stroke-linecap:round}
 @keyframes wave-drift{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-#status-meta{padding:10px 0 12px;font-size:13px;font-family:var(--font-body);display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border)}
+#status-meta{padding:8px 0 10px;font-size:12px;font-family:var(--font-body);display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border);min-width:0}
+#status-meta #status-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #status-meta .open-count{color:var(--accent);font-weight:600}
 #status-meta .check-time{color:var(--sub)}
 #ntfy-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
@@ -59,27 +70,32 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Content ── */
 #content{flex:1;overflow:hidden;position:relative}
-.pane{position:absolute;inset:0;overflow-y:auto;padding:18px 14px calc(var(--nav-h)+16px);display:none;-webkit-overflow-scrolling:touch}
+.pane{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding:14px 16px var(--content-pad-bottom);display:none;-webkit-overflow-scrolling:touch}
 .pane.active{display:block}
 .pane-header{font-family:var(--font-display);font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--sub);margin:4px 0 16px}
 
 /* ── Bottom nav ── */
 #nav{
+  position:fixed;left:50%;bottom:0;transform:translateX(-50%);
+  width:100%;max-width:480px;
   height:var(--nav-h);
-  background:rgba(6,26,53,.9);
+  padding-bottom:var(--safe-bottom);
+  background:rgba(6,26,53,.94);
   backdrop-filter:blur(12px);
   -webkit-backdrop-filter:blur(12px);
   border-top:1px solid var(--border);
-  display:flex;flex-shrink:0;
+  display:flex;flex-shrink:0;z-index:100;
 }
 .nav-btn{
-  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
   border:none;background:none;color:var(--sub);font-size:10px;font-family:var(--font-body);
-  font-weight:500;letter-spacing:var(--track);cursor:pointer;position:relative;padding-bottom:4px;
+  font-weight:500;letter-spacing:var(--track);cursor:pointer;position:relative;
+  padding:6px 4px calc(4px + var(--safe-bottom) * 0);
+  min-height:var(--nav-bar);
 }
 .nav-btn.on{color:var(--accent)}
 .nav-btn.on::after{
-  content:'';position:absolute;bottom:6px;left:50%;transform:translateX(-50%);
+  content:'';position:absolute;bottom:calc(4px + var(--safe-bottom));left:50%;transform:translateX(-50%);
   width:28px;height:2px;background:var(--accent);border-radius:1px;
 }
 .nav-btn svg{width:21px;height:21px;stroke-width:1.8;fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
@@ -108,7 +124,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .wbadge{min-width:18px;height:18px;background:var(--accent);color:var(--bg);border-radius:9px;font-size:10px;font-weight:700;padding:0 5px;display:inline-flex;align-items:center;justify-content:center;font-family:var(--font-display)}
 
 /* ── Chips ── */
-.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding-bottom:12px}
+.chips{
+  display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;
+  padding:0 16px 12px;margin:0 -16px;
+  scroll-padding-left:16px;scroll-padding-right:16px;
+  -webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;
+  touch-action:pan-x;
+}
 .chips::-webkit-scrollbar{display:none}
 .chip{
   flex-shrink:0;padding:7px 16px;border-radius:999px;
@@ -133,10 +155,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Date bar ── */
 .date-bar{
-  display:flex;align-items:center;gap:6px;
-  margin-bottom:14px;padding:4px 0;
+  display:flex;align-items:center;gap:4px;
+  margin-bottom:12px;padding:2px 0;
+  overflow:visible;
 }
-.date-heading-wrap{flex:1;min-width:0;text-align:center;}
+.date-heading-wrap{flex:1;min-width:0;text-align:center;padding:0 2px;overflow:hidden;}
 .date-bar-actions{display:flex;align-items:center;gap:6px;flex-shrink:0;}
 .date-nav-btn{
   width:36px;height:36px;border-radius:10px;
@@ -148,8 +171,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .date-nav-btn:active:not(:disabled){background:var(--card-hover);color:var(--accent);border-color:var(--accent)}
 .date-nav-btn:disabled{opacity:.35;cursor:default}
 #date-label{
-  font-family:var(--font-display);font-size:20px;font-weight:700;
-  color:#fff;letter-spacing:.03em;line-height:1.2;
+  font-family:var(--font-display);font-size:clamp(17px, 4.6vw, 20px);font-weight:700;
+  color:#fff;letter-spacing:.02em;line-height:1.2;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 #cal-btn{
   width:40px;height:40px;border-radius:10px;
@@ -238,42 +262,44 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Session cards ── */
 .sc{
-  display:flex;align-items:center;gap:12px;
-  min-height:72px;
+  display:flex;align-items:center;gap:10px;
+  min-height:76px;
   background:var(--card);
   border:1px solid var(--border);
   border-radius:10px;
-  padding:14px 14px 14px 0;
-  margin-bottom:8px;cursor:pointer;
+  padding:12px 10px 12px 0;
+  margin-bottom:10px;cursor:pointer;
   transition:background .15s,border-color .15s;
   overflow:hidden;
 }
 .sc.watching{border-color:rgba(0,201,167,.4);box-shadow:0 0 0 1px rgba(0,201,167,.15)}
 .sc:active{background:var(--card-hover)}
 .sc-accent{width:6px;align-self:stretch;flex-shrink:0;border-radius:10px 0 0 10px;margin-right:2px}
-.sc-body{flex:1;min-width:0;padding-left:12px}
+.sc-body{flex:1;min-width:0;padding-left:10px;overflow:hidden}
 .sc-time{
-  font-family:var(--font-display);font-size:22px;font-weight:700;
+  font-family:var(--font-display);font-size:clamp(19px, 5vw, 22px);font-weight:700;
   letter-spacing:.04em;text-transform:uppercase;line-height:1.1;
 }
 .sc-level{
-  font-family:var(--font-display);font-size:15px;font-weight:700;
+  font-family:var(--font-display);font-size:14px;font-weight:700;
   margin-top:3px;letter-spacing:.02em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 .slot-bar{display:flex;gap:3px;margin-top:5px;align-items:center}
 .slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .sc-wave{font-size:12px;color:var(--sub);margin-top:4px;font-family:var(--font-body);font-weight:500}
 .sc-price{font-size:11px;color:var(--muted);margin-top:2px}
-.sc-booked{font-size:11px;color:var(--sub);margin-top:2px}
+.sc-booked{font-size:11px;color:var(--sub);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
-.sc-right{display:flex;align-items:center;gap:10px;flex-shrink:0;padding-right:4px}
+.sc-right{display:flex;align-items:center;gap:8px;flex-shrink:0;padding-right:2px}
 .cond-badge{
-  font-family:var(--font-display);font-size:11px;font-weight:700;
-  letter-spacing:.06em;text-transform:uppercase;
-  white-space:nowrap;text-align:right;line-height:1.3;
+  font-family:var(--font-display);font-size:10px;font-weight:700;
+  letter-spacing:.05em;text-transform:uppercase;
+  white-space:nowrap;text-align:right;line-height:1.25;
+  max-width:76px;overflow:hidden;text-overflow:ellipsis;
 }
 .bell-btn{
-  width:38px;height:38px;border-radius:50%;
+  width:44px;height:44px;border-radius:50%;
   border:1.5px solid var(--border);background:rgba(14,42,74,.5);
   color:var(--sub);cursor:pointer;
   display:flex;align-items:center;justify-content:center;flex-shrink:0;
@@ -352,6 +378,27 @@ input.field:focus{border-color:var(--accent)}
 .book-link:hover{text-decoration:underline}
 .setup-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .setup-actions .btn{flex:1;min-width:120px}
+.lbl{
+  font-size:10px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--sub);margin:0 0 6px;
+}
+.setup-divider{height:1px;background:var(--border);margin:20px 0}
+.profile-hint{
+  font-size:12px;color:var(--sub);line-height:1.45;margin:0 0 10px;
+}
+.profile-code-display{
+  font-size:11px;color:var(--muted);margin-top:8px;word-break:break-all;
+}
+@media (min-width:390px){
+  #app-title{font-size:26px}
+  .app-sublabel{font-size:11px}
+  #status-meta{font-size:13px;padding:10px 0 12px}
+  .cond-badge{font-size:11px;max-width:96px}
+  .sc-level{font-size:15px}
+}
+@media (min-width:768px){
+  .cond-badge{max-width:none}
+}
 </style>
 </head>
 <body>
@@ -415,6 +462,19 @@ input.field:focus{border-color:var(--accent)}
     </div>
 
     <div class="pane" id="pane-setup">
+      <div class="setup-block" id="profile-sync-block">
+        <h3>Profile Sync Code</h3>
+        <p class="profile-hint">Enter the same code on your phone and computer to share your Lineup and alerts. Internal beta only — not full login.</p>
+        <div class="lbl">Sync code</div>
+        <input class="field" type="text" id="profile-code-input" placeholder="ap-surf-connor-2026" autocomplete="off" autocapitalize="none" spellcheck="false">
+        <div class="setup-actions">
+          <button type="button" class="btn btn-outline" onclick="saveProfileCode()">Save code</button>
+          <button type="button" class="btn btn-outline" onclick="syncProfileNow()">Sync now</button>
+        </div>
+        <p id="profile-code-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
+        <p class="profile-code-display" id="profile-user-key-hint" hidden></p>
+      </div>
+      <div class="setup-divider" id="setup-divider"></div>
       <div class="setup-block" id="demo-alerts-block">
         <h3>Demo Alerts</h3>
         <p class="demo-intro">Internal demo only. For now, alerts use ntfy so we can test the watchlist logic before building native push.</p>
@@ -440,9 +500,9 @@ input.field:focus{border-color:var(--accent)}
       <svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
       <span id="watch-badge">Lineup</span>
     </button>
-    <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup" hidden>
+    <button class="nav-btn" onclick="showTab('setup',this)" id="nav-setup">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      <span id="nav-setup-label">Demo Alerts</span><span class="nav-beta-dot" aria-hidden="true"></span>
+      <span id="nav-setup-label">Settings</span><span class="nav-beta-dot" aria-hidden="true"></span>
     </button>
   </nav>
 
@@ -472,18 +532,161 @@ const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 
 const STORAGE = {
   userKey: 'ap_user_key',
+  profileCode: 'ap_profile_code',
   ntfyTopic: 'ap_ntfy_topic',
   watchlist: 'ap_watchlist',
   statusCache: 'ap_status_cache',
 };
 
-function getUserKey() {
-  let key = localStorage.getItem(STORAGE.userKey);
-  if (!key) {
-    key = crypto.randomUUID();
-    localStorage.setItem(STORAGE.userKey, key);
+const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
+let cachedUserKey = null;
+
+function normalizeProfileCode(code) {
+  return (code || '').trim().toLowerCase().replace(/\s+/g, '-');
+}
+
+function getSavedProfileCode() {
+  return (localStorage.getItem(STORAGE.profileCode) || '').trim();
+}
+
+function setProfileCode(value) {
+  const normalized = normalizeProfileCode(value);
+  if (normalized) {
+    localStorage.setItem(STORAGE.profileCode, normalized);
+  } else {
+    localStorage.removeItem(STORAGE.profileCode);
   }
-  return key;
+}
+
+function getProfileCodeForInput() {
+  const saved = getSavedProfileCode();
+  if (saved) return saved;
+  if (data?.internalDefaultProfileCode) return data.internalDefaultProfileCode;
+  if (data?.internalBetaNotifications) return DEFAULT_PROFILE_CODE;
+  return '';
+}
+
+async function deriveUserKeyFromProfileCode(code) {
+  const normalized = normalizeProfileCode(code);
+  if (!normalized) return null;
+  try {
+    const bytes = new TextEncoder().encode(`lineup-profile-v1:${normalized}`);
+    const buf = await crypto.subtle.digest('SHA-256', bytes);
+    const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+    return `profile:${hex.slice(0, 32)}`;
+  } catch {
+    return `profile:${normalized}`;
+  }
+}
+
+async function applyProfileUserKey(code) {
+  const derived = await deriveUserKeyFromProfileCode(code);
+  if (!derived) return null;
+  cachedUserKey = derived;
+  localStorage.setItem(STORAGE.userKey, derived);
+  return derived;
+}
+
+async function initProfileUserKey() {
+  let code = getSavedProfileCode();
+  if (!code) code = DEFAULT_PROFILE_CODE;
+  if (code) {
+    await applyProfileUserKey(code);
+    if (!getSavedProfileCode()) setProfileCode(code);
+  } else if (localStorage.getItem(STORAGE.userKey)) {
+    cachedUserKey = localStorage.getItem(STORAGE.userKey);
+  } else {
+    cachedUserKey = crypto.randomUUID();
+    localStorage.setItem(STORAGE.userKey, cachedUserKey);
+  }
+  return cachedUserKey;
+}
+
+function getUserKey() {
+  if (cachedUserKey) return cachedUserKey;
+  const stored = localStorage.getItem(STORAGE.userKey);
+  if (stored) {
+    cachedUserKey = stored;
+    return stored;
+  }
+  cachedUserKey = crypto.randomUUID();
+  localStorage.setItem(STORAGE.userKey, cachedUserKey);
+  return cachedUserKey;
+}
+
+async function fetchWatchlistFromServer() {
+  try {
+    const res = await fetch(`/api/status?user_key=${encodeURIComponent(getUserKey())}`);
+    const payload = await res.json();
+    const serverList = asSessionArray(payload.watchList);
+    localWatchlist = serverList;
+    saveLocalWatchlist(localWatchlist);
+    if (payload.watchList) {
+      data.watchList = serverList;
+    }
+    return serverList;
+  } catch (e) {
+    console.warn('[fetchWatchlist]', e);
+    return localWatchlist;
+  }
+}
+
+async function syncProfileNow() {
+  const msgEl = document.getElementById('profile-code-msg');
+  try {
+    await fetchWatchlistFromServer();
+    await syncWatchlistToServer();
+    await refresh();
+    if (msgEl) {
+      msgEl.textContent = `Synced · ${watchlistForUi().length} session(s) in Lineup.`;
+      msgEl.style.color = '#00c9a7';
+    }
+    renderSetup();
+  } catch (e) {
+    if (msgEl) {
+      msgEl.textContent = `Sync failed: ${e.message}`;
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+}
+
+async function saveProfileCode() {
+  const input = document.getElementById('profile-code-input');
+  const msgEl = document.getElementById('profile-code-msg');
+  const code = normalizeProfileCode(input?.value || '');
+  if (!code) {
+    if (msgEl) {
+      msgEl.textContent = 'Enter a sync code first.';
+      msgEl.style.color = '#ff6b35';
+    }
+    return;
+  }
+
+  const prevKey = getUserKey();
+  setProfileCode(code);
+  const newKey = await applyProfileUserKey(code);
+
+  if (prevKey !== newKey) {
+    localWatchlist = [];
+    saveLocalWatchlist([]);
+  }
+
+  if (msgEl) {
+    msgEl.textContent = 'Saving and syncing…';
+    msgEl.style.color = 'var(--sub)';
+  }
+
+  await fetchWatchlistFromServer();
+  await syncWatchlistToServer();
+  await refresh();
+  renderSetup();
+
+  if (msgEl) {
+    msgEl.textContent = prevKey !== newKey
+      ? 'Profile code saved — Lineup synced from server.'
+      : 'Profile code saved.';
+    msgEl.style.color = '#00c9a7';
+  }
 }
 
 function hasSavedNtfyTopic() {
@@ -526,7 +729,13 @@ function saveLocalWatchlist(list) {
 let localWatchlist = loadLocalWatchlist();
 
 function mergeWatchlistFromServer(serverList) {
-  if (!Array.isArray(serverList) || !serverList.length) return;
+  if (!Array.isArray(serverList)) return;
+  if (getUserKey().startsWith('profile:')) {
+    localWatchlist = serverList;
+    saveLocalWatchlist(localWatchlist);
+    return;
+  }
+  if (!serverList.length) return;
   const byKey = new Map(localWatchlist.map(w => [w.session_key || w.key, w]));
   for (const item of serverList) {
     byKey.set(item.session_key || item.key, item);
@@ -997,17 +1206,17 @@ function applyInternalBetaNav() {
   const nav = document.getElementById('nav-setup');
   const pane = document.getElementById('pane-setup');
   const demoBlock = document.getElementById('demo-alerts-block');
+  const setupDivider = document.getElementById('setup-divider');
+  const navLabel = document.getElementById('nav-setup-label');
   if (!nav) return;
 
   const beta = !!data.internalBetaNotifications;
-  nav.hidden = !beta;
+  nav.hidden = false;
   nav.classList.toggle('nav-beta', beta);
-  if (pane) pane.hidden = !beta;
+  if (pane) pane.hidden = false;
   if (demoBlock) demoBlock.hidden = !beta;
-
-  if (!beta && pane?.classList.contains('active')) {
-    showTab('browse', document.getElementById('nav-browse'));
-  }
+  if (setupDivider) setupDivider.hidden = !beta;
+  if (navLabel) navLabel.textContent = beta ? 'Settings' : 'Settings';
 }
 
 function alertsEnabled() {
@@ -1227,11 +1436,31 @@ function renderWatching() {
 }
 
 function renderSetup() {
+  const profileInput = document.getElementById('profile-code-input');
+  const profileMsg = document.getElementById('profile-code-msg');
+  const profileHint = document.getElementById('profile-user-key-hint');
   const input = document.getElementById('ntfy-topic-input');
   const msgEl = document.getElementById('ntfy-topic-msg');
   const subscribeHint = document.getElementById('ntfy-subscribe-hint');
   const defaultTopicEl = document.getElementById('ntfy-default-topic');
-  const defaultTopic = data.internalDefaultNtfyTopic || 'ap-surf-connor-2026';
+  const defaultTopic = data.internalDefaultNtfyTopic || DEFAULT_PROFILE_CODE;
+
+  if (profileInput && document.activeElement !== profileInput) {
+    profileInput.value = getProfileCodeForInput();
+  }
+  if (profileHint) {
+    const key = getUserKey();
+    profileHint.hidden = !key.startsWith('profile:');
+    profileHint.textContent = key.startsWith('profile:')
+      ? `Device profile id: ${key.slice(0, 20)}…`
+      : '';
+  }
+  if (profileMsg && !profileMsg.textContent) {
+    profileMsg.textContent = getSavedProfileCode()
+      ? 'Same code on every device shares your Lineup.'
+      : 'Default internal code applied — tap Save to confirm.';
+    profileMsg.style.color = 'var(--sub)';
+  }
 
   if (!alertsEnabled()) return;
 
@@ -1452,10 +1681,13 @@ document.getElementById('picker-to').addEventListener('change', (e) => {
 
 initTimeSelects();
 
-getUserKey();
-loadStatusCache();
-refresh().then(() => syncWatchlistToServer());
-scheduleRefreshPoll();
+(async function boot() {
+  await initProfileUserKey();
+  loadStatusCache();
+  await refresh();
+  await syncWatchlistToServer();
+  scheduleRefreshPoll();
+})();
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(err => {

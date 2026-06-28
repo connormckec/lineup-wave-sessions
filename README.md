@@ -51,6 +51,24 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - Status fields include `currentSessionsCount`, `lastSuccessfulScrape`, `lastScrapeAttempt`, `minutesSinceLastScrape`, `scrapeInProgress`, `missingDatesInScrapeWindow`, `coveragePercent`, and `watchlistSideDebug` (stored vs canonical wave side).
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 
+### Profile Sync Code (internal beta)
+
+Cross-device Lineup sync uses a **Profile Sync Code** instead of full login:
+
+1. Open **Settings** → enter the same code on phone and computer (default internal code: `ap-surf-connor-2026`).
+2. The app derives a stable `user_key` from the code (SHA-256 hash, prefixed `profile:`).
+3. Watchlist rows in Supabase are keyed by that `user_key`, so Lineup and bell states sync across devices.
+4. **Sync now** pulls the server watchlist and refreshes the UI.
+
+localStorage still caches the watchlist locally as a fallback. The public app should eventually use Supabase Auth / Apple / email login instead of sync codes.
+
+### Mobile / PWA
+
+- Viewport uses `viewport-fit=cover` with iOS safe-area insets for header and bottom nav.
+- Bottom nav is fixed above the home indicator; scroll panes include extra bottom padding.
+- Filter chips scroll horizontally without clipping; session cards use 44px tap targets.
+- Install as a PWA via Safari **Add to Home Screen** or Chrome install prompt.
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -60,7 +78,7 @@ On startup the server loads saved sessions from `current_sessions` before accept
 | `SUPABASE_SERVICE_ROLE_KEY` | — | Supabase service role key (server only) |
 | `CHECK_EVERY_MINS` | `5` | Tier 1 scrape interval |
 | `HISTORY_SNAPSHOTS` | `true` | Set `false` to disable `availability_snapshots` inserts |
-| `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder demo only — shows **Demo Alerts** tab and enables ntfy testing |
+| `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder demo only — shows **Demo Alerts** in Settings and enables ntfy testing |
 | `NTFY_TOPIC` | — | Optional server fallback when internal beta is on |
 | `LOW_SLOTS_THRESHOLD` | `2` | Notify when watched sessions drop to this many slots or fewer |
 | `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead |

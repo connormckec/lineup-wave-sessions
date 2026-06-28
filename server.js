@@ -16,6 +16,7 @@ const TOPIC      = process.env.NTFY_TOPIC || '';
 const INTERNAL_BETA = process.env.INTERNAL_BETA_NOTIFICATIONS === 'true';
 // ntfy is internal demo infrastructure only — public MVP should use native push, web push, SMS, or email after login.
 const INTERNAL_DEFAULT_NTFY_TOPIC = 'ap-surf-connor-2026';
+const INTERNAL_DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
@@ -2471,6 +2472,7 @@ function statusPayload(userKey = null) {
     ntfyFallbackConfigured: !!TOPIC,
     internalBetaNotifications: INTERNAL_BETA,
     internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
+    internalDefaultProfileCode: INTERNAL_DEFAULT_PROFILE_CODE,
     watchlistCount: activeWatchItems().length,
     watchlistSideDebug: buildWatchlistSideDebug(userKey),
     waveSideDebug: {

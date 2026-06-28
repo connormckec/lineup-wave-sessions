@@ -31,6 +31,25 @@ curl -s http://localhost:3000/api/status | jq '{dataSource, currentSessionsCount
 8. Level chips order: PRG, INT, AT, AB, ET, EB, PT, PB.
 9. Price appears on cards when modal scrape captured it.
 
+### Profile Sync Code (cross-device Lineup)
+
+1. On desktop: **Settings** → confirm sync code `ap-surf-connor-2026` → **Save code**.
+2. Add a session to Lineup via 🔔.
+3. On phone (Safari or installed PWA): same code → **Save code** → **Sync now**.
+4. Confirm the same watched sessions appear on both devices.
+5. Remove a watch on one device → **Sync now** on the other → confirm it updates.
+
+Profile codes derive a stable `user_key` client-side (`profile:` + SHA-256). Watches are stored in Supabase by that key. Future public release should replace this with Supabase Auth.
+
+### Mobile layout (iPhone Safari / PWA)
+
+1. Test at ~375px width (iPhone SE) and ~390px (standard iPhone).
+2. Confirm header is compact, date heading is centered and not clipped.
+3. Wave/level chips scroll horizontally with no page-level horizontal scroll.
+4. Bottom nav sits above Safari home indicator / PWA safe area.
+5. Session cards: readable text, tappable bell (44px), no overlap with bottom nav when scrolled to end.
+6. Add to Home Screen → launch standalone → confirm safe areas still look correct.
+
 ### Background scrapes
 
 1. With Supabase configured, wait for a tier 1 scrape (default every 5 min) or restart to trigger bootstrap.
@@ -107,19 +126,22 @@ When enabled:
 
 When **not** enabled:
 
-- The Demo Alerts tab and ntfy setup UI are hidden.
+- The Demo Alerts block in Settings is hidden.
 - Bell buttons show “Alerts coming soon” and do not add watches.
+- **Profile Sync Code** in Settings still works for cross-device Lineup sync.
 
 ### Quick test checklist
 
-1. Install [ntfy](https://ntfy.sh) and subscribe to `ap-surf-connor-2026`.
-2. Open the app → **Demo Alerts** tab → confirm the topic is prefilled.
-3. Tap **Send test notification** — you should receive “AP Session Alert”.
-4. Browse a session → tap 🔔 → confirm it appears on **Lineup**.
-5. Wait for a scrape cycle and verify alerts on open/low-slot/selling-fast changes.
+1. **Settings** → save Profile Sync Code `ap-surf-connor-2026` on each device.
+2. Install [ntfy](https://ntfy.sh) and subscribe to `ap-surf-connor-2026`.
+3. Open **Settings** → **Demo Alerts** → confirm the topic is prefilled.
+4. Tap **Send test notification** — you should receive “AP Session Alert”.
+5. Browse a session → tap 🔔 → confirm it appears on **Lineup** on both devices after **Sync now**.
+6. Wait for a scrape cycle and verify alerts on open/low-slot/selling-fast changes.
 
 ### Notes
 
-- Demo user topics are stored in **localStorage** on the device; watches sync to Supabase with `user_key`.
+- Profile Sync Code derives a stable `user_key` stored in localStorage; watches sync to Supabase with that key.
+- ntfy topics are stored in **localStorage** per device.
 - `NTFY_TOPIC` is only used as a **server fallback** when `INTERNAL_BETA_NOTIFICATIONS=true` and a watch has no topic saved.
 - Do not expose `SUPABASE_SERVICE_ROLE_KEY` in the frontend — it stays server-side only.
