@@ -1313,20 +1313,27 @@ function formatPrice(s) {
 }
 
 function formatBookedLine(s, hist) {
+  if (!s.available || s.slots === 0) return '';
   const slots = s.slots ?? hist?.slots;
-  if (!s.available || slots == null) return '';
+  if (slots == null) return '';
   if (s.capacity != null && s.estimatedBooked != null) {
     return `${s.estimatedBooked}/${s.capacity} booked · ${slots} spot${slots === 1 ? '' : 's'} left`;
   }
   return `${slots} spot${slots === 1 ? '' : 's'} left`;
 }
 
+function isDetailFailedStatus(status) {
+  return status === 'failed' || (typeof status === 'string' && status.startsWith('failed_'));
+}
+
 function formatDetailStatusLine(s) {
   const status = s.detailStatus || s.detail_status;
-  if (!s.available) return '';
+  if (!s.available && s.slots !== 0) return '';
   if (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null) return '';
-  if (status === 'checking') return 'checking details';
-  if (status === 'failed') return 'details unavailable';
+  if (status === 'checking') return 'details pending';
+  if (isDetailFailedStatus(status)) return 'details unavailable';
+  if (status === 'checked_no_slots_visible') return 'details unavailable';
+  if (status === 'pending' || !status) return 'details pending';
   return 'details pending';
 }
 
@@ -1718,23 +1725,32 @@ function formatRelativeTime(iso) {
 function freshnessLabel(s) {
   const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
   const basicAt = s.lastBasicCheckAt || s.last_basic_check_at || s.lastScraped;
-  const hasDetails = s.slots != null || s.capacity != null || s.priceText || s.priceMin != null;
+  const hasDetails = s.slots != null || s.slots === 0 || s.capacity != null || s.priceText || s.priceMin != null;
   const detailStatus = s.detailStatus || s.detail_status;
 
-  if (hasDetails && detailedAt) {
+  if (isDetailFailedStatus(detailStatus) && detailedAt) {
+    const rel = formatRelativeTime(detailedAt);
+    const scheduleRel = basicAt ? formatRelativeTime(basicAt) : null;
+    const parts = [];
+    if (scheduleRel) parts.push(`schedule updated ${scheduleRel}`);
+    if (rel) parts.push(`details failed ${rel}`);
+    return parts.join(' · ');
+  }
+
+  if (hasDetails && detailedAt && !isDetailFailedStatus(detailStatus)) {
     const rel = formatRelativeTime(detailedAt);
     return rel ? `details updated ${rel}` : '';
   }
-  if (detailStatus === 'failed') {
-    if (basicAt) {
-      const rel = formatRelativeTime(basicAt);
-      return rel ? `schedule updated ${rel}` : '';
-    }
-    return '';
-  }
+
   if (basicAt) {
     const rel = formatRelativeTime(basicAt);
-    return rel ? `schedule updated ${rel} · details pending` : 'details pending';
+    if (detailStatus === 'checked_no_slots_visible') {
+      return rel ? `schedule updated ${rel} · details unavailable` : 'details unavailable';
+    }
+    if (detailStatus === 'checking' || detailStatus === 'pending' || !detailStatus) {
+      return rel ? `schedule updated ${rel} · details pending` : 'details pending';
+    }
+    return rel ? `schedule updated ${rel}` : '';
   }
   return '';
 }
@@ -1774,15 +1790,16 @@ function formatSpotCountShort(slots) {
 
 function sessionConditionDisplay(s, hist) {
   const slots = s.slots ?? hist?.slots;
-  if (!s.available) {
-    return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots };
+  if (!s.available || s.slots === 0) {
+    return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots: 0 };
   }
   if (slots == null) {
     const detailHint = formatDetailStatusLine(s);
+    const sub = detailHint === 'details unavailable' ? 'details unavailable' : 'details pending';
     return {
       primary: 'Open',
-      sub: detailHint || null,
-      desktop: detailHint ? `Open · ${detailHint}` : 'Open',
+      sub: detailHint ? sub : null,
+      desktop: detailHint ? `Open · ${sub}` : 'Open',
       color: '#00c9a7',
       slots: null,
     };

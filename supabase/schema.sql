@@ -46,6 +46,7 @@ create table if not exists current_sessions (
   last_scraped_at timestamptz not null default now(),
   last_basic_check_at timestamptz,
   last_detailed_check_at timestamptz,
+  -- pending | checking | checked_with_slots | checked_packed_no_slots | checked_no_slots_visible | failed_modal_open | failed_selector | failed_parse | failed_timeout
   detail_status text,
   detail_error text,
   primary key (park, session_key)

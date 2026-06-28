@@ -105,14 +105,45 @@ curl -s -X POST http://localhost:3000/api/admin/run-tier1 | jq
 ## Today/tomorrow detail reliability
 
 ```bash
-curl -s http://localhost:3000/api/debug/date/$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso) | jq '{sessionsCount,sessionsWithSlotsCount,sessionsWithDetailsUnavailableCount,detailsUnavailableReason,tier1HasRunRecently,lastTier1Scrape,sampleSessionsMissingDetails}'
+curl -s http://localhost:3000/api/debug/date/$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso) | jq '{sessionsCount,sessionsWithSlotsCount,failedDetailsCount,failedDetailsSample,checkedButNoSlotsSample,detailStatusSummary,tier1HasRunRecently}'
 curl -s http://localhost:3000/api/debug/collector | jq '{minutesSinceLastTier1,lastTier1DurationMs,likelySleepingOrRestarted,lastApiSessionsDurationMs}'
 ```
 
 1. `/api/sessions?date=<today>` returns in under 1s (check `apiDurationMs` in response).
 2. Today cards render immediately; refresh triggers background detail check (does not block).
 3. After Tier 1 runs, today sessions should have slots/booked where the booking site exposes them.
-4. Cards show `details updated Xm ago` when slots known; `schedule updated Xm ago · details pending` when not.
+4. Cards show `details updated Xm ago` when slots known; `schedule updated Xm ago · details pending` when not; `details failed Xm ago` after a failed detail scrape (prior slot counts preserved).
+
+---
+
+## Detail extraction diagnostics
+
+1. **Date debug — failure samples:**
+
+```bash
+TODAY=$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso)
+curl -s "http://localhost:3000/api/debug/date/$TODAY" | jq '{failedDetailsCount,failedDetailsSample,checkedButNoSlotsSample,detailStatusSummary}'
+```
+
+2. **Single session debug:**
+
+```bash
+curl -s http://localhost:3000/api/debug/session/<session_key> | jq '{parseResult,latestDetailAttempt,recentDetailErrors}'
+```
+
+3. **Retry failed/missing details for a date:**
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/enrich-date \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-29","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedNoSlotsVisible,sessionsFailed,topErrors}'
+```
+
+4. Confirm `failedDetailsSample` explains tile/modal/selector failures.
+5. Confirm `sessionsWithSlotsCount` increases after parser fixes when re-running enrich-date.
+6. Confirm packed sessions get `slots_available = 0` and `detail_status = checked_packed_no_slots`.
+7. Confirm a failed retry does not wipe previously known slot counts.
+8. Confirm cards show booked line (`8/12 booked · 4 spots left`), `Packed`, or `Open · details pending/unavailable`.
 
 ---
 
@@ -131,7 +162,7 @@ curl -s http://localhost:3000/api/status | jq '{detailCoveragePercent, sessionsW
 3. **Debug a date:**
 
 ```bash
-curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{sessionsCount, sessionsWithSlotsCount, sessionsWithCapacityCount, sessionsWithPriceCount, detailStatusSummary, latestLastDetailedCheckAt, sampleSessions}'
+curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{sessionsCount, sessionsWithSlotsCount, failedDetailsCount, detailStatusSummary, failedDetailsSample, checkedButNoSlotsSample}'
 ```
 
 3b. **Enrichment worker health:**
@@ -145,7 +176,7 @@ curl -s http://localhost:3000/api/debug/enrichment | jq '{queuePending, queueRun
 ```bash
 curl -s -X POST http://localhost:3000/api/admin/enrich-date \
   -H 'Content-Type: application/json' \
-  -d '{"isoDate":"2026-07-02"}' | jq
+  -d '{"isoDate":"2026-07-02","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedNoSlotsVisible,sessionsFailed,topErrors}'
 ```
 
 5. Confirm Jul 2 sessions gain slots/capacity/price where the booking site exposes them.
@@ -154,7 +185,7 @@ curl -s -X POST http://localhost:3000/api/admin/enrich-date \
 8. Confirm future sessions remain visible when details are pending (not hidden).
 9. Confirm `availability_snapshots` rows include `snapshot_type` `basic` and `detailed`, plus `hour` for heat-map analytics.
 10. Confirm app loads saved data immediately on hard refresh.
-11. Confirm every session card shows **Updated Xm ago** from `last_detailed_check_at` or `last_basic_check_at`.
+11. Confirm cards show separate schedule vs detail freshness (`schedule updated …`, `details updated …`, or `details failed …`).
 
 ---
 
