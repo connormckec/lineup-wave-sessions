@@ -533,6 +533,7 @@ const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 const STORAGE = {
   userKey: 'ap_user_key',
   profileCode: 'ap_profile_code',
+  activeDayKey: 'ap_active_day_key',
   ntfyTopic: 'ap_ntfy_topic',
   watchlist: 'ap_watchlist',
   statusCache: 'ap_status_cache',
@@ -1000,10 +1001,57 @@ function isDateChecked(dateKey) {
   return checkedDatesSet().has(dateKey);
 }
 
+function mergeSessionsSticky(prev, incoming) {
+  const prevList = asSessionArray(prev);
+  const nextList = asSessionArray(incoming);
+  if (!nextList.length) return prevList;
+  if (!prevList.length) return nextList;
+  const byKey = new Map(prevList.map(s => [s.key, s]));
+  for (const s of nextList) {
+    byKey.set(s.key, { ...byKey.get(s.key), ...s });
+  }
+  return [...byKey.values()];
+}
+
+function saveActiveDayKey(dateKey) {
+  if (dateKey) localStorage.setItem(STORAGE.activeDayKey, dateKey);
+}
+
+function loadActiveDayKey() {
+  const saved = localStorage.getItem(STORAGE.activeDayKey);
+  const tk = todayKey();
+  if (!saved || saved < tk) {
+    activeDayKey = tk;
+    saveActiveDayKey(activeDayKey);
+    return;
+  }
+  activeDayKey = saved;
+}
+
+function validateActiveDayKey() {
+  const days = getPickerDays();
+  const tk = todayKey();
+  if (activeDayKey < tk) {
+    activeDayKey = tk;
+    saveActiveDayKey(activeDayKey);
+    return;
+  }
+  if (days.length && !days.includes(activeDayKey)) {
+    if (sessionCountForDate(activeDayKey) > 0) return;
+    if (!isDateChecked(activeDayKey)) return;
+    activeDayKey = tk;
+    saveActiveDayKey(activeDayKey);
+  }
+}
+
 function loadStatusCache() {
   try {
     const raw = localStorage.getItem(STORAGE.statusCache);
-    if (!raw) return;
+    loadActiveDayKey();
+    if (!raw) {
+      renderAll();
+      return;
+    }
     const cached = JSON.parse(raw);
     if (asSessionArray(cached.sessions).length) {
       data = {
@@ -1012,6 +1060,10 @@ function loadStatusCache() {
         sessions: asSessionArray(cached.sessions),
         history: cached.history && typeof cached.history === 'object' ? cached.history : {},
       };
+      if (cached.activeDayKey && cached.activeDayKey >= todayKey()) {
+        activeDayKey = cached.activeDayKey;
+      }
+      validateActiveDayKey();
       renderAll();
     }
   } catch (e) {
@@ -1029,8 +1081,10 @@ function saveStatusCache() {
       scrapeInProgress: data.scrapeInProgress,
       lastScrapeError: data.lastScrapeError,
       source: data.source || data.dataSource,
+      dataSource: data.dataSource || data.source,
       effectiveWeeksAhead: data.effectiveWeeksAhead || data.scrapeMeta?.effectiveWeeksAhead,
       datesCheckedDuringScrape: data.datesCheckedDuringScrape || data.scrapeMeta?.datesCheckedDuringScrape,
+      activeDayKey,
     }));
   } catch (e) {
     console.warn('[cache] save failed', e);
@@ -1045,6 +1099,7 @@ function shiftActiveDay(delta) {
   if (nextIdx < 0 || nextIdx >= days.length) return;
   if (delta < 0 && days[nextIdx] < todayKey()) return;
   activeDayKey = days[nextIdx];
+  saveActiveDayKey(activeDayKey);
   renderBrowse();
   updateDateNavButtons();
 }
@@ -1166,10 +1221,14 @@ async function refresh() {
   btn.classList.add('spinning');
   const prevSessions = asSessionArray(data.sessions);
   try {
-    const res = await fetch(`/api/status?user_key=${encodeURIComponent(getUserKey())}`);
+    const params = new URLSearchParams({
+      user_key: getUserKey(),
+      selected_date: activeDayKey || todayKey(),
+    });
+    const res = await fetch(`/api/status?${params}`);
     const payload = await res.json();
     const incoming = asSessionArray(payload.sessions);
-    const sessions = incoming.length > 0 || !prevSessions.length ? incoming : prevSessions;
+    const sessions = mergeSessionsSticky(prevSessions, incoming);
     data = {
       ...payload,
       sessions,
@@ -1179,14 +1238,18 @@ async function refresh() {
     mergeWatchlistFromServer(data.watchList);
     data.watchList = watchlistForUi();
     saveStatusCache();
+    validateActiveDayKey();
     const withSlots = data.sessions.filter(s => s.slots != null).length;
-    console.log(`[refresh] ${data.sessions.length} sessions, ${withSlots} with slot counts`);
+    console.log(`[refresh] ${data.sessions.length} sessions (${withSlots} with slots), date=${activeDayKey}, source=${data.dataSource}`);
     if (!activeDayKey) activeDayKey = todayKey();
     renderAll();
     updateDateNavButtons();
     scheduleRefreshPoll();
   } catch {
-    if (prevSessions.length) renderAll();
+    if (prevSessions.length) {
+      data.sessions = prevSessions;
+      renderAll();
+    }
     document.getElementById('status-text').innerHTML =
       '<span class="check-time">Connection error · showing saved data</span>';
   } finally {
@@ -1271,7 +1334,7 @@ function renderStatusBar() {
     detail = 'waiting for first scrape';
   } else if (lastScrapeError && trackedCount > 0) {
     detail = 'showing saved data · refresh failed';
-  } else if (isUsingCachedData || src === 'supabase') {
+  } else if (isUsingCachedData || src === 'supabase' || src === 'supabase/current_sessions') {
     detail = `showing saved data · checked ${ageLabel(ageMins) || 'earlier'}`;
   } else {
     detail = `checked ${ageLabel(ageMins) || 'just now'}`;
@@ -1316,19 +1379,21 @@ function renderBrowse() {
   const listEl = document.getElementById('session-list');
   if (!filtered.length) {
     const daySessions = surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
-    const checked = isDateChecked(activeDayKey);
-    const hasSavedForDay = daySessions.length > 0;
+    const wasChecked = data.selectedDateWasChecked ?? isDateChecked(activeDayKey);
+    const hasSavedForDay = daySessions.length > 0 || data.selectedDateHasSavedSessions;
     let msg;
-    if (!checked && data.scrapeInProgress && !hasSavedForDay) {
+    if (!wasChecked && !hasSavedForDay && data.scrapeInProgress) {
       msg = 'Still checking this date…';
-    } else if (!checked && !hasSavedForDay) {
+    } else if (!wasChecked && !hasSavedForDay) {
       msg = 'Not checked yet';
-    } else if (!daySessions.length) {
+    } else if (!daySessions.length && wasChecked) {
       msg = 'No sessions found for this date';
     } else if (activeDayKey === todayKey() && daySessions.length && !daySessions.some(s => isSessionUpcoming(s, activeDayKey))) {
       msg = 'No upcoming sessions today';
     } else if (daySessions.length) {
       msg = 'No sessions match these filters';
+    } else if (!wasChecked) {
+      msg = 'Not checked yet';
     } else {
       msg = 'No sessions found for this date';
     }
@@ -1613,6 +1678,7 @@ function closePicker() {
 
 function applyPicker() {
   activeDayKey = pickerDraft.dayKey;
+  saveActiveDayKey(activeDayKey);
   filterFromH = pickerDraft.fromH;
   filterToH = pickerDraft.toH;
   closePicker();

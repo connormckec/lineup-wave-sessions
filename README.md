@@ -47,7 +47,9 @@ On startup the server loads saved sessions from `current_sessions` before accept
 - **`GET /api/status`** returns saved sessions immediately; if memory is empty it reloads from Supabase first.
 - While a scrape runs, the header shows **`checked Xm ago · refreshing…`** and sessions stay on screen.
 - If a refresh fails, the app keeps last known good data with **`showing saved data · refresh failed`**.
-- **`dataSource`**: `"supabase"` when serving persisted data, `"memory-fallback"` when Supabase is unavailable.
+- **`dataSource`**: `"supabase/current_sessions"` when serving persisted rows, `"memory-fallback"` when Supabase is unavailable.
+- `/api/status` reloads `current_sessions` from Supabase on every request (without disturbing in-progress scrape date tracking).
+- Status includes `selectedDateDebug` when `selected_date` query param is passed.
 - Status fields include `currentSessionsCount`, `lastSuccessfulScrape`, `lastScrapeAttempt`, `minutesSinceLastScrape`, `scrapeInProgress`, `missingDatesInScrapeWindow`, `coveragePercent`, and `watchlistSideDebug` (stored vs canonical wave side).
 - Session cards show price when scraped (`price_text` / min–max) and booked counts only when capacity is known.
 

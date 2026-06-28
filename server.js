@@ -65,6 +65,7 @@ let slotChecksThisCycle = 0;
 let weeksAvailableOnSite = null; // detected from booking UI
 let effectiveWeeksAhead  = SCRAPE_WEEKS_AHEAD;
 const datesCheckedDuringScrape = new Set();
+let persistedDatesChecked = new Set();
 const lastTierRun = { 1: null, 2: null, 3: null, 4: null };
 let lastHistorySnapshotSavedAt = null;
 let lastLatestSnapshotSavedAt = null;
@@ -134,6 +135,7 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
     if (Array.isArray(meta.datesCheckedDuringScrape)) {
       datesCheckedDuringScrape.clear();
       for (const d of meta.datesCheckedDuringScrape) datesCheckedDuringScrape.add(d);
+      persistedDatesChecked = new Set(meta.datesCheckedDuringScrape);
     }
   }
   if (loadedAt) {
@@ -143,9 +145,32 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
 }
 
 function normalizeDataSource(src) {
-  if (src === 'supabase-current' || src === 'supabase-cache' || src === 'supabase') return 'supabase';
-  if (src === 'memory' && supabaseConfigured) return 'supabase';
+  if (src === 'supabase/current_sessions' || src === 'supabase-current' || src === 'supabase-cache' || src === 'supabase') {
+    return 'supabase/current_sessions';
+  }
+  if (src === 'memory' && supabaseConfigured) return 'supabase/current_sessions';
   return 'memory-fallback';
+}
+
+function datesCheckedForUi() {
+  return [...persistedDatesChecked].sort();
+}
+
+function sessionsForDate(dateKey) {
+  if (!dateKey) return [];
+  return sessions.filter(s => (s.dateKey || s.isoDate) === dateKey);
+}
+
+function buildSelectedDateDebug(selectedDate) {
+  if (!selectedDate) return null;
+  const dateSessions = sessionsForDate(selectedDate);
+  const wasChecked = persistedDatesChecked.has(selectedDate) || dateSessions.length > 0;
+  return {
+    selectedDate,
+    selectedDateHasSavedSessions: dateSessions.length > 0,
+    selectedDateWasChecked: wasChecked,
+    sessionsForSelectedDateCount: dateSessions.length,
+  };
 }
 
 function currentRowToSession(row) {
@@ -268,10 +293,9 @@ function getStatusFields() {
 }
 
 async function ensureSessionsForStatus() {
-  if (sessions.length > 0) return;
   if (!supabase) return;
-  const loaded = await loadCurrentSessionsFromSupabase();
-  if (!loaded) await loadLatestSnapshotFromSupabase();
+  await loadCurrentSessionsFromSupabase({ reloadMeta: !scrapeInProgress });
+  if (!sessions.length) await loadLatestSnapshotFromSupabase();
 }
 
 function waveSideSlug(side) {
@@ -320,7 +344,7 @@ async function loadScrapeMetaFromSupabase() {
   }
 }
 
-async function loadCurrentSessionsFromSupabase() {
+async function loadCurrentSessionsFromSupabase({ reloadMeta = true } = {}) {
   if (!supabase) return false;
   try {
     const { data, error } = await supabase
@@ -340,7 +364,7 @@ async function loadCurrentSessionsFromSupabase() {
       if (s.key) sessionsByKey.set(s.key, s);
     }
     rebuildSessionsArray();
-    await loadScrapeMetaFromSupabase();
+    if (reloadMeta) await loadScrapeMetaFromSupabase();
 
     const latestScraped = data.reduce((max, row) => {
       const t = row.last_scraped_at ? new Date(row.last_scraped_at).getTime() : 0;
@@ -354,7 +378,7 @@ async function loadCurrentSessionsFromSupabase() {
       }
     }
 
-    dataSource = 'supabase';
+    dataSource = 'supabase/current_sessions';
     hasFreshScrapeThisBoot = false;
 
     const age = lastSuccessfulScrape
@@ -484,6 +508,7 @@ async function saveLatestSnapshotToSupabase() {
     }, { onConflict: 'id' });
     if (error) throw error;
     lastLatestSnapshotSavedAt = now;
+    persistedDatesChecked = new Set(datesCheckedDuringScrape);
     console.log(`  Supabase: saved snapshot (${sessions.length} sessions)`);
   } catch (e) {
     console.error('  Supabase save failed:', e.message);
@@ -945,17 +970,31 @@ function isOpenedTransition(watch, prevAvailable, prevSlots, session) {
   const currSlots = session.slots;
   const hasSpots = currSlots == null || currSlots > 0;
   if (!hasSpots) return false;
-
   if (prevAvailable === false) return true;
-  if (watch.last_seen_available === false) return true;
-  if (prevSlots === 0 && currSlots > 0) return true;
+  if (prevSlots === 0 && (currSlots == null || currSlots > 0)) return true;
   return false;
 }
 
 function wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots) {
   if (prevAvailable === false) return false;
   if (prevSlots === 0) return false;
-  if (watch.last_seen_available === false) return false;
+  return true;
+}
+
+function shouldSendLowSlotsAlert(watch, prevAvailable, prevSlots, currSlots, threshold) {
+  if (!wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots)) return false;
+  if (currSlots == null || currSlots > threshold) return false;
+  if (prevSlots == null) return false;
+  if (prevSlots <= currSlots) return false;
+  return true;
+}
+
+function shouldSendSellingFastAlert(watch, prevAvailable, prevSlots, currSlots, fastDrop) {
+  if (!wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots)) return false;
+  if (prevSlots == null || currSlots == null || currSlots >= prevSlots) return false;
+  const drop = prevSlots - currSlots;
+  if (drop < fastDrop) return false;
+  if (currSlots > 4 && drop < fastDrop + 1) return false;
   return true;
 }
 
@@ -983,7 +1022,7 @@ function minutesUntilSessionStart(session) {
   return Math.round((session.ts * 1000 - Date.now()) / 60_000);
 }
 
-// Per-session watch alerts (saved-search alerts can hook in here later).
+// Per-session watch alerts — one highest-priority event per scrape.
 async function evaluateSessionWatchAlerts(watch, session, ctx) {
   const {
     prevAvailable,
@@ -1006,85 +1045,64 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
     return;
   }
 
-  let sentOpened = false;
+  let chosen = null;
+
   if (watch.alert_when_opens !== false && isOpenedTransition(watch, prevAvailable, prevSlots, session)) {
-    sentOpened = await maybeSendWatchAlert(watch, session, 'opened', {
+    chosen = {
+      eventType: 'opened',
       urgent: true,
       detail: { ...alertDetail, eventReason: 'unavailable_to_available' },
-    });
+    };
   }
 
-  if (!slotsAlerts) {
-    if (!sentOpened && watch.alert_last_call !== false) {
-      const minsUntil = minutesUntilSessionStart(session);
-      if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && (currSlots == null || currSlots > 0)) {
-        await maybeSendWatchAlert(watch, session, 'last_call', {
-          urgent: true,
-          meta: { minutesUntil: minsUntil },
-          detail: { ...alertDetail, eventReason: 'last_call_window' },
-        });
-      }
-    }
-    return;
-  }
-
-  if (currSlots == null) return;
-
-  if (!sentOpened && watch.alert_when_low_slots !== false && wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots)) {
-    if (currSlots <= threshold) {
-      const crossedIntoLow = prevSlots == null || prevSlots > threshold;
-      const decreasedWhileLow = prevSlots != null && prevSlots > currSlots && currSlots <= threshold;
-      if (crossedIntoLow || decreasedWhileLow) {
-        await maybeSendWatchAlert(watch, session, 'low_slots', {
-          urgent: true,
-          detail: { ...alertDetail, eventReason: crossedIntoLow ? 'crossed_low_threshold' : 'decreased_while_low' },
-        });
-      }
-    }
-  }
-
-  if (!sentOpened && watch.alert_when_selling_fast !== false && wasAlreadyAvailableForLowSlots(watch, prevAvailable, prevSlots) && prevSlots != null && currSlots < prevSlots) {
-    const drop = prevSlots - currSlots;
-    let percentDrop = false;
-    if (prevSeenAt && prevSlots > 0) {
-      const minsSince = (Date.now() - prevSeenAt) / 60_000;
-      percentDrop = minsSince <= 30 && drop / prevSlots >= 0.4;
-    }
-    if (drop >= fastDrop || percentDrop) {
-      await maybeSendWatchAlert(watch, session, 'selling_fast', {
+  if (!chosen && slotsAlerts && currSlots != null) {
+    if (watch.alert_when_low_slots !== false
+      && shouldSendLowSlotsAlert(watch, prevAvailable, prevSlots, currSlots, threshold)) {
+      chosen = {
+        eventType: 'low_slots',
+        urgent: true,
+        detail: {
+          ...alertDetail,
+          eventReason: prevSlots > threshold ? 'crossed_low_threshold' : 'decreased_while_low',
+        },
+      };
+    } else if (watch.alert_when_selling_fast !== false
+      && shouldSendSellingFastAlert(watch, prevAvailable, prevSlots, currSlots, fastDrop)) {
+      chosen = {
+        eventType: 'selling_fast',
         urgent: currSlots <= threshold,
         meta: { fromSlots: prevSlots },
-        detail: { ...alertDetail, eventReason: percentDrop ? 'percent_drop_30m' : 'absolute_drop' },
-      });
+        detail: {
+          ...alertDetail,
+          eventReason: 'absolute_drop',
+        },
+      };
     }
   }
 
-  if (watch.alert_last_call !== false) {
+  if (!chosen && watch.alert_last_call !== false) {
     const minsUntil = minutesUntilSessionStart(session);
-    if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && currSlots > 0) {
-      await maybeSendWatchAlert(watch, session, 'last_call', {
+    if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && (currSlots == null || currSlots > 0)) {
+      chosen = {
+        eventType: 'last_call',
         urgent: true,
         meta: { minutesUntil: minsUntil },
         detail: { ...alertDetail, eventReason: 'last_call_window' },
-      });
+      };
     }
+  }
+
+  if (chosen) {
+    await maybeSendWatchAlert(watch, session, chosen.eventType, {
+      urgent: chosen.urgent,
+      meta: chosen.meta || {},
+      detail: chosen.detail,
+    });
   }
 }
 
-async function maybeSendImmediateWatchAlert(watch, session) {
-  if (!session?.available || session.slots == null) return;
-  if (watch.initial_available === false || session.slots === 0) return;
-  const threshold = watch.low_slots_threshold ?? THRESH;
-  if (watch.alert_when_low_slots !== false && session.slots <= threshold) {
-    await maybeSendWatchAlert(watch, session, 'low_slots', {
-      urgent: true,
-      detail: {
-        previousAvailable: watch.initial_available,
-        previousSlots: watch.initial_slots_available,
-        eventReason: 'immediate_low_on_watch',
-      },
-    });
-  }
+async function maybeSendImmediateWatchAlert(_watch, _session) {
+  // No alert when adding a watch — wait for a real state transition on the next scrape.
 }
 
 async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false } = {}) {
@@ -2412,7 +2430,7 @@ async function runTierScrape(tier) {
     lastScrapeError = null;
     lastScrapeErrorStack = null;
     hasFreshScrapeThisBoot = true;
-    dataSource = supabaseConfigured ? 'supabase' : 'memory-fallback';
+    dataSource = supabaseConfigured ? 'supabase/current_sessions' : 'memory-fallback';
 
     await upsertCurrentSessionsToSupabase(merged, tier);
     lastSnapshotRowsInsertedLastRun = await saveAvailabilitySnapshotsToSupabase(merged, tier);
@@ -2461,8 +2479,10 @@ async function detectWeeksOnStartup() {
 }
 
 // ── REST API ─────────────────────────────────────────────────────────────────
-function statusPayload(userKey = null) {
+function statusPayload(userKey = null, selectedDate = null) {
   const dateCoverage = computeDateCoverage();
+  const uiDatesChecked = datesCheckedForUi();
+  const selectedDateDebug = buildSelectedDateDebug(selectedDate);
   return {
     sessions: asSessionArray(sessions),
     watchList: watchlistForUser(userKey),
@@ -2481,6 +2501,12 @@ function statusPayload(userKey = null) {
       recentParses: recentSideParseLogs.slice(-12),
     },
     ...dateCoverage,
+    datesCheckedDuringScrape: uiDatesChecked,
+    selectedDate: selectedDate || null,
+    selectedDateHasSavedSessions: selectedDateDebug?.selectedDateHasSavedSessions ?? null,
+    selectedDateWasChecked: selectedDateDebug?.selectedDateWasChecked ?? null,
+    sessionsForSelectedDateCount: selectedDateDebug?.sessionsForSelectedDateCount ?? null,
+    selectedDateDebug,
     scrapeMeta: {
       weeksAvailableOnSite,
       effectiveWeeksAhead,
@@ -2488,6 +2514,7 @@ function statusPayload(userKey = null) {
       lastTierRun: { ...lastTierRun },
       supabaseConfigured,
       ...dateCoverage,
+      datesCheckedDuringScrape: uiDatesChecked,
     },
     ...getStatusFields(),
   };
@@ -2496,20 +2523,24 @@ function statusPayload(userKey = null) {
 app.get('/api/status', async (req, res) => {
   try {
     await ensureSessionsForStatus();
-    res.json(statusPayload(req.query.user_key || null));
+    const selectedDate = req.query.selected_date || req.query.selectedDate || null;
+    res.json(statusPayload(req.query.user_key || null, selectedDate));
   } catch (e) {
     console.error('/api/status error:', e.message);
-    res.json({ ...statusPayload(req.query.user_key || null), statusError: e.message });
+    const selectedDate = req.query.selected_date || req.query.selectedDate || null;
+    res.json({ ...statusPayload(req.query.user_key || null, selectedDate), statusError: e.message });
   }
 });
 
 app.get('/api/sessions', async (req, res) => {
   try {
     await ensureSessionsForStatus();
-    res.json(statusPayload(req.query.user_key || null));
+    const selectedDate = req.query.selected_date || req.query.selectedDate || null;
+    res.json(statusPayload(req.query.user_key || null, selectedDate));
   } catch (e) {
     console.error('/api/sessions error:', e.message);
-    res.json({ ...statusPayload(req.query.user_key || null), statusError: e.message });
+    const selectedDate = req.query.selected_date || req.query.selectedDate || null;
+    res.json({ ...statusPayload(req.query.user_key || null, selectedDate), statusError: e.message });
   }
 });
 

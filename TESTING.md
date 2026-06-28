@@ -88,6 +88,32 @@ curl -s -X POST http://localhost:3000/api/notify/test -H 'Content-Type: applicat
 - Check `/api/status` → `waveSideDebug.ambiguousSamples` if Left/Right labels look wrong.
 - Side is parsed from tile tooltip text and column headers first; wave index is fallback only.
 
+### Alert priority (non-noisy)
+
+Per scrape, at most **one** alert fires per watched session, in priority order: `opened` → `low_slots` → `selling_fast` → `last_call`.
+
+| Transition | Expected |
+|---|---|
+| unavailable → 1–4 slots | `opened` |
+| 5 → 2 slots (already available) | `low_slots` |
+| 2 → 4 slots | **nothing** |
+| 8 → 4 slots | `selling_fast` (drop ≥ 3) |
+| 4 → 4 slots | **nothing** |
+
+Adding a watch does **not** send an immediate alert — only real transitions on the next scrape.
+
+### Saved data on app open
+
+1. Hard-refresh with rows in `current_sessions`.
+2. Sessions render immediately from cache/API — not blank while `scrapeInProgress`.
+3. Status shows `checked Xm ago · refreshing…` when a scrape is running.
+4. Unchecked dates show **Not checked yet**, not **No sessions found**.
+5. `/api/status?selected_date=YYYY-MM-DD` returns `selectedDateDebug` with coverage fields.
+
+```bash
+curl -s 'http://localhost:3000/api/status?selected_date=2026-07-02' | jq '{dataSource, currentSessionsCount, scrapeInProgress, selectedDateDebug}'
+```
+
 ### Opened vs low-slot alerts
 
 - Watching a **packed/sold-out** session should produce an **`opened`** alert when spots appear — not `low_slots`.
