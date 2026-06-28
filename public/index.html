@@ -571,7 +571,7 @@ const STORAGE = {
 };
 
 const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
-const SW_CACHE_VERSION = '3';
+const SW_CACHE_VERSION = '4';
 let cachedUserKey = null;
 let lastFocusRefreshAt = 0;
 let serverWatchlistCount = null;
@@ -1063,8 +1063,16 @@ function mergeWatchlistServerPreferred(serverList) {
   saveLocalWatchlist(localWatchlist);
 }
 
+function purgeExpiredWatchlistLocal() {
+  const before = localWatchlist.length;
+  localWatchlist = localWatchlist.filter(w => !isWatchItemPast(w));
+  if (localWatchlist.length !== before) saveLocalWatchlist(localWatchlist);
+}
+
 function watchlistForUi() {
-  return localWatchlist;
+  return localWatchlist
+    .map(normalizeWatchItem)
+    .filter(w => w.active !== false && !isWatchItemPast(w));
 }
 
 function isWatched(sessionKey) {
@@ -1182,6 +1190,80 @@ const WAVE_FILTERS = [
 const LESSON_WAVES = [3, 4];
 const BOOKING_TZ = 'America/New_York';
 
+function getParkTodayIso() {
+  return todayKey();
+}
+
+function addDaysToParkIso(isoDate, days) {
+  const [y, m, d] = String(isoDate).slice(0, 10).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
+  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(dt);
+}
+
+function getRelativeDateLabel(isoDate) {
+  if (!isoDate) return '';
+  const today = getParkTodayIso();
+  if (isoDate === today) return 'Today';
+  if (isoDate === addDaysToParkIso(today, 1)) return 'Tomorrow';
+  const [y, mo, da] = isoDate.split('-').map(Number);
+  const ref = new Date(Date.UTC(y, mo - 1, da, 17, 0, 0));
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    timeZone: BOOKING_TZ,
+  }).format(ref);
+}
+
+function browserLocalDateIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function isSessionPast(session, nowMs = Date.now()) {
+  const ts = session?.start_ts ?? session?.ts ?? session?.startTs;
+  if (ts == null) return false;
+  const startMs = Number(ts) * 1000;
+  if (!Number.isFinite(startMs)) return false;
+  const durationMs = (session?.durationMinutes || 90) * 60 * 1000;
+  return nowMs > startMs + durationMs;
+}
+
+function normalizeSessionDate(session) {
+  if (!session) return session;
+  const iso = dateKeyFromSession(session);
+  return { ...session, isoDate: iso, dateKey: iso };
+}
+
+function normalizeWatchItem(w) {
+  const sessionKey = w.session_key || w.key;
+  const live = data.sessions.find(s => s.key === sessionKey);
+  const iso = w.iso_date || w.isoDate || w.dateKey || (live ? dateKeyFromSession(live) : null)
+    || (w.start_ts || w.ts ? new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date((w.start_ts || w.ts) * 1000)) : null);
+  return normalizeSessionDate({
+    ...w,
+    key: sessionKey,
+    session_key: sessionKey,
+    iso_date: iso,
+    isoDate: iso,
+    dateKey: iso,
+    ts: w.start_ts ?? w.ts ?? live?.ts ?? null,
+    level: w.session_type || w.level || live?.level || null,
+    session_type: w.session_type || w.level || live?.level || null,
+    time: w.time || w.start_time || live?.time || null,
+    waveSide: w.wave_side || w.waveSide || live?.waveSide || null,
+    wave: w.wave ?? live?.wave ?? null,
+    slots: live?.slots ?? w.slots ?? null,
+    available: live?.available ?? w.available,
+    lastDetailedCheckAt: live?.lastDetailedCheckAt ?? w.lastDetailedCheckAt ?? null,
+    lastBasicCheckAt: live?.lastBasicCheckAt ?? w.lastBasicCheckAt ?? null,
+  });
+}
+
+function isWatchItemPast(w) {
+  return isSessionPast(normalizeWatchItem(w));
+}
+
 const EXCLUDED_LEVELS = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES  = [5, 6];
 
@@ -1254,10 +1336,12 @@ function todayKey() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date());
 }
 
+function getParkTodayIso() {
+  return todayKey();
+}
+
 function tomorrowKey() {
-  const [y, m, d] = todayKey().split('-').map(Number);
-  const dt = new Date(y, m - 1, d + 1, 12, 0, 0, 0);
-  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+  return addDaysToParkIso(getParkTodayIso(), 1);
 }
 
 function isSessionUpcoming(s, selectedDateKey) {
@@ -1340,12 +1424,7 @@ function dateKeyFromSession(s) {
 }
 
 function dateLabel(dateKey) {
-  const d = new Date(dateKey + 'T12:00:00');
-  const today = new Date(); today.setHours(12, 0, 0, 0);
-  const tom = new Date(today); tom.setDate(tom.getDate() + 1);
-  if (d.toDateString() === today.toDateString()) return 'Today';
-  if (d.toDateString() === tom.toDateString()) return 'Tomorrow';
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  return getRelativeDateLabel(dateKey);
 }
 
 function getPickerDays() {
@@ -1356,12 +1435,10 @@ function getPickerDays() {
     || 4;
   const count = weeks * 7;
   const days = [];
-  const start = new Date();
-  start.setHours(12, 0, 0, 0);
+  let cur = getParkTodayIso();
   for (let i = 0; i < count; i++) {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    days.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+    days.push(cur);
+    cur = addDaysToParkIso(cur, 1);
   }
   return days;
 }
@@ -1920,7 +1997,8 @@ function renderStatusBar() {
   const loadedCount = asSessionArray(data.sessions).length;
   const selectedCount = selectedDateSessions.length;
   const trackedCount = selectedCount || loadedCount || (currentSessionsCount ?? sessionsCount ?? 0);
-  const hasSavedForView = selectedCount > 0 || selectedDateMeta.hasSavedSessions;
+  const hasSavedReason = ['saved_sessions_found', 'fallback_sessions_found'].includes(selectedDateMeta.statusReason);
+  const hasSavedForView = selectedCount > 0 || selectedDateMeta.hasSavedSessions || hasSavedReason;
   const ageMins = minutesSinceLastScrape ?? dataAgeMinutes;
   const src = source || dataSource;
 
@@ -1937,7 +2015,7 @@ function renderStatusBar() {
     detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
   } else if (scrapeInProgress) {
     detail = 'refreshing…';
-  } else if (!trackedCount && !lastSuccessfulScrape && !hasSavedForView) {
+  } else if (!hasSavedForView && !lastSuccessfulScrape && !scrapeInProgress) {
     detail = 'waiting for first scrape';
   } else if (lastScrapeError && trackedCount > 0) {
     detail = 'showing saved data · refresh failed';
@@ -1961,7 +2039,7 @@ function renderStatusBar() {
     return;
   }
 
-  if (!trackedCount && !lastSuccessfulScrape && !hasSavedForView) {
+  if (!hasSavedForView && !lastSuccessfulScrape && !scrapeInProgress && !trackedCount) {
     txt.innerHTML = `<span class="check-time">${detail}</span>`;
     return;
   }
@@ -2140,17 +2218,18 @@ function renderWatching() {
   }
 
   el.innerHTML = list.map(w => {
-    const cfg  = LEVELS[w.level || w.session_type] || { s:'?', c:'#5d8aa8' };
-    const sessionKey = w.session_key || w.key;
-    const live = data.sessions.find(s => s.key === sessionKey);
+    const item = normalizeWatchItem(w);
+    const cfg  = LEVELS[item.level || item.session_type] || { s:'?', c:'#5d8aa8' };
+    const sessionKey = item.session_key || item.key;
+    const live = data.sessions.find(s => s.key === sessionKey) || item;
     const hist = data.history[sessionKey] || {};
-    const slots = live?.slots ?? w.slots ?? hist.slots;
-    const side = live?.waveSide || w.waveSide || w.wave_side || (live ? waveLabel(live.wave) : waveLabel(w.wave));
-    const booked = live ? formatBookedLine(live, hist) : (w.slots != null ? formatSpotCountShort(w.slots) : '');
-    const price = live ? formatPrice(live) : (w.priceText ? w.priceText : '');
+    const slots = live?.slots ?? item.slots ?? hist.slots;
+    const side = live?.waveSide || item.waveSide || item.wave_side || (live?.wave != null ? waveLabel(live.wave) : waveLabel(item.wave));
+    const booked = formatBookedLine(live, hist);
+    const price = formatPrice(live);
     let statusHtml = '<div class="wc-status" style="color:var(--sub)">Latest data unavailable</div>';
 
-    if (live) {
+    if (live && live.key) {
       const display = sessionConditionDisplay(live, hist);
       if (live.available) {
         statusHtml = conditionBadgeHtml(display);
@@ -2161,15 +2240,16 @@ function renderWatching() {
 
     const slotsText = booked ? ` · ${booked}` : '';
     const priceText = price ? ` · ${price}` : '';
-    const dateLine = w.dayLabel || w.date || w.iso_date || '';
-    // Deep-link hook: append ?date= when Atlantic Park supports session-specific URLs
+    const iso = item.iso_date || dateKeyFromSession(item);
+    const dateLine = getRelativeDateLabel(iso);
+    const fresh = freshnessLabel(live);
     const bookUrl = BOOKING_URL;
 
     return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
         <div>
-          <div class="wc-title" style="color:${cfg.c}">${w.level || w.session_type}</div>
-          <div class="wc-meta">${dateLine} · ${(w.time || '').toUpperCase()} · ${side}${slotsText}${priceText}</div>
+          <div class="wc-title" style="color:${cfg.c}">${item.level || item.session_type}</div>
+          <div class="wc-meta">${dateLine} · ${(item.time || '').toUpperCase()} · ${side}${slotsText}${priceText}${fresh ? ` · ${fresh}` : ''}</div>
         </div>
         <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>
@@ -2196,7 +2276,9 @@ function renderDebugState() {
   const rows = [
     ['App version', data.appVersion || '—'],
     ['Build time', fmtTime(data.buildTime)],
-    ['Selected date', activeDayKey || todayKey()],
+    ['Selected date (park)', activeDayKey || getParkTodayIso()],
+    ['Browser local date', browserLocalDateIso()],
+    ['App Eastern today', getParkTodayIso()],
     ['Selected date endpoint', selectedDateMeta.endpoint || '—'],
     ['Returned sessions', String(selectedDateMeta.sessionsCount ?? selectedDateSessions.length)],
     ['Status reason', selectedDateMeta.statusReason || '—'],
@@ -2302,15 +2384,14 @@ async function toggleWatch(sJson) {
       key: s.key,
       start_ts: s.ts,
       ts: s.ts,
-      iso_date: s.dateKey,
-      dateKey: s.dateKey,
+      iso_date: dateKeyFromSession(s),
+      dateKey: dateKeyFromSession(s),
       wave_side: s.waveSide,
       waveSide: s.waveSide,
       session_type: s.level,
       level: s.level,
       time: s.time,
       date: s.date,
-      dayLabel: s.dayLabel,
       wave: s.wave,
     };
     const res = await fetchApi('/api/watchlist', {
@@ -2505,8 +2586,9 @@ initTimeSelects();
       loadActiveDayKey();
     } catch (e) {
       console.warn('[boot] loadActiveDayKey', e);
-      activeDayKey = todayKey();
+      activeDayKey = getParkTodayIso();
     }
+    activeDayKey = normalizeIsoDate(activeDayKey);
 
     const profilePromise = initProfileUserKey().catch((e) => {
       console.warn('[boot] profile init failed', e);
@@ -2514,24 +2596,39 @@ initTimeSelects();
       if (stored) cachedUserKey = stored;
     });
 
+    await loadSelectedDateSessions(activeDayKey, { silent: false });
+    finishLoading(selectedDateSessions.length ? 'ready' : 'loading');
+    safeRenderAll();
+
     await Promise.race([
-      (async () => {
-        await refresh({ silent: true });
-        await loadSelectedDateSessions(activeDayKey, { silent: true });
-      })(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Session fetch timeout 5s')), BOOT_FAILSAFE_MS)),
-    ]);
+      refresh({ silent: true }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Background refresh timeout 8s')), 8000)),
+    ]).catch((err) => {
+      console.warn('[boot] background refresh', err?.message || err);
+      if (selectedDateSessions.length) finishLoading('ready');
+    });
 
     profilePromise.catch(() => {});
-    loadWatchlistFromServer().catch((err) => {
+    loadWatchlistFromServer().then(() => {
+      purgeExpiredWatchlistLocal();
+      safeRenderAll();
+    }).catch((err) => {
       console.warn('[boot] watchlist load failed', err);
       watchlistLoadState = localWatchlist.length ? 'ready' : 'error';
+      purgeExpiredWatchlistLocal();
     });
 
     finishLoading('ready');
     safeRenderAll();
     scheduleRefreshPoll();
   } catch (err) {
+    if (selectedDateSessions.length) {
+      finishLoading('ready');
+      safeRenderAll();
+      scheduleRefreshPoll();
+      console.warn('[boot] partial — saved date sessions rendered', err);
+      return;
+    }
     showBootError(err);
   }
 })();

@@ -535,26 +535,35 @@ async function loadSessionsForDateAllSources(isoDate, { skipPrimary = false } = 
     return { sessions: [], dataSource: 'none', isFallback: false };
   }
 
-  if (!skipPrimary && supabase && supabaseSchemaHealth.currentSessionsAvailable !== false) {
-    try {
-      const { data, error } = await supabase
-        .from('current_sessions')
-        .select('*')
-        .eq('park', PARK)
-        .eq('iso_date', isoDate)
-        .order('start_ts', { ascending: true });
-      if (!error && data?.length) {
-        const dateSessions = data.map(currentRowToSession).filter(s => s?.key);
-        mergeSessionsIntoStore(dateSessions);
-        return {
-          sessions: dateSessions,
-          dataSource: 'supabase/current_sessions',
-          isFallback: false,
-        };
+  if (!skipPrimary && supabase) {
+    const tableMissing = supabaseSchemaHealth.checkedAt && !supabaseSchemaHealth.currentSessionsAvailable;
+    if (!tableMissing) {
+      try {
+        const { data, error } = await supabase
+          .from('current_sessions')
+          .select('*')
+          .eq('park', PARK)
+          .eq('iso_date', isoDate)
+          .order('start_ts', { ascending: true });
+        if (!error && data?.length) {
+          const dateSessions = data.map(currentRowToSession).filter(s => s?.key);
+          mergeSessionsIntoStore(dateSessions);
+          return {
+            sessions: dateSessions,
+            dataSource: 'supabase/current_sessions',
+            isFallback: false,
+          };
+        }
+        if (error && !isMissingTableError(error)) throw error;
+        if (error && isMissingTableError(error)) {
+          supabaseSchemaHealth.currentSessionsAvailable = false;
+          if (!supabaseSchemaHealth.missingTables.includes('current_sessions')) {
+            supabaseSchemaHealth.missingTables.push('current_sessions');
+          }
+        }
+      } catch (e) {
+        if (!isMissingTableError(e)) console.warn(`  current_sessions date query ${isoDate}:`, e.message);
       }
-      if (error && !isMissingTableError(error)) throw error;
-    } catch (e) {
-      if (!isMissingTableError(e)) console.warn(`  current_sessions date query ${isoDate}:`, e.message);
     }
   }
 
@@ -958,7 +967,8 @@ function resolveDateUiDisplay(isoDate, { sessions, statusReason, isFallback = fa
 }
 
 async function buildSessionsForDatePayload(isoDate) {
-  if (!persistedDatesChecked.size && supabase) {
+  if (supabase) {
+    if (!supabaseSchemaHealth.checkedAt) await auditSupabaseSchema();
     await loadScrapeMetaFromSupabase();
   }
 
@@ -1230,8 +1240,10 @@ function getStatusFields() {
 
 async function ensureSessionsForStatus() {
   if (!supabase) return;
+  if (!supabaseSchemaHealth.checkedAt) await auditSupabaseSchema();
   await loadCurrentSessionsFromSupabase({ reloadMeta: !scrapeInProgress });
   if (!sessions.length) await loadLatestSnapshotFromSupabase();
+  if (!lastSuccessfulScrape) await loadScrapeMetaFromSupabase();
 }
 
 function waveSideSlug(side) {
@@ -2221,11 +2233,25 @@ async function sendNtfy(topic, title, body, { urgent = false, clickUrl = APP_URL
 }
 
 function activeWatchItems() {
-  return watchItems.filter(w => w.active !== false);
+  return watchItems.filter(w => w.active !== false && !isWatchItemPast(w));
 }
 
 function watchedSessionKeys() {
   return new Set(activeWatchItems().map(w => w.session_key));
+}
+
+async function expirePastWatchlistItems() {
+  const expired = watchItems.filter(w => w.active !== false && isWatchItemPast(w));
+  if (!expired.length) return 0;
+  for (const w of expired) {
+    try {
+      await deactivateWatchItem(w.id, w.user_key);
+    } catch (e) {
+      console.warn(`  expire watch ${w.session_key}:`, e.message);
+    }
+  }
+  console.log(`  expired ${expired.length} past watchlist item(s)`);
+  return expired.length;
 }
 
 function watchItemToClient(w) {
@@ -2553,6 +2579,7 @@ function minutesUntilSessionStart(session) {
 
 // Per-session watch alerts — one highest-priority event per scrape.
 async function evaluateSessionWatchAlerts(watch, session, ctx) {
+  if (isWatchItemPast(watch) || isSessionPast(session)) return;
   const {
     prevAvailable,
     prevSlots,
@@ -2635,12 +2662,14 @@ async function maybeSendImmediateWatchAlert(_watch, _session) {
 }
 
 async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false } = {}) {
+  await expirePastWatchlistItems();
   const updatedSet = new Set(updatedKeys);
   const now = new Date().toISOString();
 
   for (const watch of activeWatchItems()) {
     const session = sessionsByKey.get(watch.session_key);
     if (!session) continue;
+    if (isWatchItemPast(watch) || isSessionPast(session)) continue;
 
     const prevAvailable = watch.last_seen_available;
     const prevSlots = watch.last_seen_slots_available;
@@ -2724,7 +2753,9 @@ async function reloadWatchlistFromSupabase(userKey = null) {
 }
 
 async function loadWatchlistFromSupabase() {
-  return reloadWatchlistFromSupabase();
+  const n = await reloadWatchlistFromSupabase();
+  await expirePastWatchlistItems();
+  return n;
 }
 
 async function ensureWatchlistForUser(userKey) {
@@ -2851,14 +2882,14 @@ function buildWatchRow(body) {
     user_key,
     ntfy_topic: (ntfy_topic || '').trim() || null,
     session_key: sessionKey,
-    iso_date: iso_date || dateKey || live?.isoDate || live?.dateKey || null,
+    iso_date: iso_date || dateKey || live?.isoDate || live?.dateKey || (start_ts ?? ts ?? live?.ts ? dateKeyInBookingTz(new Date((start_ts ?? ts ?? live?.ts) * 1000)) : null),
     start_ts: start_ts ?? ts ?? live?.ts ?? null,
     wave_side: live?.waveSide || wave_side || waveSide || null,
     session_type: session_type || level || live?.level || null,
     start_time: time || live?.time || null,
     time: time || live?.time || null,
     date: date || live?.date || null,
-    day_label: dayLabel || live?.dayLabel || null,
+    day_label: null,
     wave: live?.wave ?? (wave != null ? +wave : null),
     ...watchAlertDefaults({
       alert_when_opens,
@@ -3249,15 +3280,10 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
     seen.add(key);
     const fm = t.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
     const d  = new Date(ts * 1000);
-    const today = new Date(), tom = new Date(today);
-    tom.setDate(tom.getDate() + 1);
-    const isoDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const displayDate = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-    const weekday = d.toLocaleDateString('en-US', { weekday: 'long' });
-    let dayLabel;
-    if (d.toDateString() === today.toDateString())     dayLabel = 'Today';
-    else if (d.toDateString() === tom.toDateString())  dayLabel = 'Tomorrow';
-    else dayLabel = displayDate;
+    const isoDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
+    const displayDate = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+    const weekday = d.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+    const dayLabel = displayDate;
     const sideInfo = resolveWaveSide(el, wave, level, t);
     out.push({
       key, ts, wave, level,
@@ -3580,6 +3606,56 @@ function dateKeyFromDate(d) {
 
 function todayDateKey() {
   return dateKeyInBookingTz(new Date());
+}
+
+function getParkTodayIso() {
+  return todayDateKey();
+}
+
+function addDaysToParkIso(isoDate, days) {
+  const [y, m, d] = String(isoDate).slice(0, 10).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
+  return dateKeyInBookingTz(dt);
+}
+
+function getRelativeDateLabel(isoDate) {
+  if (!isoDate) return '';
+  const today = getParkTodayIso();
+  if (isoDate === today) return 'Today';
+  if (isoDate === addDaysToParkIso(today, 1)) return 'Tomorrow';
+  const [y, mo, da] = isoDate.split('-').map(Number);
+  const ref = new Date(Date.UTC(y, mo - 1, da, 17, 0, 0));
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    timeZone: BOOKING_TZ,
+  }).format(ref);
+}
+
+function isSessionPast(session, now = new Date()) {
+  const ts = session?.start_ts ?? session?.ts ?? session?.startTs;
+  if (ts == null) return false;
+  const startMs = Number(ts) * 1000;
+  if (!Number.isFinite(startMs)) return false;
+  const durationMs = (session?.durationMinutes || 90) * 60 * 1000;
+  return now.getTime() > startMs + durationMs;
+}
+
+function normalizeSessionDate(session) {
+  if (!session) return session;
+  const iso = sessionDateKey(session) || isoDateFromRow(session) || null;
+  return {
+    ...session,
+    isoDate: iso || session.isoDate || session.iso_date || null,
+    dateKey: iso || session.dateKey || session.iso_date || null,
+  };
+}
+
+function isWatchItemPast(w, now = new Date()) {
+  const ts = w?.start_ts ?? w?.startTs;
+  if (ts == null) return false;
+  return isSessionPast({ ts, durationMinutes: 90 }, now);
 }
 
 function dateKeyInBookingTz(date = new Date()) {
@@ -4291,6 +4367,78 @@ app.get('/api/sessions', async (req, res) => {
   }
 });
 
+function reasonBrowseWouldShowNotChecked(isoDate, dateSessions, statusReason) {
+  if (dateSessions?.length) return 'has_sessions — should render cards';
+  if (statusReason === 'saved_sessions_found' || statusReason === 'fallback_sessions_found') {
+    return 'statusReason indicates saved data but sessions array empty — client bug';
+  }
+  if (statusReason === 'checked_no_sessions') return 'date was checked and has zero sessions';
+  if (statusReason === 'schema_error') return 'schema missing or query failed';
+  if (statusReason === 'error') return 'fetch or server error';
+  if (scrapeInProgress) return 'scrape in progress and no saved rows for date yet';
+  const map = currentSessionsByDateMap();
+  if (map[isoDate]) return `in-memory map has ${map[isoDate]} session(s) but date query returned none — iso_date mismatch?`;
+  if (fallbackAvailableCached) return 'fallback sources exist globally but not for this date';
+  if (!supabaseConfigured) return 'Supabase not configured and no in-memory sessions';
+  if (supabaseSchemaHealth.checkedAt && !supabaseSchemaHealth.currentSessionsAvailable) {
+    return 'current_sessions table unavailable — check fallback chain';
+  }
+  return 'no rows in current_sessions, scrape_snapshots, or availability_snapshots for this date';
+}
+
+async function buildBootDebugPayload(selectedDate = null) {
+  const isoDate = normalizeIsoDateParam(selectedDate) || getParkTodayIso();
+  await ensureSessionsForStatus();
+  let datePayload = null;
+  try {
+    datePayload = await buildSessionsForDatePayload(isoDate);
+  } catch (e) {
+    datePayload = { error: e.message, sessionsCount: 0, statusReason: 'error' };
+  }
+  const map = currentSessionsByDateMap();
+  return {
+    serverNowUtc: new Date().toISOString(),
+    serverNowEastern: new Intl.DateTimeFormat('en-US', {
+      timeZone: BOOKING_TZ,
+      dateStyle: 'full',
+      timeStyle: 'long',
+    }).format(new Date()),
+    appTimezoneUsed: BOOKING_TZ,
+    parkTodayIso: getParkTodayIso(),
+    selectedDate: selectedDate || isoDate,
+    selectedDateIso: isoDate,
+    frontendExpectedTodayIso: getParkTodayIso(),
+    currentSessionsCount: sessionsByKey.size,
+    currentSessionsByDate: map,
+    earliestSessionDate: computeDateCoverage().earliestSessionDate,
+    latestSessionDate: computeDateCoverage().latestSessionDate,
+    lastSuccessfulScrape,
+    lastTier1Scrape: lastTierRun[1],
+    lastTier2Scrape: lastTierRun[2],
+    lastTier3Scrape: lastTierRun[3],
+    scrapeInProgress,
+    schemaHealth: schemaHealthPayload(),
+    dataSource: normalizeDataSource(dataSource),
+    hasFreshScrapeThisBoot,
+    serverStartedAt,
+    dateQuery: {
+      isoDate,
+      sessionsCount: datePayload?.sessionsCount ?? 0,
+      statusReason: datePayload?.statusReason ?? null,
+      dataSource: datePayload?.dataSource ?? null,
+      isFallback: datePayload?.isFallback ?? false,
+      hasSavedSessions: datePayload?.hasSavedSessions ?? false,
+    },
+    reasonBrowseWouldShowNotChecked: reasonBrowseWouldShowNotChecked(
+      isoDate,
+      datePayload?.sessions || [],
+      datePayload?.statusReason,
+    ),
+    activeWatchlistCount: activeWatchItems().length,
+    expiredWatchlistCandidates: watchItems.filter(w => w.active !== false && isWatchItemPast(w)).length,
+  };
+}
+
 function uiReasonText(reason) {
   switch (reason) {
     case 'has_sessions': return 'Show saved sessions for this date';
@@ -4300,6 +4448,16 @@ function uiReasonText(reason) {
     default: return reason || 'unknown';
   }
 }
+
+app.get('/api/debug/boot', async (req, res) => {
+  try {
+    const selectedDate = req.query.selected_date || req.query.selectedDate || req.query.date || null;
+    const payload = await buildBootDebugPayload(selectedDate);
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/debug/coverage', async (_req, res) => {
   try {
@@ -4360,6 +4518,12 @@ app.get('/api/debug/date/:isoDate', async (req, res) => {
     });
     const payload = {
       isoDate,
+      parkTodayIso: getParkTodayIso(),
+      reasonBrowseWouldShowNotChecked: reasonBrowseWouldShowNotChecked(
+        isoDate,
+        apiPayload.sessions,
+        apiPayload.statusReason,
+      ),
       apiContract: {
         isoDate: apiPayload.isoDate,
         sessionsCount: apiPayload.sessionsCount,
@@ -4753,6 +4917,7 @@ async function loadPersistedData() {
       await mergeBroadSnapshotIntoStore();
     }
     await loadWatchlistFromSupabase();
+    await expirePastWatchlistItems();
     await refreshCoverageFlags();
   } catch (e) {
     supabaseInitError = supabaseInitError || e.message;

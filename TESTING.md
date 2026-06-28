@@ -69,6 +69,20 @@ done
 
 ---
 
+### Morning boot / timezone
+
+```bash
+curl -s http://localhost:3000/api/debug/boot | jq '{parkTodayIso,serverNowEastern,currentSessionsCount,currentSessionsByDate,dateQuery,reasonBrowseWouldShowNotChecked}'
+curl -s "http://localhost:3000/api/sessions?date=$(curl -s http://localhost:3000/api/debug/boot | jq -r .parkTodayIso)" | jq '{sessionsCount,statusReason,dataSource}'
+```
+
+1. Open app after overnight — Browse should show saved Today sessions without "waiting for first scrape".
+2. Settings debug shows park Eastern today vs browser local date.
+3. Lineup items added yesterday for today show **Today**, not **Tomorrow**.
+4. Past watched sessions disappear from active Lineup and stop alerting.
+
+---
+
 ## Future session detail enrichment
 
 After deploying schema changes, run updated [`supabase/schema.sql`](supabase/schema.sql) (adds `detail_status`, `session_enrichment_queue`, `snapshot_type`).

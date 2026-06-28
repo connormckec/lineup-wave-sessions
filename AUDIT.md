@@ -167,6 +167,10 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
 
 ---
 
+All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supabase is the park calendar day; `start_ts` is absolute UTC epoch. UI computes Today/Tomorrow at render time — never from stored `day_label`.
+
+---
+
 ## API routes
 
 | Route | Purpose |
@@ -177,6 +181,7 @@ Defined in schema.sql; written during scrapes, read by analytics/debug endpoints
 | `GET /api/schema/health` | Table probe results, `missingTables`, actionable message |
 | `GET /api/watchlist?user_key=` | User watchlist |
 | `GET /api/debug/date/:isoDate` | Date-level debug + enrichment queue rows |
+| `GET /api/debug/boot` | Park timezone, saved session counts, why Browse would show not_checked |
 | `GET /api/debug/enrichment` | Enrichment queue, stale/missing counts, run duration, recent errors |
 | `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
 | `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date |
