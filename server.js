@@ -3619,13 +3619,116 @@ function inferSlotsFromThresholdPresence(thresholdsSeen, maxTested, {
 }
 
 function classifyThresholdScanStatus(report) {
-  if (report.targetDateVisibleFromHeaders === false) return 'date_not_visible_after_navigation';
+  if (report.targetDateVisibleFromHeaders === false) {
+    const hasHeaders = (report.rawDayHeaderTexts?.length || 0) > 0
+      || (report.visibleIsoDatesFromHeaders?.length || 0) > 0;
+    if (!hasHeaders) return 'calendar_headers_not_ready';
+    return 'date_not_visible_after_navigation';
+  }
+  if (report.thresholdScanStarted !== true) {
+    return 'calendar_headers_not_ready';
+  }
   if ((report.exactCount || 0) + (report.atLeastCount || 0) > 0) return 'scan_success_with_matches';
   if (report.emptyWeekButVisible || report.visibleTileCountAtThreshold1 === 0) {
     return 'visible_week_no_threshold_tiles';
   }
   if ((report.ambiguousCount || 0) > 0) return 'threshold_scan_ambiguous';
   return 'visible_week_no_threshold_tiles';
+}
+
+function buildThresholdHeaderDiagnostics(source = {}) {
+  return {
+    rawMonthLabel: source.rawMonthLabel ?? null,
+    rawDayHeaderTexts: source.rawDayHeaderTexts || [],
+    parsedDayHeaders: source.parsedDayHeaders || [],
+    dayHeaderCandidateTexts: source.dayHeaderCandidateTexts || [],
+    dayHeaderCandidateCount: source.dayHeaderCandidateCount ?? 0,
+    dayHeaderParseSource: source.dayHeaderParseSource ?? null,
+    bodyWeekdayTextSample: source.bodyWeekdayTextSample || [],
+    headerParseStrategy: source.headerParseStrategy ?? null,
+    visibleIsoDatesFromHeaders: source.visibleIsoDatesFromHeaders || [],
+    headerScrapeAttempts: source.headerScrapeAttempts || [],
+  };
+}
+
+function buildThresholdNavigationDiagnostics(source = {}) {
+  return {
+    targetIsoDate: source.targetIsoDate ?? source.navigationIsoDate ?? null,
+    navigationIsoDate: source.navigationIsoDate ?? null,
+    validateIsoDate: source.validateIsoDate ?? null,
+    computedWeekStart: source.computedWeekStart ?? null,
+    visibleWeekStart: source.visibleWeekStart ?? null,
+    visibleWeekEnd: source.visibleWeekEnd ?? null,
+    clickedNextWeekCount: source.clickedNextWeekCount ?? 0,
+    targetDateVisibleFromHeaders: source.targetDateVisibleFromHeaders === true,
+    targetDateVisible: source.targetDateVisible === true,
+    navigationError: source.navigationError ?? null,
+    currentUrl: source.currentUrl ?? null,
+    pageTitle: source.pageTitle ?? null,
+    bodyTextLength: source.bodyTextLength ?? null,
+    bodyTextSample: source.bodyTextSample ?? null,
+    calendarReadySignals: source.calendarReadySignals ?? null,
+  };
+}
+
+function flattenThresholdScanApiResponse({
+  scanResult = {},
+  requestedIsoDate = null,
+  computedWeekStart = null,
+  navigationIsoDate = null,
+  weekMode = true,
+  dryRun = true,
+  routeMeta = {},
+} = {}) {
+  const week = scanResult.dateResults?.[0] || scanResult;
+  const nav = week.navigationDiagnostics || week.navigation || {};
+  const header = week.headerDiagnostics || buildThresholdHeaderDiagnostics(week);
+  const threshold = week.thresholdDiagnostics || {
+    visibleByThreshold: week.visibleByThreshold || null,
+    filterResults: week.filterResults || null,
+    filterNormalization: week.filterNormalization || null,
+    visibleTileCountAtThreshold1: week.visibleTileCountAtThreshold1 ?? null,
+    thresholdPresenceBySession: week.thresholdPresenceBySession || null,
+  };
+  const flat = {
+    ...routeMeta,
+    ...scanResult,
+    ...week,
+    requestedIsoDate: requestedIsoDate || week.requestedIsoDate || routeMeta.isoDate || null,
+    computedWeekStart: computedWeekStart || week.computedWeekStart || (requestedIsoDate ? getMondayWeekStartIso(requestedIsoDate) : null),
+    navigationIsoDate: navigationIsoDate || week.navigationIsoDate || null,
+    weekMode,
+    dryRun,
+    navigationDiagnostics: week.navigationDiagnostics || buildThresholdNavigationDiagnostics({ ...nav, ...week }),
+    headerDiagnostics: week.headerDiagnostics || header,
+    thresholdDiagnostics: week.thresholdDiagnostics || threshold,
+    currentUrl: week.currentUrl ?? nav.currentUrl ?? null,
+    pageTitle: week.pageTitle ?? nav.pageTitle ?? null,
+    bodyTextLength: week.bodyTextLength ?? nav.bodyTextLength ?? null,
+    bodyTextSample: week.bodyTextSample ?? nav.bodyTextSample ?? null,
+    calendarReadySignals: week.calendarReadySignals ?? nav.calendarReadySignals ?? null,
+    headerScrapeAttempts: week.headerScrapeAttempts ?? header.headerScrapeAttempts ?? [],
+    rawMonthLabel: week.rawMonthLabel ?? header.rawMonthLabel ?? null,
+    rawDayHeaderTexts: week.rawDayHeaderTexts ?? header.rawDayHeaderTexts ?? [],
+    dayHeaderCandidateTexts: week.dayHeaderCandidateTexts ?? header.dayHeaderCandidateTexts ?? [],
+    dayHeaderCandidateCount: week.dayHeaderCandidateCount ?? header.dayHeaderCandidateCount ?? 0,
+    dayHeaderParseSource: week.dayHeaderParseSource ?? header.dayHeaderParseSource ?? null,
+    bodyWeekdayTextSample: week.bodyWeekdayTextSample ?? header.bodyWeekdayTextSample ?? [],
+    visibleIsoDatesFromHeaders: week.visibleIsoDatesFromHeaders ?? header.visibleIsoDatesFromHeaders ?? [],
+    targetDateVisibleFromHeaders: week.targetDateVisibleFromHeaders === true,
+    visibleTileCountAtThreshold1: week.visibleTileCountAtThreshold1 ?? null,
+    earlyExitStage: week.earlyExitStage ?? scanResult.earlyExitStage ?? null,
+    earlyExitReason: week.earlyExitReason ?? scanResult.earlyExitReason ?? null,
+    statusReason: week.statusReason ?? scanResult.statusReason ?? null,
+    error: week.error ?? scanResult.error ?? null,
+    crashed: week.crashed ?? scanResult.crashed ?? false,
+  };
+  if (dryRun) {
+    flat.debugResponseShape = true;
+    flat.scanResultKeys = Object.keys(scanResult || {});
+    flat.weekResultKeys = Object.keys(week || {});
+  }
+  return flat;
 }
 
 function buildWeekAnchorsFromDates(dates) {
@@ -3641,6 +3744,7 @@ function buildWeekAnchorsFromDates(dates) {
       weekKey: weekStart,
       computedWeekStart: weekStart,
       anchorIsoDate: weekDates[0],
+      requestedIsoDate: weekDates[weekDates.length - 1],
       weekDates,
     }));
 }
@@ -8428,6 +8532,68 @@ async function getCalendarHeaderParseFromPage(page) {
   return page.evaluate(scrapeCalendarHeaderDates);
 }
 
+async function collectThresholdPageDiagnostics(page) {
+  return page.evaluate(() => {
+    const bodyText = (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+    return {
+      currentUrl: location.href,
+      pageTitle: document.title || null,
+      bodyTextLength: bodyText.length,
+      bodyTextSample: bodyText.slice(0, 1200),
+      calendarReadySignals: {
+        hasMonthLabel: /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i.test(bodyText),
+        hasDayHeaders: /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.?\s+\d{1,2}\b/i.test(bodyText),
+        tableCount: document.querySelectorAll('table').length,
+        sessionTileCount: document.querySelectorAll('div.dynamic-cal-booking-ts').length,
+        waveHeadingCount: [...document.querySelectorAll('*')].filter(el => /left wave sessions|right wave sessions/i.test(el.textContent || '')).length,
+      },
+    };
+  });
+}
+
+async function waitForThresholdCalendarShell(page, { timeoutMs = THRESHOLD_SCAN_PAGE_TIMEOUT_MS } = {}) {
+  await page.waitForSelector('.dynamic-cal-booking-ts, table', { timeout: Math.min(timeoutMs, 20_000) }).catch(() => {});
+  await page.waitForFunction(() => {
+    const body = (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ');
+    return /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i.test(body)
+      || /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.?\s+\d{1,2}\b/i.test(body)
+      || document.querySelectorAll('div.dynamic-cal-booking-ts').length > 0;
+  }, { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
+}
+
+async function scrapeCalendarHeadersWithRetry(page, { maxAttempts = 4, waitMs = 1500 } = {}) {
+  const attempts = [];
+  let lastHeaderParse = null;
+  let lastPageDiagnostics = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const [headerParse, pageDiagnostics] = await Promise.all([
+      getCalendarHeaderParseFromPage(page),
+      collectThresholdPageDiagnostics(page),
+    ]);
+    lastHeaderParse = headerParse;
+    lastPageDiagnostics = pageDiagnostics;
+    attempts.push({
+      attempt,
+      at: new Date().toISOString(),
+      rawMonthLabel: headerParse?.rawMonthLabel ?? null,
+      rawDayHeaderTexts: headerParse?.rawDayHeaderTexts || [],
+      dayHeaderCandidateCount: headerParse?.dayHeaderCandidateCount ?? 0,
+      visibleIsoDatesFromHeaders: headerParse?.visibleIsoDatesFromHeaders || [],
+      currentUrl: pageDiagnostics?.currentUrl ?? null,
+    });
+    const ready = (headerParse?.rawDayHeaderTexts?.length || 0) >= 7
+      || (headerParse?.dayHeaderCandidateCount || 0) >= 7
+      || (headerParse?.visibleIsoDatesFromHeaders?.length || 0) >= 7;
+    if (ready) break;
+    if (attempt < maxAttempts) await page.waitForTimeout(waitMs);
+  }
+  return {
+    headerParse: lastHeaderParse,
+    headerScrapeAttempts: attempts,
+    pageDiagnostics: lastPageDiagnostics,
+  };
+}
+
 async function getVisibleWeekDatesFromHeaders(page) {
   const result = await getCalendarHeaderParseFromPage(page);
   return result?.visibleIsoDatesFromHeaders || result?.dates || [];
@@ -8615,12 +8781,30 @@ function matchThresholdResultsToSessions({
 }
 
 async function scanEntriesLeftThresholdsForWeek(page, {
-  targetIsoDate,
+  requestedIsoDate: requestedIsoDateInput = null,
+  navigationIsoDate: navigationIsoDateInput = null,
+  targetIsoDate = null,
   thresholds,
   minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
   weekKey = null,
 } = {}) {
+  const requestedIsoDate = requestedIsoDateInput || targetIsoDate;
+  const navigationIsoDate = navigationIsoDateInput || requestedIsoDate;
+  if (!requestedIsoDate) {
+    return {
+      requestedIsoDate: null,
+      computedWeekStart: null,
+      navigationIsoDate: null,
+      statusReason: 'calendar_headers_not_ready',
+      earlyExitStage: 'before_navigation',
+      earlyExitReason: 'missing_requested_iso_date',
+      error: 'missing_requested_iso_date',
+      crashed: false,
+      durationMs: 0,
+    };
+  }
+
   const minT = Math.max(1, Number(minThreshold) || THRESHOLD_SCAN_MIN_DEFAULT);
   const maxT = Math.max(minT, Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE));
   const thresholdBatches = buildThresholdBatches(minT, maxT, THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE);
@@ -8628,11 +8812,12 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     ? thresholds.map(t => Number(t)).filter(t => Number.isFinite(t) && t >= minT && t <= maxT).sort((a, b) => a - b)
     : thresholdBatches.flatMap(b => b.thresholds);
 
-  const computedWeekStart = getMondayWeekStartIso(targetIsoDate);
+  const computedWeekStart = getMondayWeekStartIso(requestedIsoDate);
   const report = {
-    requestedIsoDate: targetIsoDate,
+    requestedIsoDate,
     computedWeekStart,
-    targetIsoDate,
+    navigationIsoDate,
+    targetIsoDate: requestedIsoDate,
     weekKey: weekKey || computedWeekStart,
     minThreshold: minT,
     maxThreshold: maxT,
@@ -8640,6 +8825,9 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     thresholdsScanned: thresholdList,
     thresholdBatches: thresholdBatches.length,
     navigation: null,
+    navigationDiagnostics: null,
+    headerDiagnostics: null,
+    thresholdDiagnostics: null,
     visibleWeekStart: null,
     visibleWeekEnd: null,
     visibleIsoDatesFromHeaders: [],
@@ -8651,11 +8839,18 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     dayHeaderParseSource: null,
     bodyWeekdayTextSample: [],
     headerParseStrategy: null,
+    headerScrapeAttempts: [],
+    currentUrl: null,
+    pageTitle: null,
+    bodyTextLength: null,
+    bodyTextSample: null,
+    calendarReadySignals: null,
     targetDateVisibleFromHeaders: false,
     targetDateVisible: false,
     visibleTileCountAtThreshold1: 0,
     emptyWeekButVisible: false,
     weekMarkedComplete: false,
+    thresholdScanStarted: false,
     filterResults: [],
     filterNormalization: null,
     visibleByThreshold: {},
@@ -8670,6 +8865,8 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     sessionsMatched: 0,
     sessionsWritten: 0,
     statusReason: null,
+    earlyExitStage: null,
+    earlyExitReason: null,
     errors: [],
     durationMs: 0,
     method: 'entries_left_threshold_scan',
@@ -8680,11 +8877,18 @@ async function scanEntriesLeftThresholdsForWeek(page, {
 
   const started = Date.now();
   try {
+    await waitForThresholdCalendarShell(page).catch(() => {});
+
     const nav = await withPlaywrightGuard(
-      () => navigateCalendarToShowDate(page, targetIsoDate, { headerOnly: true }),
+      () => navigateCalendarToShowDate(page, navigationIsoDate, {
+        headerOnly: true,
+        validateIsoDate: requestedIsoDate,
+        waitForShell: true,
+      }),
       { stage: 'threshold_week_navigation', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS, weekKey: weekKey || computedWeekStart },
     );
     report.navigation = nav;
+    report.navigationDiagnostics = buildThresholdNavigationDiagnostics(nav);
     report.visibleIsoDatesFromHeaders = nav.visibleIsoDatesFromHeaders || nav.visibleDateLabels || [];
     report.rawMonthLabel = nav.rawMonthLabel ?? null;
     report.rawDayHeaderTexts = nav.rawDayHeaderTexts || [];
@@ -8694,13 +8898,35 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     report.dayHeaderParseSource = nav.dayHeaderParseSource ?? null;
     report.bodyWeekdayTextSample = nav.bodyWeekdayTextSample || [];
     report.headerParseStrategy = nav.headerParseStrategy ?? null;
+    report.headerScrapeAttempts = nav.headerScrapeAttempts || [];
+    report.currentUrl = nav.currentUrl ?? null;
+    report.pageTitle = nav.pageTitle ?? null;
+    report.bodyTextLength = nav.bodyTextLength ?? null;
+    report.bodyTextSample = nav.bodyTextSample ?? null;
+    report.calendarReadySignals = nav.calendarReadySignals ?? null;
+    report.headerDiagnostics = buildThresholdHeaderDiagnostics(report);
     report.visibleWeekStart = nav.visibleWeekStart;
     report.visibleWeekEnd = nav.visibleWeekEnd;
     report.targetDateVisibleFromHeaders = nav.targetDateVisibleFromHeaders === true;
     report.targetDateVisible = report.targetDateVisibleFromHeaders;
 
+    const headersReady = (report.rawDayHeaderTexts?.length || 0) > 0
+      || (report.visibleIsoDatesFromHeaders?.length || 0) > 0;
+    if (!headersReady) {
+      report.statusReason = 'calendar_headers_not_ready';
+      report.earlyExitStage = 'after_header_parse';
+      report.earlyExitReason = 'no_day_headers_parsed';
+      report.error = 'calendar_headers_not_ready';
+      report.crashed = false;
+      report.durationMs = Date.now() - started;
+      return report;
+    }
+
     if (!report.targetDateVisibleFromHeaders) {
       report.statusReason = 'date_not_visible_after_navigation';
+      report.earlyExitStage = 'after_header_parse';
+      report.earlyExitReason = nav.navigationError || 'requested_date_not_in_visible_headers';
+      report.error = report.earlyExitReason;
       report.errors.push({
         error: nav.navigationError || 'target_date_not_visible_in_headers',
         failureReason: 'failed_navigation',
@@ -8709,6 +8935,7 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       return report;
     }
 
+    report.thresholdScanStarted = true;
     report.filterNormalization = await withPlaywrightGuard(
       () => normalizeBookingFiltersOnPage(page),
       { stage: 'threshold_filter_normalize', timeout: THRESHOLD_FILTER_TIMEOUT_MS, weekKey: report.weekKey },
@@ -8725,7 +8952,7 @@ async function scanEntriesLeftThresholdsForWeek(page, {
         batchIndex: batch.batchIndex + 1,
         totalBatches: thresholdBatches.length,
         thresholdRange: `${batch.minThreshold}-${batch.maxThreshold}`,
-        targetIsoDate,
+        targetIsoDate: requestedIsoDate,
       };
 
       for (const threshold of batch.thresholds) {
@@ -8823,6 +9050,14 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     report.noMatchCount = results.filter(r => r.inference?.thresholdConfidence === 'no_match' && r.session).length;
     report.sessionsMatched = results.filter(r => r.session && r.inference?.thresholdScanVerified).length;
     report.weekMarkedComplete = true;
+    report.thresholdDiagnostics = {
+      visibleByThreshold: report.visibleByThreshold,
+      filterResults: report.filterResults,
+      filterNormalization: report.filterNormalization,
+      visibleTileCountAtThreshold1: report.visibleTileCountAtThreshold1,
+      thresholdPresenceBySession: report.thresholdPresenceBySession,
+      inferredCount: report.inferred.length,
+    };
     report.statusReason = classifyThresholdScanStatus(report);
     collectorState.lastThresholdScanWeek = report.weekKey;
   } catch (e) {
@@ -8834,7 +9069,9 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     report.errors.push({ error: e.message, failureReason });
     if (!isPlaywrightCrashError(e)) {
       collectorState.thresholdScanLastError = e.message;
-      report.statusReason = report.statusReason || 'threshold_scan_ambiguous';
+      report.earlyExitStage = report.thresholdScanStarted ? 'threshold_parse' : 'after_navigation_before_header_parse';
+      report.earlyExitReason = e.message;
+      report.statusReason = report.statusReason || 'calendar_headers_not_ready';
     }
   }
 
@@ -8976,6 +9213,10 @@ async function runThresholdScansChunked(dates, options = {}) {
     maxWeeksPerRun = THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
     recycleBrowserEachWeek = THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK,
     resumeQueue = null,
+    requestedIsoDate: routeRequestedIsoDate = null,
+    navigationIsoDate: routeNavigationIsoDate = null,
+    computedWeekStart: routeComputedWeekStart = null,
+    weekMode = true,
   } = options;
 
   const pendingWeeks = buildThresholdScanResumeQueue(dates, { resumeQueue });
@@ -9005,8 +9246,19 @@ async function runThresholdScansChunked(dates, options = {}) {
           await openBookingPageForThreshold(launched.page);
         }
 
+        const scanRequestedIsoDate = routeRequestedIsoDate
+          || week.requestedIsoDate
+          || week.weekDates?.[0]
+          || week.anchorIsoDate;
+        const scanComputedWeekStart = routeComputedWeekStart
+          || week.computedWeekStart
+          || getMondayWeekStartIso(scanRequestedIsoDate);
+        const scanNavigationIsoDate = routeNavigationIsoDate
+          || (weekMode ? scanComputedWeekStart : scanRequestedIsoDate);
+
         const result = await runThresholdScanForWeek(launched.page, {
-          targetIsoDate: week.anchorIsoDate,
+          requestedIsoDate: scanRequestedIsoDate,
+          navigationIsoDate: scanNavigationIsoDate,
           weekKey: week.weekKey || week.computedWeekStart,
           minThreshold,
           maxThreshold,
@@ -9020,10 +9272,20 @@ async function runThresholdScansChunked(dates, options = {}) {
         );
 
         dateResults.push({
-          isoDate: week.anchorIsoDate,
+          isoDate: scanRequestedIsoDate,
           weekKey: result.weekKey || week.weekKey,
-          computedWeekStart: result.computedWeekStart,
-          requestedIsoDate: result.requestedIsoDate,
+          computedWeekStart: result.computedWeekStart || scanComputedWeekStart,
+          requestedIsoDate: result.requestedIsoDate || scanRequestedIsoDate,
+          navigationIsoDate: result.navigationIsoDate || scanNavigationIsoDate,
+          navigationDiagnostics: result.navigationDiagnostics,
+          headerDiagnostics: result.headerDiagnostics,
+          thresholdDiagnostics: result.thresholdDiagnostics,
+          currentUrl: result.currentUrl,
+          pageTitle: result.pageTitle,
+          bodyTextLength: result.bodyTextLength,
+          bodyTextSample: result.bodyTextSample,
+          calendarReadySignals: result.calendarReadySignals,
+          headerScrapeAttempts: result.headerScrapeAttempts,
           visibleIsoDatesFromHeaders: result.visibleIsoDatesFromHeaders,
           rawMonthLabel: result.rawMonthLabel,
           rawDayHeaderTexts: result.rawDayHeaderTexts,
@@ -9037,6 +9299,8 @@ async function runThresholdScansChunked(dates, options = {}) {
           visibleTileCountAtThreshold1: result.visibleTileCountAtThreshold1,
           emptyWeekButVisible: result.emptyWeekButVisible,
           weekMarkedComplete: result.weekMarkedComplete,
+          earlyExitStage: result.earlyExitStage,
+          earlyExitReason: result.earlyExitReason,
           statusReason: result.statusReason,
           exactCount: result.exactCount,
           atLeastCount: result.atLeastCount,
@@ -9048,7 +9312,7 @@ async function runThresholdScansChunked(dates, options = {}) {
           write: result.write,
           errors: result.errors,
           crashed: weekFailed,
-          error: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || result.error) : null,
+          error: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || result.error) : result.error,
           failureReason: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || 'failed_page_crash') : null,
         });
 
@@ -9748,10 +10012,17 @@ function groupSessionsByIsoDate(sessions) {
   return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
-async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = false } = {}) {
+async function navigateCalendarToShowDate(page, navigationIsoDate, {
+  headerOnly = false,
+  validateIsoDate = null,
+  waitForShell = true,
+} = {}) {
+  const validationTarget = validateIsoDate || navigationIsoDate;
   const diag = {
-    targetIsoDate: targetIsoDate || null,
-    computedWeekStart: targetIsoDate ? getMondayWeekStartIso(targetIsoDate) : null,
+    targetIsoDate: navigationIsoDate || null,
+    navigationIsoDate: navigationIsoDate || null,
+    validateIsoDate: validationTarget || null,
+    computedWeekStart: navigationIsoDate ? getMondayWeekStartIso(navigationIsoDate) : null,
     visibleWeekStart: null,
     visibleWeekEnd: null,
     visibleDateLabels: [],
@@ -9764,19 +10035,45 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
     dayHeaderParseSource: null,
     bodyWeekdayTextSample: [],
     headerParseStrategy: null,
+    headerScrapeAttempts: [],
     targetDateVisibleFromHeaders: false,
     clickedNextWeekCount: 0,
     targetDateVisible: false,
     navigationError: null,
     headerOnly,
+    currentUrl: null,
+    pageTitle: null,
+    bodyTextLength: null,
+    bodyTextSample: null,
+    calendarReadySignals: null,
   };
 
-  if (!targetIsoDate) {
+  if (!navigationIsoDate) {
     diag.navigationError = 'missing_target_iso_date';
     return diag;
   }
 
-  function applyHeaderParse(headerParse, headers) {
+  function weekContainsTarget(headers) {
+    if (!headers?.length || !validationTarget) return false;
+    return headers.includes(validationTarget);
+  }
+
+  async function readVisibleDates() {
+    if (waitForShell) await waitForThresholdCalendarShell(page).catch(() => {});
+    const scraped = await scrapeCalendarHeadersWithRetry(page);
+    const headerParse = scraped.headerParse || {};
+    diag.headerScrapeAttempts = scraped.headerScrapeAttempts || [];
+    if (scraped.pageDiagnostics) {
+      diag.currentUrl = scraped.pageDiagnostics.currentUrl ?? null;
+      diag.pageTitle = scraped.pageDiagnostics.pageTitle ?? null;
+      diag.bodyTextLength = scraped.pageDiagnostics.bodyTextLength ?? null;
+      diag.bodyTextSample = scraped.pageDiagnostics.bodyTextSample ?? null;
+      diag.calendarReadySignals = scraped.pageDiagnostics.calendarReadySignals ?? null;
+    }
+    let headers = headerParse?.visibleIsoDatesFromHeaders || headerParse?.dates || [];
+    if (!headers.length && !headerOnly) {
+      headers = await getVisibleDateKeysFromPage(page);
+    }
     diag.visibleIsoDatesFromHeaders = headers;
     diag.visibleDateLabels = headers;
     diag.rawMonthLabel = headerParse?.rawMonthLabel ?? null;
@@ -9791,40 +10088,32 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
       diag.visibleWeekStart = headers[0];
       diag.visibleWeekEnd = headers[headers.length - 1];
     }
-    diag.targetDateVisibleFromHeaders = headers.includes(targetIsoDate);
+    diag.targetDateVisibleFromHeaders = weekContainsTarget(headers);
     diag.targetDateVisible = diag.targetDateVisibleFromHeaders;
-  }
-
-  async function readVisibleDates() {
-    const headerParse = await getCalendarHeaderParseFromPage(page);
-    let headers = headerParse?.visibleIsoDatesFromHeaders || headerParse?.dates || [];
-    if (!headers.length && !headerOnly) {
-      headers = await getVisibleDateKeysFromPage(page);
-    }
-    applyHeaderParse(headerParse, headers);
     return headers;
   }
 
   let visible = await readVisibleDates();
-  if (visible.includes(targetIsoDate)) return diag;
+  if (weekContainsTarget(visible)) return diag;
 
   await openBookingPage(page);
   await dismissCookieBanner(page);
+  await waitForThresholdCalendarShell(page).catch(() => {});
   visible = await readVisibleDates();
-  if (visible.includes(targetIsoDate)) return diag;
+  if (weekContainsTarget(visible)) return diag;
 
   const maxSteps = effectiveWeeksAhead + 3;
   for (let step = 0; step < maxSteps; step++) {
     if (!await advanceCalendarWeek(page)) break;
     diag.clickedNextWeekCount++;
     visible = await readVisibleDates();
-    if (visible.includes(targetIsoDate)) return diag;
+    if (weekContainsTarget(visible)) return diag;
   }
 
   for (let step = 0; step < maxSteps; step++) {
     if (!await retreatCalendarWeek(page)) break;
     visible = await readVisibleDates();
-    if (visible.includes(targetIsoDate)) return diag;
+    if (weekContainsTarget(visible)) return diag;
   }
 
   diag.navigationError = 'target_date_not_visible_after_navigation';
@@ -10778,10 +11067,11 @@ async function openBookingPage(page, { timeout = BOOKING_PAGE_TIMEOUT_MS, waitUn
 }
 
 async function openBookingPageForThreshold(page) {
-  return openBookingPage(page, {
+  await openBookingPage(page, {
     timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS,
     waitUntil: 'domcontentloaded',
   });
+  await waitForThresholdCalendarShell(page);
 }
 
 async function detectAvailableWeeks(page) {
@@ -11661,46 +11951,67 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
         skipped: true,
         skipReason: 'scrape_in_progress',
         isoDate,
+        requestedIsoDate: isoDate,
         weekMode,
         dryRun,
       };
     }
 
+    const requestedIsoDate = isoDate;
+    const computedWeekStart = getMondayWeekStartIso(requestedIsoDate);
+    const navigationIsoDate = weekMode ? computedWeekStart : requestedIsoDate;
+
     try {
       await ensureSessionsForStatus();
-      const result = await runThresholdScansChunked([isoDate], {
+      const result = await runThresholdScansChunked([requestedIsoDate], {
         dryRun,
         minThreshold,
         maxThreshold,
         sourceTier: 2,
         maxWeeksPerRun: 1,
+        requestedIsoDate,
+        navigationIsoDate,
+        computedWeekStart,
+        weekMode,
       });
 
       await refreshCoverageFlags().catch(() => {});
-      const firstWeek = result.dateResults?.[0] || null;
-      return {
-        skipped: false,
-        isoDate,
+      return flattenThresholdScanApiResponse({
+        scanResult: result,
+        requestedIsoDate,
+        computedWeekStart,
+        navigationIsoDate,
         weekMode,
         dryRun,
-        minThreshold,
-        maxThreshold,
-        ...result,
-        ...(firstWeek || {}),
-      };
+        routeMeta: {
+          skipped: false,
+          isoDate,
+          minThreshold,
+          maxThreshold,
+        },
+      });
     } catch (e) {
       releaseScrapeLock();
       handlePlaywrightFailure(e, 'admin_threshold_scan', { weekKey: isoDate });
       const failureReason = isPlaywrightCrashError(e) ? 'failed_page_crash' : 'failed_threshold_scan';
-      return {
-        skipped: false,
-        crashed: true,
-        failureReason,
-        error: e.message,
-        isoDate,
+      return flattenThresholdScanApiResponse({
+        scanResult: {},
+        requestedIsoDate: isoDate,
+        computedWeekStart: getMondayWeekStartIso(isoDate),
+        navigationIsoDate: weekMode ? getMondayWeekStartIso(isoDate) : isoDate,
         weekMode,
         dryRun,
-      };
+        routeMeta: {
+          skipped: false,
+          crashed: isPlaywrightCrashError(e),
+          failureReason,
+          error: e.message,
+          isoDate,
+          earlyExitStage: 'before_browser_launch',
+          earlyExitReason: e.message,
+          statusReason: isPlaywrightCrashError(e) ? null : 'calendar_headers_not_ready',
+        },
+      });
     } finally {
       releaseScrapeLock();
     }
