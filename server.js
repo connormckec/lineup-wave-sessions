@@ -3891,6 +3891,24 @@ function entriesLeftLabelMatchesThreshold(label, threshold) {
   return patterns.some((re) => re.test(text));
 }
 
+function entriesLeftSelectedLabelMatchesThreshold(label, threshold) {
+  if (!label) return false;
+  const n = Number(threshold);
+  if (!Number.isFinite(n)) return false;
+  const text = String(label).replace(/\s+/g, ' ').trim();
+  return new RegExp(`^entries?\\s*left\\s*:\\s*${n}\\b`, 'i').test(text);
+}
+
+function exactAtLeastEntriesLeftOptionText(threshold) {
+  const n = Math.max(1, Number(threshold) || 1);
+  return `At least ${n} entries left`;
+}
+
+function expectedEntriesLeftSelectedLabel(threshold) {
+  const n = Math.max(1, Number(threshold) || 1);
+  return `Entries left : ${n}`;
+}
+
 function evaluateThresholdWriteSafety(report) {
   const scanned = (report.thresholdsScanned || Object.keys(report.visibleTileCountsByThreshold || {})
     .map((k) => Number(k))
@@ -9726,13 +9744,224 @@ async function scrapeEntriesLeftControlReconFromPage(page) {
   };
 }
 
+async function readEntriesLeftCurrentLabelFromPage(page) {
+  assertPlaywrightPage(page, 'readEntriesLeftCurrentLabelFromPage');
+  return page.evaluate(() => {
+    function normalizeText(text) {
+      return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+    for (const el of document.querySelectorAll('button, span, label, div, a, th')) {
+      const t = normalizeText(el.innerText || el.textContent || '');
+      if (/entries?\s*left\s*:/i.test(t) && t.length < 80) return t;
+    }
+    for (const sel of document.querySelectorAll('select')) {
+      const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''} ${sel.previousElementSibling?.textContent || ''}`.replace(/\s+/g, ' ');
+      if (/entries?\s*left/i.test(context)) {
+        const opt = sel.options[sel.selectedIndex];
+        return normalizeText(opt?.textContent || opt?.label || '');
+      }
+    }
+    return null;
+  });
+}
+
+async function clickEntriesLeftOptionOnPage(page, optionText) {
+  assertPlaywrightPage(page, 'clickEntriesLeftOptionOnPage');
+  return page.evaluate((targetText) => {
+    function normalizeText(text) {
+      return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+    function isVisible(el) {
+      if (!el?.getBoundingClientRect) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+      let node = el;
+      while (node && node !== document.body) {
+        const st = window.getComputedStyle(node);
+        if (st.display === 'none' || st.visibility === 'hidden') return false;
+        node = node.parentElement;
+      }
+      return true;
+    }
+    function selectorHint(el) {
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const tag = el.tagName.toLowerCase();
+      const classes = [...(el.classList || [])].slice(0, 4);
+      return classes.length ? `${tag}.${classes.join('.')}` : tag;
+    }
+    const wanted = normalizeText(targetText).toLowerCase();
+    const matches = [];
+    for (const el of document.querySelectorAll('option, li, a, button, span, div[role="option"], [role="menuitem"]')) {
+      const text = normalizeText(el.innerText || el.textContent || el.label || '');
+      if (text.toLowerCase() !== wanted) continue;
+      if (!isVisible(el)) continue;
+      matches.push(el);
+    }
+    if (!matches.length) {
+      return { ok: false, reason: 'option_not_found', wanted: targetText };
+    }
+    matches.sort((a, b) => {
+      const aNested = a.querySelector('option, li, a, button, span') ? 1 : 0;
+      const bNested = b.querySelector('option, li, a, button, span') ? 1 : 0;
+      return aNested - bNested;
+    });
+    const target = matches[0];
+    target.click();
+    return {
+      ok: true,
+      clickTargetText: normalizeText(target.innerText || target.textContent || target.label || ''),
+      clickSelectorUsed: selectorHint(target),
+      tagName: target.tagName,
+    };
+  }, optionText);
+}
+
+async function waitForEntriesLeftSelectedLabel(page, threshold, { timeoutMs = 8000, pollMs = 250 } = {}) {
+  assertPlaywrightPage(page, 'waitForEntriesLeftSelectedLabel');
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const afterLabel = await readEntriesLeftCurrentLabelFromPage(page);
+    if (entriesLeftSelectedLabelMatchesThreshold(afterLabel, threshold)) {
+      return { ok: true, afterLabel, waitedMs: Date.now() - started };
+    }
+    await page.waitForTimeout(pollMs);
+  }
+  const afterLabel = await readEntriesLeftCurrentLabelFromPage(page);
+  return {
+    ok: entriesLeftSelectedLabelMatchesThreshold(afterLabel, threshold),
+    afterLabel,
+    waitedMs: Date.now() - started,
+  };
+}
+
+async function dismissEntriesLeftPopup(page) {
+  assertPlaywrightPage(page, 'dismissEntriesLeftPopup');
+  await page.keyboard.press('Escape').catch(() => {});
+  await blurActiveFilterDropdown(page);
+}
+
+async function setEntriesLeftThreshold(page, threshold, options = {}) {
+  assertPlaywrightPage(page, 'setEntriesLeftThreshold');
+  const requestedThreshold = Math.max(1, Number(threshold) || 1);
+  const matchingOptionText = exactAtLeastEntriesLeftOptionText(requestedThreshold);
+  const expectedAfterLabel = expectedEntriesLeftSelectedLabel(requestedThreshold);
+  const labelWaitMs = options.labelWaitMs ?? Math.max(THRESHOLD_FILTER_SETTLE_MS * 2, 6000);
+
+  const beforeLabel = await readEntriesLeftCurrentLabelFromPage(page);
+
+  const openAttempt = await openEntriesLeftControlForRecon(page);
+  if (!openAttempt?.ok) {
+    return {
+      requestedThreshold,
+      beforeLabel,
+      popupVisible: false,
+      optionTexts: [],
+      matchingOptionText,
+      clickSelectorUsed: null,
+      clickTargetText: null,
+      afterLabel: beforeLabel,
+      filterSetOk: false,
+      filterSetError: 'entries_left_control_open_failed',
+      openAttempt,
+    };
+  }
+
+  await page.waitForTimeout(options.openWaitMs ?? 600);
+  const afterOpen = await page.evaluate(reconEntriesLeftControlAfterOpen);
+  const popupVisible = afterOpen.popupVisible === true;
+  const optionTexts = [...new Set(
+    (afterOpen.optionCandidates || []).map((o) => o.normalizedText || o.text).filter(Boolean),
+  )];
+
+  const hasMatchingOption = optionTexts.some(
+    (text) => text.replace(/\s+/g, ' ').trim().toLowerCase() === matchingOptionText.toLowerCase(),
+  );
+  if (!hasMatchingOption) {
+    await dismissEntriesLeftPopup(page);
+    return {
+      requestedThreshold,
+      beforeLabel,
+      popupVisible,
+      optionTexts,
+      matchingOptionText,
+      clickSelectorUsed: null,
+      clickTargetText: null,
+      afterLabel: beforeLabel,
+      filterSetOk: false,
+      filterSetError: 'entries_left_option_not_found',
+      expectedAfterLabel,
+    };
+  }
+
+  const clickResult = await clickEntriesLeftOptionOnPage(page, matchingOptionText);
+  if (!clickResult?.ok) {
+    await dismissEntriesLeftPopup(page);
+    return {
+      requestedThreshold,
+      beforeLabel,
+      popupVisible,
+      optionTexts,
+      matchingOptionText,
+      clickSelectorUsed: clickResult?.clickSelectorUsed ?? null,
+      clickTargetText: clickResult?.clickTargetText ?? null,
+      afterLabel: beforeLabel,
+      filterSetOk: false,
+      filterSetError: 'entries_left_option_not_found',
+      expectedAfterLabel,
+      clickResult,
+    };
+  }
+
+  const labelWait = await waitForEntriesLeftSelectedLabel(page, requestedThreshold, {
+    timeoutMs: labelWaitMs,
+  });
+  await dismissEntriesLeftPopup(page);
+
+  const afterLabel = labelWait.afterLabel ?? await readEntriesLeftCurrentLabelFromPage(page);
+  const filterSetOk = entriesLeftSelectedLabelMatchesThreshold(afterLabel, requestedThreshold);
+
+  return {
+    requestedThreshold,
+    beforeLabel,
+    popupVisible,
+    optionTexts,
+    matchingOptionText,
+    clickSelectorUsed: clickResult.clickSelectorUsed ?? null,
+    clickTargetText: clickResult.clickTargetText ?? null,
+    afterLabel,
+    expectedAfterLabel,
+    filterSetOk,
+    filterSetError: filterSetOk
+      ? null
+      : (clickResult.ok ? 'entries_left_option_clicked_but_label_unchanged' : 'entries_left_option_not_found'),
+    labelWaitMs: labelWait.waitedMs ?? null,
+    openAttempt,
+    clickResult,
+  };
+}
+
+async function runDebugEntriesLeftSelectionContract(page, thresholds) {
+  const selectionResults = [];
+  for (const threshold of thresholds) {
+    const result = await setEntriesLeftThreshold(page, threshold);
+    selectionResults.push(result);
+    if (!result.filterSetOk) break;
+    await page.waitForTimeout(400);
+  }
+  return selectionResults;
+}
+
 async function runDebugEntriesLeftControl({
   isoDate,
   weekMode = true,
   thresholds = [1, 2, 3],
   dryRun = true,
   debug = true,
+  mode = 'recon',
 } = {}) {
+  const gateNum = mode === 'selection_contract' ? 3 : 2;
   const requestedIsoDate = isoDate;
   const computedWeekStart = getMondayWeekStartIso(isoDate);
   const navigationIsoDate = weekMode ? computedWeekStart : isoDate;
@@ -9752,7 +9981,8 @@ async function runDebugEntriesLeftControl({
 
     if (nav.statusReason === 'calendar_day_headers_not_parsed' || nav.headerParseError) {
       return {
-        gate: 2,
+        gate: gateNum,
+        mode,
         dryRun,
         debug,
         isoDate: requestedIsoDate,
@@ -9767,7 +9997,8 @@ async function runDebugEntriesLeftControl({
 
     if (!nav.targetDateVisibleFromHeaders) {
       return {
-        gate: 2,
+        gate: gateNum,
+        mode,
         dryRun,
         debug,
         isoDate: requestedIsoDate,
@@ -9789,6 +10020,37 @@ async function runDebugEntriesLeftControl({
     await normalizeBookingFiltersOnPage(launched.page).catch(() => {});
     await launched.page.waitForTimeout(500);
 
+    const pageDiag = await collectPageDiagnostics(launched.page, 'entries_left_control');
+
+    if (mode === 'selection_contract') {
+      const selectionResults = await runDebugEntriesLeftSelectionContract(launched.page, thresholds);
+      const allOk = selectionResults.length > 0 && selectionResults.every((r) => r.filterSetOk);
+      return {
+        gate: 3,
+        mode,
+        dryRun,
+        debug,
+        isoDate: requestedIsoDate,
+        computedWeekStart,
+        navigationIsoDate,
+        weekMode,
+        thresholds,
+        rawMonthLabel: nav.rawMonthLabel,
+        rawDayHeaderTexts: nav.rawDayHeaderTexts,
+        visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
+        targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+        currentUrl: pageDiag.currentUrl,
+        pageTitle: pageDiag.pageTitle,
+        selectionResults,
+        selectionContractOk: allOk,
+        durationMs: Date.now() - started,
+        writesPerformed: false,
+        thresholdWriteSafe: false,
+        crashed: false,
+        error: allOk ? null : (selectionResults.find((r) => !r.filterSetOk)?.filterSetError || 'selection_contract_failed'),
+      };
+    }
+
     const recon = await scrapeEntriesLeftControlReconFromPage(launched.page);
     const thresholdAvailability = buildThresholdAvailabilityFromOptions(
       recon.afterOpen.optionCandidates,
@@ -9797,6 +10059,7 @@ async function runDebugEntriesLeftControl({
 
     return {
       gate: 2,
+      mode: mode || 'recon',
       dryRun,
       debug,
       isoDate: requestedIsoDate,
@@ -13514,6 +13777,8 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   const wait = req.body?.wait === true || req.query?.wait === 'true';
   const dryRun = req.body?.dryRun !== false;
   const debug = req.body?.debug !== false;
+  const mode = req.body?.mode === 'selection_contract' ? 'selection_contract' : 'recon';
+  const gate = mode === 'selection_contract' ? 3 : 2;
 
   if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
     return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
@@ -13524,7 +13789,8 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
       return {
         skipped: true,
         skipReason: 'scrape_in_progress',
-        gate: 2,
+        gate,
+        mode,
         isoDate,
         weekMode,
         dryRun,
@@ -13538,6 +13804,7 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         thresholds,
         dryRun,
         debug,
+        mode,
       });
     } finally {
       releaseScrapeLock();
@@ -13550,7 +13817,8 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         started: false,
         skipped: true,
         skipReason: 'scrape_in_progress',
-        gate: 2,
+        gate,
+        mode,
         isoDate,
         weekMode,
         dryRun,
@@ -13575,12 +13843,15 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         started: true,
         queued: true,
         wait: false,
-        gate: 2,
+        gate,
+        mode,
         isoDate,
         weekMode,
         thresholds,
         dryRun,
-        message: 'Entries-left control recon queued — retry with wait=true',
+        message: mode === 'selection_contract'
+          ? 'Entries-left selection contract queued — retry with wait=true'
+          : 'Entries-left control recon queued — retry with wait=true',
       });
     }
 
@@ -13589,7 +13860,8 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   } catch (e) {
     handlePlaywrightFailure(e, 'debug_entries_left_control', { weekKey: isoDate });
     res.status(500).json({
-      gate: 2,
+      gate,
+      mode,
       error: e.message,
       isoDate,
       weekMode,

@@ -153,6 +153,15 @@ curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin
 }
 ```
 
+**Acceptance curl:**
+
+```bash
+curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin/debug-entries-left-control \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-30","weekMode":true,"thresholds":[1,2,3],"dryRun":true,"debug":true,"wait":true,"mode":"selection_contract"}' \
+  | jq '{gate,currentUrl,rawMonthLabel,targetDateVisibleFromHeaders,selectionResults,writesPerformed,thresholdWriteSafe,error,crashed}'
+```
+
 **Acceptance:**
 
 | N | Expected |
