@@ -3472,6 +3472,55 @@ function getMondayWeekStartIso(isoDate) {
   return dt.toISOString().slice(0, 10);
 }
 
+const CALENDAR_MONTH_NAME_TO_INDEX = {
+  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+  july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+};
+
+function isoDateFromUtcParts(year, monthIndex, day) {
+  if (!year || monthIndex == null || !day) return null;
+  const dt = new Date(Date.UTC(year, monthIndex, day));
+  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== monthIndex || dt.getUTCDate() !== day) {
+    return null;
+  }
+  return dt.toISOString().slice(0, 10);
+}
+
+function parseMonthYearLabel(monthLabel) {
+  const text = String(monthLabel || '').replace(/\s+/g, ' ').trim();
+  const m = text.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})$/i);
+  if (!m) return null;
+  const month = CALENDAR_MONTH_NAME_TO_INDEX[m[1].toLowerCase()];
+  if (month == null) return null;
+  return { year: parseInt(m[2], 10), month };
+}
+
+function parseVisibleWeekFromMonthAndDayHeaders(monthLabel, dayHeaders) {
+  const monthCtx = parseMonthYearLabel(monthLabel);
+  if (!monthCtx || !Array.isArray(dayHeaders) || !dayHeaders.length) return [];
+
+  let year = monthCtx.year;
+  let month = monthCtx.month;
+  let prevDay = null;
+  const out = [];
+
+  for (const header of dayHeaders) {
+    const day = Number(header?.day);
+    if (!Number.isFinite(day) || day < 1 || day > 31) continue;
+    if (prevDay != null && day < prevDay) {
+      month += 1;
+      if (month > 11) {
+        month = 0;
+        year += 1;
+      }
+    }
+    const iso = isoDateFromUtcParts(year, month, day);
+    if (iso) out.push(iso);
+    prevDay = day;
+  }
+  return out;
+}
+
 const SESSION_CODE_BY_LEVEL = {
   'advanced trick': 'AT',
   'advanced tricks': 'AT',
@@ -7803,115 +7852,145 @@ async function getSlotCount(page, ts, wave, session = null) {
   return details?.slots ?? null;
 }
 
-// Extract visible week dates from calendar headers (not session tiles).
+// Extract visible week dates from month selector + day column headers (not session tiles).
 function scrapeCalendarHeaderDates() {
-  const TZ = 'America/New_York';
-  const dates = new Set();
-  const sources = [];
+  const MONTH_NAMES = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+  };
+  const DAY_HEADER_RE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.?\s+(\d{1,2})$/i;
+  const MONTH_YEAR_RE = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})$/i;
+  const MONTH_YEAR_LOOSE_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i;
 
-  const addIso = (iso, source) => {
-    if (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso)) {
-      dates.add(iso);
-      sources.push({ iso, source });
+  function isoFromParts(year, monthIndex, day) {
+    if (!year || monthIndex == null || !day) return null;
+    const dt = new Date(Date.UTC(year, monthIndex, day));
+    if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== monthIndex || dt.getUTCDate() !== day) {
+      return null;
     }
-  };
-
-  document.querySelectorAll('[data-date]').forEach(el => {
-    addIso(el.getAttribute('data-date'), 'data-date');
-  });
-
-  const monthNames = {
-    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
-    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
-    aug: 7, august: 7, sep: 8, sept: 8, september: 8,
-    oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
-  };
-
-  const inferYear = () => {
-    const labelEl = document.querySelector('.dynamic-cal-booking-date, .booking-agenda-date, [class*="calendar-title"]');
-    const ym = (labelEl?.textContent || '').match(/\b(20\d{2})\b/);
-    if (ym) return parseInt(ym[1], 10);
-    return parseInt(new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()).slice(0, 4), 10);
-  };
-  const yearHint = inferYear();
-
-  function isoFromParts(y, mo, d) {
-    if (!y || mo == null || !d) return null;
-    const dt = new Date(Date.UTC(y, mo, d));
-    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo || dt.getUTCDate() !== d) return null;
     return dt.toISOString().slice(0, 10);
   }
 
-  const parseHeaderText = (text, sourceTag) => {
-    const t = (text || '').replace(/\s+/g, ' ').trim();
-    if (!t || t.length > 120) return;
+  function parseMonthYearLabel(text) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const exact = t.match(MONTH_YEAR_RE);
+    if (exact) {
+      const month = MONTH_NAMES[exact[1].toLowerCase()];
+      return month == null ? null : { year: parseInt(exact[2], 10), month };
+    }
+    const loose = t.match(MONTH_YEAR_LOOSE_RE);
+    if (loose) {
+      const month = MONTH_NAMES[loose[1].toLowerCase()];
+      return month == null ? null : { year: parseInt(loose[2], 10), month };
+    }
+    return null;
+  }
 
-    const isoM = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
-    if (isoM) { addIso(isoM[0], sourceTag); return; }
+  function parseDayHeaderText(text) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const m = t.match(DAY_HEADER_RE);
+    if (!m) return null;
+    return {
+      weekday: m[1].charAt(0).toUpperCase() + m[1].slice(1, 3).toLowerCase(),
+      day: parseInt(m[2], 10),
+      rawText: t,
+    };
+  }
 
-    const rangeM = t.match(
-      /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})\s*[-–]\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}))?\b/i,
-    );
-    if (rangeM) {
-      const startMo = monthNames[rangeM[1].toLowerCase().replace(/\./g, '')];
-      const startDay = parseInt(rangeM[2], 10);
-      const endMo = monthNames[rangeM[3].toLowerCase().replace(/\./g, '')];
-      const endDay = parseInt(rangeM[4], 10);
-      const y = rangeM[5] ? parseInt(rangeM[5], 10) : yearHint;
-      let curMo = startMo;
-      let curDay = startDay;
-      const endDate = new Date(Date.UTC(y, endMo, endDay));
-      for (let guard = 0; guard < 14; guard++) {
-        addIso(isoFromParts(y, curMo, curDay), `${sourceTag}_range`);
-        const curDate = new Date(Date.UTC(y, curMo, curDay));
-        if (curDate.getTime() >= endDate.getTime()) break;
-        curDate.setUTCDate(curDate.getUTCDate() + 1);
-        curMo = curDate.getUTCMonth();
-        curDay = curDate.getUTCDate();
+  function findRawMonthLabel() {
+    const selectors = 'button, .btn, a[role="button"], [class*="month"], .dropdown-toggle, span, div, label';
+    for (const el of document.querySelectorAll(selectors)) {
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 40) continue;
+      if (MONTH_YEAR_RE.test(t)) return t;
+    }
+    for (const el of document.querySelectorAll(selectors)) {
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 40) continue;
+      const m = t.match(MONTH_YEAR_LOOSE_RE);
+      if (m) return `${m[1]} ${m[2]}`;
+    }
+    return null;
+  }
+
+  function collectRawDayHeaderTexts() {
+    const texts = [];
+    for (const table of document.querySelectorAll('table')) {
+      const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+      if (!headerRow) continue;
+      for (let i = 1; i < headerRow.cells.length; i++) {
+        const t = (headerRow.cells[i].textContent || '').replace(/\s+/g, ' ').trim();
+        if (DAY_HEADER_RE.test(t)) texts.push(t);
       }
-      return;
+    }
+    if (!texts.length) {
+      for (const el of document.querySelectorAll('th, [class*="day-header"], [class*="calendar-day"]')) {
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (DAY_HEADER_RE.test(t)) texts.push(t);
+      }
+    }
+    return texts;
+  }
+
+  function firstCompleteWeekSequence(rawTexts) {
+    const parsed = rawTexts.map(parseDayHeaderText).filter(Boolean);
+    if (!parsed.length) return [];
+
+    const monIdx = parsed.findIndex(p => p.weekday.toLowerCase().startsWith('mon'));
+    if (monIdx >= 0 && parsed.length >= monIdx + 7) {
+      return parsed.slice(monIdx, monIdx + 7);
     }
 
-    const mdy = t.match(/\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}))?\b/i);
-    if (mdy) {
-      const mo = monthNames[mdy[1].toLowerCase().replace(/\./g, '')];
-      const d = parseInt(mdy[2], 10);
-      const y = mdy[3] ? parseInt(mdy[3], 10) : yearHint;
-      addIso(isoFromParts(y, mo, d), sourceTag);
-      return;
+    const seen = new Set();
+    const unique = [];
+    for (const p of parsed) {
+      const key = `${p.weekday.toLowerCase()}-${p.day}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(p);
+      if (unique.length >= 7) break;
     }
+    return unique;
+  }
 
-    const slash = t.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(20\d{2}))?\b/);
-    if (slash) {
-      const mo = parseInt(slash[1], 10) - 1;
-      const d = parseInt(slash[2], 10);
-      const y = slash[3] ? parseInt(slash[3], 10) : yearHint;
-      addIso(isoFromParts(y, mo, d), sourceTag);
+  function parseVisibleWeekFromMonthAndDayHeaders(monthLabel, dayHeaders) {
+    const monthCtx = parseMonthYearLabel(monthLabel);
+    if (!monthCtx || !dayHeaders.length) return [];
+
+    let year = monthCtx.year;
+    let month = monthCtx.month;
+    let prevDay = null;
+    const out = [];
+    for (const header of dayHeaders) {
+      const day = Number(header.day);
+      if (!Number.isFinite(day)) continue;
+      if (prevDay != null && day < prevDay) {
+        month += 1;
+        if (month > 11) {
+          month = 0;
+          year += 1;
+        }
+      }
+      const iso = isoFromParts(year, month, day);
+      if (iso) out.push(iso);
+      prevDay = day;
     }
+    return out;
+  }
+
+  const rawMonthLabel = findRawMonthLabel();
+  const rawDayHeaderTexts = collectRawDayHeaderTexts();
+  const parsedDayHeaders = firstCompleteWeekSequence(rawDayHeaderTexts);
+  const visibleIsoDatesFromHeaders = parseVisibleWeekFromMonthAndDayHeaders(rawMonthLabel, parsedDayHeaders);
+
+  return {
+    dates: visibleIsoDatesFromHeaders,
+    visibleIsoDatesFromHeaders,
+    rawMonthLabel,
+    rawDayHeaderTexts,
+    parsedDayHeaders,
+    headerParseStrategy: 'month_selector_plus_day_columns',
   };
-
-  document.querySelectorAll('.dynamic-cal-booking-date, .booking-agenda-date, [class*="calendar-title"], [class*="agenda-title"], .panel-heading h4, .panel-title').forEach(el => {
-    parseHeaderText(el.textContent, 'week_label');
-  });
-
-  const headerSelectors = 'th, td.agenda-day, [class*="day-header"], [class*="calendar-day"], .dynamic-cal-booking-date, .booking-agenda-date, [class*="agenda-title"], .panel-heading h4, .panel-title, [class*="week-day"]';
-  document.querySelectorAll(headerSelectors).forEach(el => {
-    parseHeaderText(el.textContent, el.tagName.toLowerCase());
-    const dd = el.getAttribute('data-date') || el.dataset?.date;
-    if (dd) addIso(dd, 'attr');
-  });
-
-  document.querySelectorAll('table').forEach(table => {
-    const rows = table.querySelectorAll('thead tr, tr');
-    if (!rows.length) return;
-    const firstRow = rows[0];
-    [...firstRow.cells].forEach((cell, idx) => {
-      if (idx === 0) return;
-      parseHeaderText(cell.textContent, 'table-header');
-    });
-  });
-
-  return { dates: [...dates].sort(), sources: sources.slice(0, 30) };
 }
 
 function normalizeBookingFiltersForThresholdScan() {
@@ -8192,9 +8271,13 @@ async function normalizeBookingFiltersOnPage(page) {
   return page.evaluate(normalizeBookingFiltersForThresholdScan);
 }
 
+async function getCalendarHeaderParseFromPage(page) {
+  return page.evaluate(scrapeCalendarHeaderDates);
+}
+
 async function getVisibleWeekDatesFromHeaders(page) {
-  const result = await page.evaluate(scrapeCalendarHeaderDates);
-  return result?.dates || [];
+  const result = await getCalendarHeaderParseFromPage(page);
+  return result?.visibleIsoDatesFromHeaders || result?.dates || [];
 }
 
 async function blurActiveFilterDropdown(page) {
@@ -8407,6 +8490,10 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     visibleWeekStart: null,
     visibleWeekEnd: null,
     visibleIsoDatesFromHeaders: [],
+    rawMonthLabel: null,
+    rawDayHeaderTexts: [],
+    parsedDayHeaders: [],
+    headerParseStrategy: null,
     targetDateVisibleFromHeaders: false,
     targetDateVisible: false,
     visibleTileCountAtThreshold1: 0,
@@ -8442,6 +8529,10 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     );
     report.navigation = nav;
     report.visibleIsoDatesFromHeaders = nav.visibleIsoDatesFromHeaders || nav.visibleDateLabels || [];
+    report.rawMonthLabel = nav.rawMonthLabel ?? null;
+    report.rawDayHeaderTexts = nav.rawDayHeaderTexts || [];
+    report.parsedDayHeaders = nav.parsedDayHeaders || [];
+    report.headerParseStrategy = nav.headerParseStrategy ?? null;
     report.visibleWeekStart = nav.visibleWeekStart;
     report.visibleWeekEnd = nav.visibleWeekEnd;
     report.targetDateVisibleFromHeaders = nav.targetDateVisibleFromHeaders === true;
@@ -8764,7 +8855,7 @@ async function runThresholdScansChunked(dates, options = {}) {
 
         const isEmptyVisibleWeek = result.statusReason === 'visible_week_no_threshold_tiles';
         const weekFailed = !isEmptyVisibleWeek && result.errors?.some(e =>
-          e.failureReason === 'failed_page_crash' || e.failureReason === 'failed_navigation',
+          e.failureReason === 'failed_page_crash',
         );
 
         dateResults.push({
@@ -8773,6 +8864,10 @@ async function runThresholdScansChunked(dates, options = {}) {
           computedWeekStart: result.computedWeekStart,
           requestedIsoDate: result.requestedIsoDate,
           visibleIsoDatesFromHeaders: result.visibleIsoDatesFromHeaders,
+          rawMonthLabel: result.rawMonthLabel,
+          rawDayHeaderTexts: result.rawDayHeaderTexts,
+          parsedDayHeaders: result.parsedDayHeaders,
+          headerParseStrategy: result.headerParseStrategy,
           targetDateVisibleFromHeaders: result.targetDateVisibleFromHeaders,
           visibleTileCountAtThreshold1: result.visibleTileCountAtThreshold1,
           emptyWeekButVisible: result.emptyWeekButVisible,
@@ -9496,6 +9591,10 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
     visibleWeekEnd: null,
     visibleDateLabels: [],
     visibleIsoDatesFromHeaders: [],
+    rawMonthLabel: null,
+    rawDayHeaderTexts: [],
+    parsedDayHeaders: [],
+    headerParseStrategy: null,
     targetDateVisibleFromHeaders: false,
     clickedNextWeekCount: 0,
     targetDateVisible: false,
@@ -9508,19 +9607,28 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
     return diag;
   }
 
-  async function readVisibleDates() {
-    let headers = await getVisibleWeekDatesFromHeaders(page);
-    if (!headers.length && !headerOnly) {
-      headers = await getVisibleDateKeysFromPage(page);
-    }
+  function applyHeaderParse(headerParse, headers) {
     diag.visibleIsoDatesFromHeaders = headers;
     diag.visibleDateLabels = headers;
+    diag.rawMonthLabel = headerParse?.rawMonthLabel ?? null;
+    diag.rawDayHeaderTexts = headerParse?.rawDayHeaderTexts || [];
+    diag.parsedDayHeaders = headerParse?.parsedDayHeaders || [];
+    diag.headerParseStrategy = headerParse?.headerParseStrategy ?? null;
     if (headers.length) {
       diag.visibleWeekStart = headers[0];
       diag.visibleWeekEnd = headers[headers.length - 1];
     }
     diag.targetDateVisibleFromHeaders = headers.includes(targetIsoDate);
     diag.targetDateVisible = diag.targetDateVisibleFromHeaders;
+  }
+
+  async function readVisibleDates() {
+    const headerParse = await getCalendarHeaderParseFromPage(page);
+    let headers = headerParse?.visibleIsoDatesFromHeaders || headerParse?.dates || [];
+    if (!headers.length && !headerOnly) {
+      headers = await getVisibleDateKeysFromPage(page);
+    }
+    applyHeaderParse(headerParse, headers);
     return headers;
   }
 
