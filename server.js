@@ -2002,6 +2002,12 @@ function currentRowToSession(row) {
     modalSlots: raw.modalSlots ?? null,
     thresholdSlots: raw.thresholdSlots ?? null,
     slotsAgree: raw.slotsAgree ?? null,
+    available_entries: raw.available_entries ?? null,
+    slot_status: raw.slot_status ?? null,
+    slot_source: raw.slot_source ?? null,
+    threshold_scan_verified: raw.threshold_scan_verified ?? false,
+    threshold_scan_at: raw.threshold_scan_at ?? null,
+    expectedCapacity: raw.expectedCapacity ?? null,
   };
 }
 
@@ -2071,6 +2077,12 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       modalSlots: s.modalSlots ?? null,
       thresholdSlots: s.thresholdSlots ?? null,
       slotsAgree: s.slotsAgree ?? null,
+      available_entries: s.available_entries ?? null,
+      slot_status: s.slot_status ?? null,
+      slot_source: s.slot_source ?? null,
+      threshold_scan_verified: s.threshold_scan_verified ?? false,
+      threshold_scan_at: s.threshold_scan_at ?? null,
+      expectedCapacity: s.expectedCapacity ?? null,
     },
     last_seen_at: now,
     last_scraped_at: now,
@@ -2968,6 +2980,12 @@ const THRESHOLD_SESSION_FIELDS = [
   'modalSlots',
   'thresholdSlots',
   'slotsAgree',
+  'available_entries',
+  'slot_status',
+  'slot_source',
+  'threshold_scan_verified',
+  'threshold_scan_at',
+  'expectedCapacity',
 ];
 
 function thresholdFieldOnSession(s, field) {
@@ -2983,7 +3001,10 @@ function thresholdConfidenceOnSession(s) {
 
 function sessionThresholdScanVerified(s) {
   if (!s) return false;
-  return s.thresholdScanVerified === true || s.raw?.thresholdScanVerified === true;
+  return s.thresholdScanVerified === true
+    || s.raw?.thresholdScanVerified === true
+    || s.threshold_scan_verified === true
+    || s.raw?.threshold_scan_verified === true;
 }
 
 function getThresholdInferredSlots(s) {
@@ -2998,7 +3019,9 @@ function getThresholdScanMaxTested(s) {
 
 function thresholdSlotsTrusted(s) {
   if (!sessionThresholdScanVerified(s)) return false;
-  const conf = thresholdConfidenceOnSession(s);
+  const slotSource = thresholdFieldOnSession(s, 'slot_source');
+  if (slotSource && slotSource !== 'entries_left_threshold_scan') return false;
+  const conf = thresholdConfidenceOnSession(s) || thresholdFieldOnSession(s, 'slot_status');
   return conf === 'exact' || conf === 'at_least';
 }
 
@@ -3014,13 +3037,16 @@ function resolveTrustedSlotDisplay(s) {
     : null;
 
   if (thresholdSlotsTrusted(s)) {
-    const inferred = getThresholdInferredSlots(s);
-    const conf = thresholdConfidenceOnSession(s);
+    const inferred = getThresholdInferredSlots(s)
+      ?? thresholdFieldOnSession(s, 'available_entries');
+    const conf = thresholdConfidenceOnSession(s)
+      || thresholdFieldOnSession(s, 'slot_status');
     const maxTested = getThresholdScanMaxTested(s);
+    const slotSource = thresholdFieldOnSession(s, 'slot_source') || 'entries_left_threshold_scan';
     if (inferred != null) {
       return {
         slots: inferred,
-        source: 'threshold',
+        source: slotSource === 'entries_left_threshold_scan' ? 'entries_left_threshold_scan' : 'threshold',
         confidence: conf,
         atLeast: conf === 'at_least',
         slotsDisplay: conf === 'at_least' ? `${maxTested}+` : String(inferred),
@@ -3134,6 +3160,21 @@ function applyThresholdFieldsToSession(entry, inference, {
   entry.thresholdScanMethod = 'entries_left_filter';
   entry.thresholdConfidence = inference.thresholdConfidence || 'failed';
   entry.thresholdDiagnostics = diagnostics || inference.reason || null;
+  entry.expectedCapacity = inference.expectedCapacity ?? null;
+
+  if (thresholdSlotsTrusted(entry)) {
+    entry.available_entries = entry.thresholdInferredSlots;
+    entry.slot_status = entry.thresholdConfidence === 'at_least' ? 'at_least' : 'exact';
+    entry.slot_source = 'entries_left_threshold_scan';
+    entry.threshold_scan_verified = true;
+    entry.threshold_scan_at = now;
+  } else {
+    entry.available_entries = null;
+    entry.slot_status = entry.thresholdConfidence === 'no_match' ? 'no_match' : null;
+    entry.slot_source = null;
+    entry.threshold_scan_verified = false;
+    entry.threshold_scan_at = now;
+  }
 
   const modalVerified = sessionDetailVerified(entry);
   const modalSlots = modalVerified ? entry.slots : null;
@@ -3143,7 +3184,7 @@ function applyThresholdFieldsToSession(entry, inference, {
   entry.slotsAgree = slotsComparisonFields(entry).slotsAgree;
 
   if (!modalVerified && thresholdSlotsTrusted(entry) && overwriteModalSlots !== false) {
-    if (entry.thresholdConfidence === 'exact') {
+    if (entry.thresholdConfidence === 'exact' || entry.thresholdConfidence === 'at_least') {
       entry.slots = entry.thresholdInferredSlots;
     }
   }
@@ -3166,14 +3207,16 @@ function matchThresholdTileToSessions(thresholdTile, candidates) {
     };
   }
 
-  const tileTime = normalizeTimeForMatch(thresholdTile.time);
+  const tileTime = normalizeTimeForMatch(thresholdTile.timeLabel || thresholdTile.time);
+  const tileCode = thresholdTile.sessionCode || levelToSessionCode(thresholdTile.level);
   const identityMatches = list.filter((s) => {
     const sameDate = sessionDateKey(s) === thresholdTile.isoDate;
     const sameTime = tileTime && normalizeTimeForMatch(s.time) === tileTime;
     const sameType = (s.level || '').trim().toLowerCase() === (thresholdTile.level || '').trim().toLowerCase();
+    const sameCode = tileCode && levelToSessionCode(s.level) === tileCode;
     const sameSide = !s.waveSide || !thresholdTile.waveSide
-      || s.waveSide === thresholdTile.waveSide;
-    return sameDate && sameTime && sameType && sameSide;
+      || normalizeWaveSideShort(s.waveSide) === normalizeWaveSideShort(thresholdTile.waveSide);
+    return sameDate && sameTime && (sameType || sameCode) && sameSide;
   });
 
   if (identityMatches.length === 1) {
@@ -3413,26 +3456,162 @@ function buildThresholdBatches(minThreshold, maxThreshold, batchSize = THRESHOLD
   return batches;
 }
 
-function buildWeekAnchorsFromDates(dates) {
-  const sorted = asSessionArray(dates).filter(Boolean).sort();
-  const anchors = [];
-  let lastBucket = null;
-  for (const isoDate of sorted) {
-    const bucket = Math.floor(daysFromToday(isoDate) / 7);
-    if (bucket === lastBucket) continue;
-    lastBucket = bucket;
-    anchors.push({ weekKey: isoDate, anchorIsoDate: isoDate });
-  }
-  return anchors;
+function getMondayWeekStartIso(isoDate) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  const day = dt.getUTCDay();
+  const daysSinceMonday = (day + 6) % 7;
+  dt.setUTCDate(dt.getUTCDate() - daysSinceMonday);
+  return dt.toISOString().slice(0, 10);
 }
 
-function buildThresholdScanResumeQueue(dates, { resumeQueue = null } = {}) {
+const SESSION_CODE_BY_LEVEL = {
+  'advanced trick': 'AT',
+  'advanced tricks': 'AT',
+  'advanced': 'AT',
+  'advanced beginner': 'AB',
+  'expert trick': 'ET',
+  'expert tricks': 'ET',
+  'expert': 'ET',
+  'expert beginner': 'EB',
+  'progressive': 'PRG',
+  'intermediate': 'INT',
+  'pro turns': 'PT',
+  'pro turn': 'PT',
+  'progressive beginner': 'PB',
+  'beginner': 'BGN',
+  'cruiser': 'CRU',
+  'lesson only': 'LO',
+};
+
+const EXPECTED_CAPACITY_BY_CODE = {
+  PT: 10,
+  PRG: 18,
+};
+
+const DEFAULT_EXPECTED_CAPACITY = 12;
+
+function levelToSessionCode(level) {
+  const norm = String(level || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!norm) return null;
+  if (SESSION_CODE_BY_LEVEL[norm]) return SESSION_CODE_BY_LEVEL[norm];
+  for (const [key, code] of Object.entries(SESSION_CODE_BY_LEVEL)) {
+    if (norm.includes(key) || key.includes(norm)) return code;
+  }
+  const abbrev = norm.split(/\s+/).map(w => w[0]).join('').toUpperCase();
+  return abbrev.length >= 2 && abbrev.length <= 4 ? abbrev : null;
+}
+
+function expectedCapacityForSessionCode(sessionCode, level) {
+  const code = sessionCode || levelToSessionCode(level);
+  if (code && EXPECTED_CAPACITY_BY_CODE[code] != null) return EXPECTED_CAPACITY_BY_CODE[code];
+  if (code) return DEFAULT_EXPECTED_CAPACITY;
+  return null;
+}
+
+function normalizeWaveSideShort(waveSide) {
+  const low = String(waveSide || '').toLowerCase();
+  if (/\bleft\b/.test(low)) return 'left';
+  if (/\bright\b/.test(low)) return 'right';
+  return null;
+}
+
+function makeThresholdIdentityKey(tile) {
+  const side = normalizeWaveSideShort(tile.waveSide);
+  const time = normalizeTimeForMatch(tile.timeLabel || tile.time);
+  const code = tile.sessionCode || levelToSessionCode(tile.level || tile.sessionName);
+  return `${tile.isoDate}|${time || '?'}|${side || '?'}|${code || '?'}`;
+}
+
+function buildThresholdsSeenForIdentity(identityKey, visibleByThreshold) {
+  const seen = [];
+  for (const [threshold, keys] of visibleByThreshold.entries()) {
+    if (keys.has(identityKey)) seen.push(threshold);
+  }
+  return seen.sort((a, b) => a - b);
+}
+
+function inferSlotsFromThresholdPresence(thresholdsSeen, maxTested, {
+  sessionCode = null,
+  level = null,
+  inBasicScrape = false,
+} = {}) {
+  const seen = [...new Set((thresholdsSeen || []).filter(t => Number.isFinite(t) && t >= 1))].sort((a, b) => a - b);
+  if (!seen.length) {
+    return inferThresholdSlotsFromMaxVisible(0, maxTested, { inBasicScrape });
+  }
+  const maxThresholdSeen = Math.max(...seen);
+  const inference = inferThresholdSlotsFromMaxVisible(maxThresholdSeen, maxTested, { inBasicScrape });
+  const expectedCapacity = expectedCapacityForSessionCode(sessionCode, level);
+  if (expectedCapacity != null) inference.expectedCapacity = expectedCapacity;
+  if (inference.thresholdConfidence === 'exact'
+    && expectedCapacity != null
+    && inference.thresholdInferredSlots != null
+    && inference.thresholdInferredSlots > expectedCapacity) {
+    return {
+      thresholdInferredSlots: null,
+      thresholdMaxVisible: maxThresholdSeen,
+      thresholdConfidence: 'ambiguous',
+      thresholdScanVerified: false,
+      reason: 'exceeds_expected_capacity',
+      expectedCapacity,
+      thresholdsSeen: seen,
+    };
+  }
+  inference.thresholdsSeen = seen;
+  return inference;
+}
+
+function classifyThresholdScanStatus(report) {
+  if (report.targetDateVisibleFromHeaders === false) return 'date_not_visible_after_navigation';
+  if ((report.exactCount || 0) + (report.atLeastCount || 0) > 0) return 'scan_success_with_matches';
+  if (report.emptyWeekButVisible || report.visibleTileCountAtThreshold1 === 0) {
+    return 'visible_week_no_threshold_tiles';
+  }
+  if ((report.ambiguousCount || 0) > 0) return 'threshold_scan_ambiguous';
+  return 'visible_week_no_threshold_tiles';
+}
+
+function buildWeekAnchorsFromDates(dates) {
+  const weekMap = new Map();
+  for (const isoDate of asSessionArray(dates).filter(Boolean).sort()) {
+    const weekStart = getMondayWeekStartIso(isoDate);
+    if (!weekMap.has(weekStart)) weekMap.set(weekStart, []);
+    weekMap.get(weekStart).push(isoDate);
+  }
+  return [...weekMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([weekStart, weekDates]) => ({
+      weekKey: weekStart,
+      computedWeekStart: weekStart,
+      anchorIsoDate: weekDates[0],
+      weekDates,
+    }));
+}
+
+function buildThresholdScanResumeQueue(dates, { resumeQueue = null, preferBasicSessions = true } = {}) {
   if (resumeQueue?.length) return resumeQueue;
   const pendingKeys = collectorState.thresholdScanPendingWeeks || [];
   if (pendingKeys.length) {
-    return pendingKeys.map(weekKey => ({ weekKey, anchorIsoDate: weekKey }));
+    return pendingKeys.map(weekKey => ({
+      weekKey,
+      computedWeekStart: weekKey,
+      anchorIsoDate: weekKey,
+    }));
   }
-  return buildWeekAnchorsFromDates(dates);
+  let dateList = asSessionArray(dates).filter(Boolean);
+  if (preferBasicSessions) {
+    const today = getParkTodayIso();
+    const fromStore = [...new Set(
+      allStoredSessions()
+        .map(sessionDateKey)
+        .filter(d => d && d >= today),
+    )];
+    if (fromStore.length) {
+      dateList = [...new Set([...dateList, ...fromStore])].sort();
+    }
+  }
+  return buildWeekAnchorsFromDates(dateList);
 }
 
 function applyDetailSourceFields(entry, session, validation) {
@@ -3488,6 +3667,11 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
   out.slotsSource = trustedDisplay.source;
   out.slotsAtLeast = trustedDisplay.atLeast;
   out.slotsDisplay = trustedDisplay.slotsDisplay;
+  out.available_entries = thresholdFieldOnSession(s, 'available_entries') ?? getThresholdInferredSlots(s);
+  out.slot_status = thresholdFieldOnSession(s, 'slot_status') ?? thresholdConfidenceOnSession(s);
+  out.slot_source = thresholdFieldOnSession(s, 'slot_source');
+  out.threshold_scan_verified = sessionThresholdScanVerified(s);
+  out.threshold_scan_at = thresholdFieldOnSession(s, 'threshold_scan_at') ?? thresholdFieldOnSession(s, 'thresholdScanAt');
   const cmp = slotsComparisonFields(s);
   out.modalSlots = cmp.modalSlots;
   out.thresholdSlots = cmp.thresholdSlots;
@@ -7612,6 +7796,176 @@ async function getSlotCount(page, ts, wave, session = null) {
   return details?.slots ?? null;
 }
 
+// Extract visible week dates from calendar headers (not session tiles).
+function scrapeCalendarHeaderDates() {
+  const TZ = 'America/New_York';
+  const dates = new Set();
+  const sources = [];
+
+  const addIso = (iso, source) => {
+    if (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+      dates.add(iso);
+      sources.push({ iso, source });
+    }
+  };
+
+  document.querySelectorAll('[data-date]').forEach(el => {
+    addIso(el.getAttribute('data-date'), 'data-date');
+  });
+
+  const monthNames = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
+    aug: 7, august: 7, sep: 8, sept: 8, september: 8,
+    oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
+  };
+
+  const inferYear = () => {
+    const labelEl = document.querySelector('.dynamic-cal-booking-date, .booking-agenda-date, [class*="calendar-title"]');
+    const ym = (labelEl?.textContent || '').match(/\b(20\d{2})\b/);
+    if (ym) return parseInt(ym[1], 10);
+    return parseInt(new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()).slice(0, 4), 10);
+  };
+  const yearHint = inferYear();
+
+  function isoFromParts(y, mo, d) {
+    if (!y || mo == null || !d) return null;
+    const dt = new Date(Date.UTC(y, mo, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo || dt.getUTCDate() !== d) return null;
+    return dt.toISOString().slice(0, 10);
+  }
+
+  const parseHeaderText = (text, sourceTag) => {
+    const t = (text || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 120) return;
+
+    const isoM = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+    if (isoM) { addIso(isoM[0], sourceTag); return; }
+
+    const rangeM = t.match(
+      /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})\s*[-–]\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}))?\b/i,
+    );
+    if (rangeM) {
+      const startMo = monthNames[rangeM[1].toLowerCase().replace(/\./g, '')];
+      const startDay = parseInt(rangeM[2], 10);
+      const endMo = monthNames[rangeM[3].toLowerCase().replace(/\./g, '')];
+      const endDay = parseInt(rangeM[4], 10);
+      const y = rangeM[5] ? parseInt(rangeM[5], 10) : yearHint;
+      let curMo = startMo;
+      let curDay = startDay;
+      const endDate = new Date(Date.UTC(y, endMo, endDay));
+      for (let guard = 0; guard < 14; guard++) {
+        addIso(isoFromParts(y, curMo, curDay), `${sourceTag}_range`);
+        const curDate = new Date(Date.UTC(y, curMo, curDay));
+        if (curDate.getTime() >= endDate.getTime()) break;
+        curDate.setUTCDate(curDate.getUTCDate() + 1);
+        curMo = curDate.getUTCMonth();
+        curDay = curDate.getUTCDate();
+      }
+      return;
+    }
+
+    const mdy = t.match(/\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}))?\b/i);
+    if (mdy) {
+      const mo = monthNames[mdy[1].toLowerCase().replace(/\./g, '')];
+      const d = parseInt(mdy[2], 10);
+      const y = mdy[3] ? parseInt(mdy[3], 10) : yearHint;
+      addIso(isoFromParts(y, mo, d), sourceTag);
+      return;
+    }
+
+    const slash = t.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(20\d{2}))?\b/);
+    if (slash) {
+      const mo = parseInt(slash[1], 10) - 1;
+      const d = parseInt(slash[2], 10);
+      const y = slash[3] ? parseInt(slash[3], 10) : yearHint;
+      addIso(isoFromParts(y, mo, d), sourceTag);
+    }
+  };
+
+  document.querySelectorAll('.dynamic-cal-booking-date, .booking-agenda-date, [class*="calendar-title"], [class*="agenda-title"], .panel-heading h4, .panel-title').forEach(el => {
+    parseHeaderText(el.textContent, 'week_label');
+  });
+
+  const headerSelectors = 'th, td.agenda-day, [class*="day-header"], [class*="calendar-day"], .dynamic-cal-booking-date, .booking-agenda-date, [class*="agenda-title"], .panel-heading h4, .panel-title, [class*="week-day"]';
+  document.querySelectorAll(headerSelectors).forEach(el => {
+    parseHeaderText(el.textContent, el.tagName.toLowerCase());
+    const dd = el.getAttribute('data-date') || el.dataset?.date;
+    if (dd) addIso(dd, 'attr');
+  });
+
+  document.querySelectorAll('table').forEach(table => {
+    const rows = table.querySelectorAll('thead tr, tr');
+    if (!rows.length) return;
+    const firstRow = rows[0];
+    [...firstRow.cells].forEach((cell, idx) => {
+      if (idx === 0) return;
+      parseHeaderText(cell.textContent, 'table-header');
+    });
+  });
+
+  return { dates: [...dates].sort(), sources: sources.slice(0, 30) };
+}
+
+function normalizeBookingFiltersForThresholdScan() {
+  const results = [];
+  const clickOption = (selectEl, optionRegex) => {
+    if (!selectEl) return false;
+    for (const opt of selectEl.options) {
+      const label = (opt.textContent || opt.label || '').replace(/\s+/g, ' ').trim();
+      if (optionRegex.test(label)) {
+        selectEl.value = opt.value;
+        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        selectEl.dispatchEvent(new Event('input', { bubbles: true }));
+        return label;
+      }
+    }
+    return false;
+  };
+
+  const findSelectNear = (labelRegex) => {
+    for (const sel of document.querySelectorAll('select')) {
+      const id = sel.id || '';
+      const name = sel.name || '';
+      const label = sel.closest('label')?.textContent || '';
+      const prev = sel.previousElementSibling?.textContent || '';
+      const parentText = sel.parentElement?.textContent || '';
+      const hay = `${id} ${name} ${label} ${prev} ${parentText}`.replace(/\s+/g, ' ');
+      if (labelRegex.test(hay)) return sel;
+    }
+    for (const el of document.querySelectorAll('label, span, th, div, button')) {
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!labelRegex.test(t) || t.length > 40) continue;
+      const sel = el.querySelector('select') || el.parentElement?.querySelector('select');
+      if (sel) return sel;
+    }
+    return null;
+  };
+
+  const priceSel = findSelectNear(/price\s*category/i);
+  const priceLabel = clickOption(priceSel, /^all$/i);
+  if (priceLabel) results.push({ filter: 'price_category', value: priceLabel });
+
+  const levelSel = findSelectNear(/session\s*level/i);
+  const levelLabel = clickOption(levelSel, /^all$/i);
+  if (levelLabel) results.push({ filter: 'session_level', value: levelLabel });
+
+  const viewSel = findSelectNear(/view\s*by/i);
+  const viewLabel = clickOption(viewSel, /levels/i);
+  if (viewLabel) results.push({ filter: 'view_by', value: viewLabel });
+
+  for (const el of document.querySelectorAll('button, label, span, a')) {
+    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (/^levels$/i.test(t) || /^view by levels$/i.test(t)) {
+      el.click();
+      results.push({ filter: 'view_by_click', value: t });
+      break;
+    }
+  }
+
+  return { ok: true, normalized: results };
+}
+
 // Parse session tiles currently visible in the agenda DOM.
 // Dates derive from the tile unix timestamp (Atlantic Park local time via browser TZ).
 function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOffset = 0 } = {}) {
@@ -7786,18 +8140,82 @@ async function scrapeVisibleSessionsFromPage(page, options = {}) {
   return page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, ...options });
 }
 
+function isThresholdPlaceholderTile(tile) {
+  const cls = tile.tileClassName || '';
+  if (cls.includes('expired_timeslot')) return true;
+  if (cls.includes('disabled') || cls.includes('unavailable') || cls.includes('empty')) return true;
+  const text = (tile.tileText || '').replace(/\s+/g, ' ').trim();
+  if (/^x$/i.test(text)) return true;
+  if (!tile.level || String(tile.level).length < 2) return true;
+  return false;
+}
+
+function enrichThresholdTile(tile) {
+  const sessionCode = levelToSessionCode(tile.level);
+  const sideShort = normalizeWaveSideShort(tile.waveSide);
+  return {
+    ...tile,
+    sessionCode,
+    sessionName: tile.level,
+    timeLabel: tile.time,
+    waveSideShort: sideShort,
+    identityKey: makeThresholdIdentityKey({
+      isoDate: tile.isoDate,
+      timeLabel: tile.time,
+      waveSide: tile.waveSide,
+      sessionCode,
+      level: tile.level,
+    }),
+  };
+}
+
+async function scrapeThresholdSessionTilesFromPage(page, options = {}) {
+  const scrape = await scrapeVisibleSessionsFromPage(page, options);
+  const sessions = (scrape.sessions || [])
+    .filter(s => s.available && !isThresholdPlaceholderTile(s))
+    .map(enrichThresholdTile);
+  return {
+    ...scrape,
+    sessions,
+    availableCount: sessions.length,
+  };
+}
+
+async function normalizeBookingFiltersOnPage(page) {
+  return page.evaluate(normalizeBookingFiltersForThresholdScan);
+}
+
+async function getVisibleWeekDatesFromHeaders(page) {
+  const result = await page.evaluate(scrapeCalendarHeaderDates);
+  return result?.dates || [];
+}
+
+async function blurActiveFilterDropdown(page) {
+  await page.evaluate(() => {
+    document.body.click();
+    const grid = document.querySelector('table, .panel-body, .dynamic-cal-booking-ts');
+    grid?.click();
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
 async function setEntriesLeftFilter(page, minThreshold) {
   await dismissCookieBanner(page).catch(() => {});
   const n = Math.max(1, Number(minThreshold) || 1);
 
   let changed = await page.evaluate((threshold) => {
-    const want = new RegExp(`at\\s*least\\s*${threshold}\\s*entries?\\s*left`, 'i');
-    const wantLoose = new RegExp(`\\b${threshold}\\s*entries?\\s*left`, 'i');
+    const patterns = [
+      new RegExp(`entries?\\s*left\\s*:?\\s*${threshold}\\b`, 'i'),
+      new RegExp(`at\\s*least\\s*${threshold}\\s*entries?\\s*left`, 'i'),
+      new RegExp(`\\b${threshold}\\s*entries?\\s*left`, 'i'),
+    ];
+
+    const matchesLabel = (label) => patterns.some(re => re.test(label));
 
     for (const sel of document.querySelectorAll('select')) {
       for (const opt of sel.options) {
         const label = (opt.textContent || opt.label || '').replace(/\s+/g, ' ').trim();
-        if (want.test(label) || wantLoose.test(label) || opt.value === String(threshold)) {
+        if (matchesLabel(label) || opt.value === String(threshold)) {
           sel.value = opt.value;
           sel.dispatchEvent(new Event('change', { bubbles: true }));
           sel.dispatchEvent(new Event('input', { bubbles: true }));
@@ -7810,7 +8228,7 @@ async function setEntriesLeftFilter(page, minThreshold) {
     for (const el of clickables) {
       const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
       if (!t || t.length > 80) continue;
-      if (want.test(t) || wantLoose.test(t)) {
+      if (matchesLabel(t)) {
         el.click();
         return { ok: true, method: 'click', label: t, threshold };
       }
@@ -7824,7 +8242,7 @@ async function setEntriesLeftFilter(page, minThreshold) {
       const parent = labelEl.closest('form, .panel, .filter, .dropdown, .row, div') || document.body;
       for (const optEl of parent.querySelectorAll('option, li, a, button, span')) {
         const t = (optEl.textContent || '').replace(/\s+/g, ' ').trim();
-        if (want.test(t) || wantLoose.test(t)) {
+        if (matchesLabel(t)) {
           optEl.click();
           return { ok: true, method: 'dropdown_click', label: t, threshold };
         }
@@ -7835,7 +8253,7 @@ async function setEntriesLeftFilter(page, minThreshold) {
   }, n);
 
   if (!changed?.ok) {
-    const loc = page.getByText(new RegExp(`At least\\s*${n}\\s*entries?\\s*left`, 'i')).first();
+    const loc = page.getByText(new RegExp(`Entries?\\s*left\\s*:?\\s*${n}\\b`, 'i')).first();
     if (await loc.count() && await loc.isVisible().catch(() => false)) {
       await loc.click().catch(() => {});
       changed = { ok: true, method: 'playwright_text', threshold: n };
@@ -7843,6 +8261,7 @@ async function setEntriesLeftFilter(page, minThreshold) {
   }
 
   if (changed?.ok) {
+    await blurActiveFilterDropdown(page);
     await page.waitForTimeout(THRESHOLD_FILTER_SETTLE_MS);
     await page.waitForFunction(() =>
       document.querySelectorAll('div.dynamic-cal-booking-ts').length >= 0,
@@ -7852,57 +8271,66 @@ async function setEntriesLeftFilter(page, minThreshold) {
   return changed || { ok: false, reason: 'filter_set_failed', threshold: n };
 }
 
-function buildThresholdSurvivalMap(visibleByThreshold, maxTested) {
-  const survival = new Map();
+function buildThresholdPresenceMap(visibleByThreshold, maxTested) {
+  const presenceByIdentity = new Map();
   for (let t = 1; t <= maxTested; t++) {
     const visible = visibleByThreshold.get(t) || new Set();
-    for (const key of visible) {
-      survival.set(key, Math.max(survival.get(key) || 0, t));
+    for (const identityKey of visible) {
+      if (!presenceByIdentity.has(identityKey)) presenceByIdentity.set(identityKey, []);
+      presenceByIdentity.get(identityKey).push(t);
     }
   }
-  return survival;
+  return presenceByIdentity;
 }
 
 function matchThresholdResultsToSessions({
-  survivalMap,
-  tileByKey,
+  presenceByIdentity,
+  tileByIdentity,
   basicSessions,
   maxTested,
 }) {
   const results = [];
   const ambiguousSamples = [];
   const matchedSessionKeys = new Set();
+  const thresholdPresenceBySession = {};
 
-  for (const [tileKey, maxVisible] of survivalMap.entries()) {
-    const tile = tileByKey.get(tileKey);
+  for (const [identityKey, thresholdsSeen] of presenceByIdentity.entries()) {
+    const tile = tileByIdentity.get(identityKey);
     if (!tile) continue;
-    const weekCandidates = basicSessions.filter(s => {
-      const dk = sessionDateKey(s);
-      return dk === tile.isoDate;
-    });
+    thresholdPresenceBySession[identityKey] = thresholdsSeen.sort((a, b) => a - b);
+
+    const weekCandidates = basicSessions.filter(s => sessionDateKey(s) === tile.isoDate);
     const match = matchThresholdTileToSessions(tile, weekCandidates);
-    const inference = inferThresholdSlotsFromMaxVisible(maxVisible, maxTested, { inBasicScrape: false });
+    const inference = inferSlotsFromThresholdPresence(thresholdsSeen, maxTested, {
+      sessionCode: tile.sessionCode,
+      level: tile.level,
+      inBasicScrape: false,
+    });
 
     if (match.session) {
       matchedSessionKeys.add(match.session.key);
       results.push({
         session: match.session,
         tile,
-        maxVisible,
+        identityKey,
+        thresholdsSeen,
+        maxVisible: inference.thresholdMaxVisible,
         inference,
         matchConfidence: match.confidence,
         matchMethod: match.matchMethod,
         thresholdConfidence: inference.thresholdConfidence,
       });
     } else if (match.confidence === 'ambiguous') {
-      ambiguousSamples.push({ tileKey, maxVisible, ...match });
+      ambiguousSamples.push({ identityKey, thresholdsSeen, ...match });
       results.push({
         session: null,
         tile,
-        maxVisible,
+        identityKey,
+        thresholdsSeen,
+        maxVisible: inference.thresholdMaxVisible,
         inference: {
           thresholdInferredSlots: null,
-          thresholdMaxVisible: maxVisible,
+          thresholdMaxVisible: inference.thresholdMaxVisible,
           thresholdConfidence: 'ambiguous',
           thresholdScanVerified: false,
           reason: match.reason,
@@ -7915,19 +8343,32 @@ function matchThresholdResultsToSessions({
 
   for (const basic of basicSessions) {
     if (matchedSessionKeys.has(basic.key)) continue;
-    const maxVisible = survivalMap.get(basic.key) || 0;
-    const inference = inferThresholdSlotsFromMaxVisible(maxVisible, maxTested, { inBasicScrape: true });
+    const identityKey = makeThresholdIdentityKey({
+      isoDate: sessionDateKey(basic),
+      timeLabel: basic.time,
+      waveSide: basic.waveSide,
+      sessionCode: levelToSessionCode(basic.level),
+      level: basic.level,
+    });
+    const thresholdsSeen = presenceByIdentity.get(identityKey) || [];
+    const inference = inferSlotsFromThresholdPresence(thresholdsSeen, maxTested, {
+      sessionCode: levelToSessionCode(basic.level),
+      level: basic.level,
+      inBasicScrape: true,
+    });
     results.push({
       session: basic,
       tile: null,
-      maxVisible,
+      identityKey,
+      thresholdsSeen,
+      maxVisible: inference.thresholdMaxVisible || 0,
       inference,
       matchConfidence: inference.thresholdConfidence === 'no_match' ? 'no_match' : 'basic_only',
       thresholdConfidence: inference.thresholdConfidence,
     });
   }
 
-  return { results, ambiguousSamples };
+  return { results, ambiguousSamples, thresholdPresenceBySession };
 }
 
 async function scanEntriesLeftThresholdsForWeek(page, {
@@ -7944,53 +8385,79 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     ? thresholds.map(t => Number(t)).filter(t => Number.isFinite(t) && t >= minT && t <= maxT).sort((a, b) => a - b)
     : thresholdBatches.flatMap(b => b.thresholds);
 
+  const computedWeekStart = getMondayWeekStartIso(targetIsoDate);
   const report = {
+    requestedIsoDate: targetIsoDate,
+    computedWeekStart,
     targetIsoDate,
-    weekKey: weekKey || targetIsoDate,
+    weekKey: weekKey || computedWeekStart,
     minThreshold: minT,
     maxThreshold: maxT,
     thresholds: thresholdList,
+    thresholdsScanned: thresholdList,
     thresholdBatches: thresholdBatches.length,
     navigation: null,
     visibleWeekStart: null,
     visibleWeekEnd: null,
+    visibleIsoDatesFromHeaders: [],
+    targetDateVisibleFromHeaders: false,
     targetDateVisible: false,
+    visibleTileCountAtThreshold1: 0,
+    emptyWeekButVisible: false,
+    weekMarkedComplete: false,
     filterResults: [],
+    filterNormalization: null,
     visibleByThreshold: {},
+    thresholdPresenceBySession: {},
     survivalMap: {},
     inferred: [],
     ambiguousSamples: [],
+    exactCount: 0,
+    atLeastCount: 0,
+    ambiguousCount: 0,
+    noMatchCount: 0,
     sessionsMatched: 0,
     sessionsWritten: 0,
+    statusReason: null,
     errors: [],
     durationMs: 0,
-    method: 'entries_left_filter',
+    method: 'entries_left_threshold_scan',
     batchProgress: [],
+    crashed: false,
+    error: null,
   };
 
   const started = Date.now();
   try {
     const nav = await withPlaywrightGuard(
-      () => navigateCalendarToShowDate(page, targetIsoDate),
-      { stage: 'threshold_week_navigation', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS, weekKey: weekKey || targetIsoDate },
+      () => navigateCalendarToShowDate(page, targetIsoDate, { headerOnly: true }),
+      { stage: 'threshold_week_navigation', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS, weekKey: weekKey || computedWeekStart },
     );
     report.navigation = nav;
+    report.visibleIsoDatesFromHeaders = nav.visibleIsoDatesFromHeaders || nav.visibleDateLabels || [];
     report.visibleWeekStart = nav.visibleWeekStart;
     report.visibleWeekEnd = nav.visibleWeekEnd;
-    report.targetDateVisible = nav.targetDateVisible;
-    report.weekKey = nav.visibleWeekStart || weekKey || targetIsoDate;
+    report.targetDateVisibleFromHeaders = nav.targetDateVisibleFromHeaders === true;
+    report.targetDateVisible = report.targetDateVisibleFromHeaders;
 
-    if (!nav.targetDateVisible) {
+    if (!report.targetDateVisibleFromHeaders) {
+      report.statusReason = 'date_not_visible_after_navigation';
       report.errors.push({
-        error: nav.navigationError || 'target_date_not_visible',
+        error: nav.navigationError || 'target_date_not_visible_in_headers',
         failureReason: 'failed_navigation',
       });
       report.durationMs = Date.now() - started;
       return report;
     }
 
+    report.filterNormalization = await withPlaywrightGuard(
+      () => normalizeBookingFiltersOnPage(page),
+      { stage: 'threshold_filter_normalize', timeout: THRESHOLD_FILTER_TIMEOUT_MS, weekKey: report.weekKey },
+    );
+    await page.waitForTimeout(500);
+
     const visibleByThreshold = new Map();
-    const tileByKey = new Map();
+    const tileByIdentity = new Map();
     const filterResults = [];
 
     for (const batch of thresholdBatches) {
@@ -8014,16 +8481,17 @@ async function scanEntriesLeftThresholdsForWeek(page, {
         }
 
         const scrape = await withPlaywrightGuard(
-          () => scrapeVisibleSessionsFromPage(page, { weekOffset: 0 }),
+          () => scrapeThresholdSessionTilesFromPage(page, { weekOffset: 0 }),
           { stage: 'threshold_tile_scrape', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
         );
-        const keys = new Set();
+        const identityKeys = new Set();
         for (const tile of scrape.sessions || []) {
-          keys.add(tile.key);
-          if (!tileByKey.has(tile.key)) tileByKey.set(tile.key, tile);
+          identityKeys.add(tile.identityKey);
+          if (!tileByIdentity.has(tile.identityKey)) tileByIdentity.set(tile.identityKey, tile);
         }
-        visibleByThreshold.set(threshold, keys);
-        report.visibleByThreshold[threshold] = keys.size;
+        visibleByThreshold.set(threshold, identityKeys);
+        report.visibleByThreshold[threshold] = identityKeys.size;
+        if (threshold === 1) report.visibleTileCountAtThreshold1 = identityKeys.size;
       }
 
       report.batchProgress.push({
@@ -8034,29 +8502,53 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     }
 
     report.filterResults = filterResults;
-    const survivalMap = buildThresholdSurvivalMap(visibleByThreshold, maxT);
-    report.survivalMap = Object.fromEntries(survivalMap.entries());
 
-    const weekDates = await withPlaywrightGuard(
-      () => getVisibleDateKeysFromPage(page),
-      { stage: 'threshold_week_dates', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
+    if (report.visibleTileCountAtThreshold1 === 0) {
+      report.emptyWeekButVisible = true;
+      report.weekMarkedComplete = true;
+      report.statusReason = 'visible_week_no_threshold_tiles';
+      report.exactCount = 0;
+      report.atLeastCount = 0;
+      report.ambiguousCount = 0;
+      report.noMatchCount = 0;
+      report.sessionsMatched = 0;
+      collectorState.lastThresholdScanWeek = report.weekKey;
+      report.durationMs = Date.now() - started;
+      return report;
+    }
+
+    const presenceByIdentity = buildThresholdPresenceMap(visibleByThreshold, maxT);
+    report.survivalMap = Object.fromEntries(
+      [...presenceByIdentity.entries()].map(([k, v]) => [k, Math.max(...v, 0)]),
     );
+
+    const weekDates = report.visibleIsoDatesFromHeaders.length
+      ? report.visibleIsoDatesFromHeaders
+      : await withPlaywrightGuard(
+        () => getVisibleWeekDatesFromHeaders(page),
+        { stage: 'threshold_week_dates', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
+      );
     const basicSessions = weekDates.flatMap(d => sessionsForDate(d));
     const uniqueBasic = [...new Map(basicSessions.map(s => [s.key, s])).values()];
 
-    const { results, ambiguousSamples } = matchThresholdResultsToSessions({
-      survivalMap,
-      tileByKey,
+    const { results, ambiguousSamples, thresholdPresenceBySession } = matchThresholdResultsToSessions({
+      presenceByIdentity,
+      tileByIdentity,
       basicSessions: uniqueBasic,
       maxTested: maxT,
     });
 
+    report.thresholdPresenceBySession = thresholdPresenceBySession;
     report.inferred = results.map(r => ({
-      key: r.session?.key || r.tile?.key || null,
+      key: r.session?.key || null,
+      identityKey: r.identityKey,
       isoDate: r.session ? sessionDateKey(r.session) : r.tile?.isoDate,
       time: r.session?.time || r.tile?.time,
+      timeLabel: r.tile?.timeLabel || r.session?.time,
       level: r.session?.level || r.tile?.level,
+      sessionCode: r.tile?.sessionCode || levelToSessionCode(r.session?.level),
       waveSide: r.session?.waveSide || r.tile?.waveSide,
+      thresholdsSeen: r.thresholdsSeen || [],
       maxVisible: r.maxVisible,
       thresholdInferredSlots: r.inference?.thresholdInferredSlots,
       thresholdConfidence: r.inference?.thresholdConfidence,
@@ -8066,15 +8558,24 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       ambiguousSample: r.ambiguousSample || null,
     }));
     report.ambiguousSamples = ambiguousSamples;
+    report.exactCount = results.filter(r => r.inference?.thresholdConfidence === 'exact' && r.session).length;
+    report.atLeastCount = results.filter(r => r.inference?.thresholdConfidence === 'at_least' && r.session).length;
+    report.ambiguousCount = results.filter(r => r.inference?.thresholdConfidence === 'ambiguous').length;
+    report.noMatchCount = results.filter(r => r.inference?.thresholdConfidence === 'no_match' && r.session).length;
     report.sessionsMatched = results.filter(r => r.session && r.inference?.thresholdScanVerified).length;
+    report.weekMarkedComplete = true;
+    report.statusReason = classifyThresholdScanStatus(report);
     collectorState.lastThresholdScanWeek = report.weekKey;
   } catch (e) {
     const failureReason = isPlaywrightCrashError(e)
-      ? recordPageCrash('threshold_week_scan', e, { weekKey: weekKey || targetIsoDate })
+      ? recordPageCrash('threshold_week_scan', e, { weekKey: weekKey || computedWeekStart })
       : 'failed_threshold_scan';
+    report.crashed = isPlaywrightCrashError(e);
+    report.error = e.message;
     report.errors.push({ error: e.message, failureReason });
     if (!isPlaywrightCrashError(e)) {
       collectorState.thresholdScanLastError = e.message;
+      report.statusReason = report.statusReason || 'threshold_scan_ambiguous';
     }
   }
 
@@ -8132,7 +8633,7 @@ async function applyThresholdScanReport(report, { dryRun = true, sourceTier = 2 
         thresholdMaxVisible: item.maxVisible || 0,
         thresholdConfidence: 'no_match',
         thresholdScanVerified: false,
-        reason: 'not_available_under_filter',
+        reason: 'threshold_no_match',
       }, {
         maxTested: report.maxThreshold,
         diagnostics: 'not_visible_at_threshold_1',
@@ -8247,25 +8748,40 @@ async function runThresholdScansChunked(dates, options = {}) {
 
         const result = await runThresholdScanForWeek(launched.page, {
           targetIsoDate: week.anchorIsoDate,
-          weekKey: week.weekKey,
+          weekKey: week.weekKey || week.computedWeekStart,
           minThreshold,
           maxThreshold,
           dryRun,
           sourceTier,
         });
 
-        const weekFailed = result.errors?.some(e =>
+        const isEmptyVisibleWeek = result.statusReason === 'visible_week_no_threshold_tiles';
+        const weekFailed = !isEmptyVisibleWeek && result.errors?.some(e =>
           e.failureReason === 'failed_page_crash' || e.failureReason === 'failed_navigation',
         );
 
         dateResults.push({
           isoDate: week.anchorIsoDate,
           weekKey: result.weekKey || week.weekKey,
+          computedWeekStart: result.computedWeekStart,
+          requestedIsoDate: result.requestedIsoDate,
+          visibleIsoDatesFromHeaders: result.visibleIsoDatesFromHeaders,
+          targetDateVisibleFromHeaders: result.targetDateVisibleFromHeaders,
+          visibleTileCountAtThreshold1: result.visibleTileCountAtThreshold1,
+          emptyWeekButVisible: result.emptyWeekButVisible,
+          weekMarkedComplete: result.weekMarkedComplete,
+          statusReason: result.statusReason,
+          exactCount: result.exactCount,
+          atLeastCount: result.atLeastCount,
+          ambiguousCount: result.ambiguousCount,
+          noMatchCount: result.noMatchCount,
+          thresholdPresenceBySession: result.thresholdPresenceBySession,
           targetDateVisible: result.targetDateVisible,
           sessionsMatched: result.sessionsMatched,
           write: result.write,
           errors: result.errors,
           crashed: weekFailed,
+          error: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || result.error) : null,
           failureReason: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || 'failed_page_crash') : null,
         });
 
@@ -8276,8 +8792,8 @@ async function runThresholdScansChunked(dates, options = {}) {
           break;
         }
 
-        if (!collectorState.thresholdScanCompletedWeeks.includes(result.weekKey || week.weekKey)) {
-          collectorState.thresholdScanCompletedWeeks.push(result.weekKey || week.weekKey);
+        if (!collectorState.thresholdScanCompletedWeeks.includes(result.computedWeekStart || result.weekKey || week.weekKey)) {
+          collectorState.thresholdScanCompletedWeeks.push(result.computedWeekStart || result.weekKey || week.weekKey);
         }
         markThresholdScanRecovered();
       } catch (e) {
@@ -8965,15 +9481,19 @@ function groupSessionsByIsoDate(sessions) {
   return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
-async function navigateCalendarToShowDate(page, targetIsoDate) {
+async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = false } = {}) {
   const diag = {
     targetIsoDate: targetIsoDate || null,
+    computedWeekStart: targetIsoDate ? getMondayWeekStartIso(targetIsoDate) : null,
     visibleWeekStart: null,
     visibleWeekEnd: null,
     visibleDateLabels: [],
+    visibleIsoDatesFromHeaders: [],
+    targetDateVisibleFromHeaders: false,
     clickedNextWeekCount: 0,
     targetDateVisible: false,
     navigationError: null,
+    headerOnly,
   };
 
   if (!targetIsoDate) {
@@ -8981,61 +9501,47 @@ async function navigateCalendarToShowDate(page, targetIsoDate) {
     return diag;
   }
 
-  let visible = await getVisibleDateKeysFromPage(page);
-  diag.visibleDateLabels = visible;
-  if (visible.length) {
-    diag.visibleWeekStart = visible[0];
-    diag.visibleWeekEnd = visible[visible.length - 1];
+  async function readVisibleDates() {
+    let headers = await getVisibleWeekDatesFromHeaders(page);
+    if (!headers.length && !headerOnly) {
+      headers = await getVisibleDateKeysFromPage(page);
+    }
+    diag.visibleIsoDatesFromHeaders = headers;
+    diag.visibleDateLabels = headers;
+    if (headers.length) {
+      diag.visibleWeekStart = headers[0];
+      diag.visibleWeekEnd = headers[headers.length - 1];
+    }
+    diag.targetDateVisibleFromHeaders = headers.includes(targetIsoDate);
+    diag.targetDateVisible = diag.targetDateVisibleFromHeaders;
+    return headers;
   }
-  if (visible.includes(targetIsoDate)) {
-    diag.targetDateVisible = true;
-    return diag;
-  }
+
+  let visible = await readVisibleDates();
+  if (visible.includes(targetIsoDate)) return diag;
 
   await openBookingPage(page);
   await dismissCookieBanner(page);
-  visible = await getVisibleDateKeysFromPage(page);
-  diag.visibleDateLabels = visible;
-  if (visible.length) {
-    diag.visibleWeekStart = visible[0];
-    diag.visibleWeekEnd = visible[visible.length - 1];
-  }
-  if (visible.includes(targetIsoDate)) {
-    diag.targetDateVisible = true;
-    return diag;
-  }
+  visible = await readVisibleDates();
+  if (visible.includes(targetIsoDate)) return diag;
 
   const maxSteps = effectiveWeeksAhead + 3;
   for (let step = 0; step < maxSteps; step++) {
     if (!await advanceCalendarWeek(page)) break;
     diag.clickedNextWeekCount++;
-    visible = await getVisibleDateKeysFromPage(page);
-    diag.visibleDateLabels = visible;
-    if (visible.length) {
-      diag.visibleWeekStart = visible[0];
-      diag.visibleWeekEnd = visible[visible.length - 1];
-    }
-    if (visible.includes(targetIsoDate)) {
-      diag.targetDateVisible = true;
-      return diag;
-    }
+    visible = await readVisibleDates();
+    if (visible.includes(targetIsoDate)) return diag;
   }
 
   for (let step = 0; step < maxSteps; step++) {
     if (!await retreatCalendarWeek(page)) break;
-    visible = await getVisibleDateKeysFromPage(page);
-    diag.visibleDateLabels = visible;
-    if (visible.length) {
-      diag.visibleWeekStart = visible[0];
-      diag.visibleWeekEnd = visible[visible.length - 1];
-    }
-    if (visible.includes(targetIsoDate)) {
-      diag.targetDateVisible = true;
-      return diag;
-    }
+    visible = await readVisibleDates();
+    if (visible.includes(targetIsoDate)) return diag;
   }
 
   diag.navigationError = 'target_date_not_visible_after_navigation';
+  diag.targetDateVisible = false;
+  diag.targetDateVisibleFromHeaders = false;
   return diag;
 }
 
@@ -10894,6 +11400,7 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
       });
 
       await refreshCoverageFlags().catch(() => {});
+      const firstWeek = result.dateResults?.[0] || null;
       return {
         skipped: false,
         isoDate,
@@ -10902,6 +11409,7 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
         minThreshold,
         maxThreshold,
         ...result,
+        ...(firstWeek || {}),
       };
     } catch (e) {
       releaseScrapeLock();

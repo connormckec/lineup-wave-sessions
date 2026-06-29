@@ -1320,17 +1320,21 @@ function sessionDetailVerified(s) {
 }
 
 function sessionThresholdSlotsTrusted(s) {
-  return s?.thresholdScanVerified === true
-    && (s?.thresholdConfidence === 'exact' || s?.thresholdConfidence === 'at_least');
+  const verified = s?.thresholdScanVerified === true || s?.threshold_scan_verified === true;
+  const source = s?.slot_source || s?.slotsSource;
+  const conf = s?.thresholdConfidence || s?.slot_status;
+  return verified
+    && (source === 'entries_left_threshold_scan' || source === 'threshold' || !source)
+    && (conf === 'exact' || conf === 'at_least');
 }
 
 function trustedSlotsForSession(s, hist) {
   if (sessionThresholdSlotsTrusted(s)) {
     return {
-      slots: s.thresholdInferredSlots ?? s.slots ?? null,
-      atLeast: s.thresholdConfidence === 'at_least' || s.slotsAtLeast === true,
+      slots: s.available_entries ?? s.thresholdInferredSlots ?? s.slots ?? null,
+      atLeast: s.thresholdConfidence === 'at_least' || s.slot_status === 'at_least' || s.slotsAtLeast === true,
       maxTested: s.thresholdScanMaxTested ?? null,
-      source: 'threshold',
+      source: s.slot_source || 'entries_left_threshold_scan',
     };
   }
   if (sessionDetailVerified(s)) {
@@ -1369,6 +1373,8 @@ function formatDetailStatusLine(s) {
   if (!s.available && s.slots !== 0) return '';
   if (sessionThresholdSlotsTrusted(s)) return '';
   if (sessionDetailVerified(s) && (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null)) return '';
+  if ((s?.thresholdConfidence === 'no_match' || s?.slot_status === 'no_match')
+    && (s?.thresholdScanAt || s?.threshold_scan_at)) return 'details unavailable';
   if (status === 'checking') return 'details pending';
   if (isDetailFailedStatus(status)) return 'details unavailable';
   if (status === 'checked_no_slots_visible') return 'details unavailable';
