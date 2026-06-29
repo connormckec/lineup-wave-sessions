@@ -11574,7 +11574,189 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
   };
 }
 
+const GATE8_BATCH_MAX_DATES = 5;
+
+function buildGate8BatchDateRange(startDate, endDate, maxDates = GATE8_BATCH_MAX_DATES) {
+  if (!startDate || !endDate) {
+    return { ok: false, error: 'missing_start_or_end_date', dates: [] };
+  }
+  if (startDate > endDate) {
+    return { ok: false, error: 'startDate_after_endDate', dates: [] };
+  }
+  const dates = [];
+  let cur = startDate;
+  while (cur <= endDate) {
+    dates.push(cur);
+    if (dates.length > maxDates) {
+      return { ok: false, error: 'date_range_exceeds_max', dates, maxDates };
+    }
+    cur = addDaysToParkIso(cur, 1);
+  }
+  return { ok: true, dates, error: null };
+}
+
+async function runDebugEntriesLeftThresholdWriteBatchContract({
+  startDate,
+  endDate,
+  weekMode = true,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  dryRun = true,
+  write = false,
+} = {}) {
+  const range = buildGate8BatchDateRange(startDate, endDate, GATE8_BATCH_MAX_DATES);
+  if (!range.ok) {
+    return {
+      gate: 8,
+      mode: 'threshold_write_batch_contract',
+      datesRequested: [],
+      dateResults: [],
+      totalRowsPrepared: 0,
+      totalRowsWritten: 0,
+      writesPerformed: false,
+      error: range.error,
+    };
+  }
+
+  const datesRequested = range.dates;
+  const dateResults = [];
+  let totalRowsPrepared = 0;
+  let totalRowsWritten = 0;
+  let launched = null;
+  const started = Date.now();
+
+  try {
+    launched = await launchBrowser();
+    await openBookingPageForThreshold(launched.page);
+    await waitForThresholdCalendarShell(launched.page).catch(() => {});
+
+    for (const isoDate of datesRequested) {
+      const dateStarted = Date.now();
+      try {
+        const navigationIsoDate = weekMode ? getMondayWeekStartIso(isoDate) : isoDate;
+        const nav = await navigateCalendarToShowDate(launched.page, navigationIsoDate, {
+          headerOnly: true,
+          validateIsoDate: isoDate,
+          waitForShell: true,
+        });
+
+        if (nav.statusReason === 'calendar_day_headers_not_parsed' || nav.headerParseError) {
+          dateResults.push({
+            isoDate,
+            fullScanContractOk: false,
+            rowsPrepared: 0,
+            rowsWritten: 0,
+            writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
+            writesPerformed: false,
+            exactCount: 0,
+            error: nav.statusReason || nav.headerParseError || 'header_parse_failed',
+            durationMs: Date.now() - dateStarted,
+          });
+          continue;
+        }
+
+        if (!nav.targetDateVisibleFromHeaders) {
+          dateResults.push({
+            isoDate,
+            fullScanContractOk: false,
+            rowsPrepared: 0,
+            rowsWritten: 0,
+            writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
+            writesPerformed: false,
+            exactCount: 0,
+            error: 'target_date_not_visible',
+            durationMs: Date.now() - dateStarted,
+          });
+          continue;
+        }
+
+        await normalizeBookingFiltersOnPage(launched.page).catch(() => {});
+        await launched.page.waitForTimeout(400);
+
+        const writeRun = await runDebugEntriesLeftThresholdWriteContract(launched.page, {
+          isoDate,
+          navigation: nav,
+          minThreshold,
+          maxThreshold,
+          dryRun,
+          write,
+        });
+
+        dateResults.push({
+          isoDate,
+          fullScanContractOk: writeRun.fullScanContractOk,
+          rowsPrepared: writeRun.rowsPrepared,
+          rowsWritten: writeRun.rowsWritten,
+          writeMode: writeRun.writeMode,
+          writesPerformed: writeRun.writesPerformed,
+          exactCount: writeRun.exactCount,
+          atLeastCount: writeRun.atLeastCount,
+          thresholdStopReason: writeRun.thresholdStopReason,
+          error: writeRun.error,
+          durationMs: Date.now() - dateStarted,
+        });
+        totalRowsPrepared += writeRun.rowsPrepared || 0;
+        totalRowsWritten += writeRun.rowsWritten || 0;
+      } catch (err) {
+        dateResults.push({
+          isoDate,
+          fullScanContractOk: false,
+          rowsPrepared: 0,
+          rowsWritten: 0,
+          writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
+          writesPerformed: false,
+          exactCount: 0,
+          error: err.message || String(err),
+          durationMs: Date.now() - dateStarted,
+        });
+      }
+    }
+
+    return {
+      gate: 8,
+      mode: 'threshold_write_batch_contract',
+      dryRun,
+      write,
+      startDate,
+      endDate,
+      weekMode,
+      minThreshold: Math.max(1, Number(minThreshold) || 1),
+      maxThreshold: Math.max(
+        1,
+        Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+      ),
+      datesRequested,
+      dateResults,
+      totalRowsPrepared,
+      totalRowsWritten,
+      writesPerformed: totalRowsWritten > 0,
+      durationMs: Date.now() - started,
+      error: null,
+    };
+  } catch (err) {
+    return {
+      gate: 8,
+      mode: 'threshold_write_batch_contract',
+      dryRun,
+      write,
+      startDate,
+      endDate,
+      datesRequested,
+      dateResults,
+      totalRowsPrepared,
+      totalRowsWritten,
+      writesPerformed: false,
+      durationMs: Date.now() - started,
+      error: err.message || String(err),
+      crashed: isPlaywrightCrashError(err),
+    };
+  } finally {
+    await safeCloseBrowser(launched);
+  }
+}
+
 function entriesLeftDebugGateForMode(mode) {
+  if (mode === 'threshold_write_batch_contract') return 8;
   if (mode === 'threshold_write_contract') return 8;
   if (mode === 'full_scan_contract') return 7;
   if (mode === 'threshold_inference_contract') return 6;
@@ -15620,6 +15802,8 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
 
 app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   const isoDate = req.body?.isoDate;
+  const startDate = req.body?.startDate;
+  const endDate = req.body?.endDate;
   const weekMode = req.body?.weekMode !== false;
   const thresholds = Array.isArray(req.body?.thresholds) && req.body.thresholds.length
     ? req.body.thresholds.map((t) => Number(t)).filter((t) => Number.isFinite(t) && t >= 1)
@@ -15644,11 +15828,24 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
     || modeRaw === 'threshold_inference_contract'
     || modeRaw === 'full_scan_contract'
     || modeRaw === 'threshold_write_contract'
+    || modeRaw === 'threshold_write_batch_contract'
     ? modeRaw
     : 'recon';
   const gate = entriesLeftDebugGateForMode(mode);
+  const isBatchWriteMode = mode === 'threshold_write_batch_contract';
 
-  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+  if (isBatchWriteMode) {
+    if (!startDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+      return res.status(400).json({ error: 'startDate must be YYYY-MM-DD' });
+    }
+    if (!endDate || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      return res.status(400).json({ error: 'endDate must be YYYY-MM-DD' });
+    }
+    const range = buildGate8BatchDateRange(startDate, endDate, GATE8_BATCH_MAX_DATES);
+    if (!range.ok) {
+      return res.status(400).json({ error: range.error, maxDates: GATE8_BATCH_MAX_DATES });
+    }
+  } else if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
     return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
   }
 
@@ -15659,13 +15856,26 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         skipReason: 'scrape_in_progress',
         gate,
         mode,
-        isoDate,
+        isoDate: isBatchWriteMode ? null : isoDate,
+        startDate: isBatchWriteMode ? startDate : null,
+        endDate: isBatchWriteMode ? endDate : null,
         weekMode,
         dryRun,
       };
     }
     try {
       await ensureSessionsForStatus();
+      if (isBatchWriteMode) {
+        return await runDebugEntriesLeftThresholdWriteBatchContract({
+          startDate,
+          endDate,
+          weekMode,
+          minThreshold,
+          maxThreshold,
+          dryRun,
+          write,
+        });
+      }
       return await runDebugEntriesLeftControl({
         isoDate,
         weekMode,
@@ -15721,7 +15931,9 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         weekMode,
         thresholds,
         dryRun,
-        message: mode === 'threshold_write_contract'
+        message: mode === 'threshold_write_batch_contract'
+          ? 'Entries-left threshold write batch contract queued — retry with wait=true'
+          : mode === 'threshold_write_contract'
           ? 'Entries-left threshold write contract queued — retry with wait=true'
           : mode === 'full_scan_contract'
           ? 'Entries-left full scan contract queued — retry with wait=true'
