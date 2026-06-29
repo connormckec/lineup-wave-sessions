@@ -3,6 +3,7 @@ const express  = require('express');
 const { chromium } = require('playwright');
 const cron     = require('node-cron');
 const path     = require('path');
+const fs       = require('fs');
 const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
@@ -45,6 +46,7 @@ const THRESHOLD_FILTER_SETTLE_MS = parseInt(process.env.THRESHOLD_FILTER_SETTLE_
 const THRESHOLD_SCAN_MAX_WEEKS_PER_RUN = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_MAX_WEEKS_PER_RUN || '1', 10));
 const THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE || '20', 10));
 const THRESHOLD_SCAN_PAGE_TIMEOUT_MS = parseInt(process.env.THRESHOLD_SCAN_PAGE_TIMEOUT_MS || '45000', 10);
+const THRESHOLD_DEBUG_ARTIFACTS_DIR = path.join(__dirname, 'debug-threshold-scans');
 const THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK = process.env.THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK !== 'false';
 const THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE || '5', 10));
 const THRESHOLD_FILTER_TIMEOUT_MS = parseInt(process.env.THRESHOLD_FILTER_TIMEOUT_MS || '20000', 10);
@@ -3436,14 +3438,209 @@ async function withTimeout(promise, ms, label = 'operation') {
   }
 }
 
-async function withPlaywrightGuard(fn, { stage = 'playwright', timeout = THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey = null, tier = null } = {}) {
+async function withPlaywrightGuard(fn, {
+  stage = 'playwright',
+  timeout = THRESHOLD_TILE_SCRAPE_TIMEOUT_MS,
+  weekKey = null,
+  tier = null,
+  page = null,
+  auditContext = null,
+} = {}) {
   try {
     return await withTimeout(Promise.resolve().then(fn), timeout, stage);
   } catch (e) {
+    if (page) {
+      try {
+        const diag = await collectPageDiagnostics(page, `${stage}_timeout`);
+        const artifacts = await captureThresholdDebugArtifacts(page, auditContext, stage, {
+          screenshot: true,
+          html: true,
+        });
+        Object.assign(diag, artifacts);
+        e.timeoutDiagnostics = diag;
+        pushThresholdAuditStep(auditContext, 'timeout_or_success', {
+          ok: false,
+          reason: e.message,
+          stage,
+          ...diag,
+        });
+      } catch {}
+    }
     if (isPlaywrightCrashError(e)) {
       recordPageCrash(stage, e, { weekKey, tier });
     }
     throw e;
+  }
+}
+
+function isLocalThresholdDebugArtifactsEnabled() {
+  return process.env.RAILWAY_ENVIRONMENT == null && process.env.RAILWAY_PROJECT_ID == null;
+}
+
+function createThresholdAuditContext(options = {}) {
+  return {
+    auditTrail: [],
+    debug: {
+      debug: options.debug === true,
+      trace: options.trace === true,
+      screenshot: options.screenshot === true,
+      headed: options.headed === true,
+    },
+    startedAt: Date.now(),
+    traceContext: null,
+    tracePath: null,
+  };
+}
+
+function pushThresholdAuditStep(auditContext, step, data = {}) {
+  if (!auditContext?.auditTrail) return;
+  auditContext.auditTrail.push({
+    step,
+    at: new Date().toISOString(),
+    elapsedMs: Date.now() - (auditContext.startedAt || Date.now()),
+    ...data,
+  });
+}
+
+function applyPageDiagnosticsTo(target, diagnostics = {}) {
+  if (!target || !diagnostics) return target;
+  for (const key of [
+    'currentUrl', 'pageTitle', 'bodyTextLength', 'bodyTextSample',
+    'calendarReadySignals', 'pageDiagnosticError', 'pageAvailable', 'pageUnavailableReason',
+    'diagnosticLabel', 'screenshotPath', 'htmlSnapshotPath',
+  ]) {
+    if (diagnostics[key] != null) target[key] = diagnostics[key];
+  }
+  return target;
+}
+
+async function collectPageDiagnostics(page, label = 'unknown') {
+  const out = {
+    diagnosticLabel: label,
+    pageAvailable: !!page,
+    currentUrl: null,
+    pageTitle: null,
+    bodyTextLength: null,
+    bodyTextSample: null,
+    calendarReadySignals: null,
+  };
+
+  if (!page) {
+    out.pageAvailable = false;
+    out.pageUnavailableReason = 'page_object_missing';
+    return out;
+  }
+
+  try { out.currentUrl = page.url?.() || null; } catch {
+    out.pageUnavailableReason = out.pageUnavailableReason || 'current_url_unavailable';
+  }
+  try { out.pageTitle = await page.title(); } catch {
+    out.pageUnavailableReason = out.pageUnavailableReason || 'page_title_unavailable';
+  }
+
+  try {
+    const body = await page.evaluate(() => {
+      const text = document.body?.innerText || '';
+      return {
+        bodyTextLength: text.length,
+        bodyTextSample: text.slice(0, 1500),
+        calendarReadySignals: {
+          hasMonthYearText: /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b/i.test(text),
+          hasLeftWaveSessionsText: /Left Wave Sessions/i.test(text),
+          hasRightWaveSessionsText: /Right Wave Sessions/i.test(text),
+          hasEntriesLeftText: /Entries left/i.test(text),
+          hasWeekdayText: /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/i.test(text),
+          hasTimeRows: /\b\d{1,2}\s?(am|pm)\b/i.test(text),
+        },
+      };
+    });
+    Object.assign(out, body);
+  } catch (err) {
+    out.pageDiagnosticError = String(err?.stack || err?.message || err);
+  }
+
+  return out;
+}
+
+async function captureThresholdDebugArtifacts(page, auditContext, label, { screenshot = false, html = false } = {}) {
+  if (!page || !isLocalThresholdDebugArtifactsEnabled()) return {};
+  const wantScreenshot = screenshot || auditContext?.debug?.screenshot;
+  const wantHtml = html || auditContext?.debug?.debug;
+  if (!wantScreenshot && !wantHtml) return {};
+
+  const safeLabel = String(label || 'step').replace(/[^\w.-]+/g, '_').slice(0, 80);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const dir = THRESHOLD_DEBUG_ARTIFACTS_DIR;
+  const artifacts = {};
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    if (wantScreenshot) {
+      const screenshotPath = path.join(dir, `${ts}_${safeLabel}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      if (fs.existsSync(screenshotPath)) artifacts.screenshotPath = screenshotPath;
+    }
+    if (wantHtml) {
+      const htmlSnapshotPath = path.join(dir, `${ts}_${safeLabel}.html`);
+      const content = await page.content().catch(() => '');
+      if (content) {
+        fs.writeFileSync(htmlSnapshotPath, content, 'utf8');
+        artifacts.htmlSnapshotPath = htmlSnapshotPath;
+      }
+    }
+  } catch (err) {
+    artifacts.artifactCaptureError = String(err?.message || err);
+  }
+  return artifacts;
+}
+
+async function enrichFailureWithPageDiagnostics(page, auditContext, stage, err) {
+  const diagnostics = err?.timeoutDiagnostics
+    || (page
+      ? await collectPageDiagnostics(page, `${stage}_catch`)
+      : {
+        pageAvailable: false,
+        pageUnavailableReason: 'page_object_missing',
+        diagnosticLabel: `${stage}_catch`,
+      });
+  const artifacts = await captureThresholdDebugArtifacts(page, auditContext, stage, {
+    screenshot: true,
+    html: true,
+  });
+  const merged = { ...diagnostics, ...artifacts };
+  pushThresholdAuditStep(auditContext, 'timeout_or_success', {
+    ok: false,
+    reason: err?.message || String(err),
+    stage,
+    ...merged,
+  });
+  return merged;
+}
+
+async function startThresholdPlaywrightTrace(auditContext, context) {
+  if (!auditContext?.debug?.trace || !isLocalThresholdDebugArtifactsEnabled() || !context?.tracing) return;
+  try {
+    fs.mkdirSync(THRESHOLD_DEBUG_ARTIFACTS_DIR, { recursive: true });
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    auditContext.traceContext = context;
+  } catch (err) {
+    pushThresholdAuditStep(auditContext, 'trace_start_failed', {
+      ok: false,
+      error: String(err?.message || err),
+    });
+  }
+}
+
+async function stopThresholdPlaywrightTrace(auditContext, label = 'threshold_scan') {
+  if (!auditContext?.traceContext?.tracing) return null;
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const tracePath = path.join(THRESHOLD_DEBUG_ARTIFACTS_DIR, `${ts}_${label}.zip`);
+    await auditContext.traceContext.tracing.stop({ path: tracePath });
+    auditContext.tracePath = tracePath;
+    return tracePath;
+  } catch {
+    return null;
   }
 }
 
@@ -3720,6 +3917,10 @@ function flattenThresholdScanApiResponse({
     earlyExitStage: week.earlyExitStage ?? scanResult.earlyExitStage ?? null,
     earlyExitReason: week.earlyExitReason ?? scanResult.earlyExitReason ?? null,
     headerParseError: week.headerParseError ?? nav.headerParseError ?? null,
+    auditTrail: week.auditTrail ?? scanResult.auditTrail ?? [],
+    tracePath: week.tracePath ?? scanResult.tracePath ?? null,
+    pageAvailable: week.pageAvailable ?? null,
+    pageUnavailableReason: week.pageUnavailableReason ?? null,
     statusReason: week.statusReason ?? scanResult.statusReason ?? null,
     error: week.error ?? scanResult.error ?? null,
     crashed: week.crashed ?? scanResult.crashed ?? false,
@@ -8584,23 +8785,8 @@ async function getCalendarHeaderParseFromPage(page) {
   return page.evaluate(scrapeCalendarHeaderDates);
 }
 
-async function collectThresholdPageDiagnostics(page) {
-  return page.evaluate(() => {
-    const bodyText = (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
-    return {
-      currentUrl: location.href,
-      pageTitle: document.title || null,
-      bodyTextLength: bodyText.length,
-      bodyTextSample: bodyText.slice(0, 1200),
-      calendarReadySignals: {
-        hasMonthLabel: /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i.test(bodyText),
-        hasDayHeaders: /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.?\s+\d{1,2}\b/i.test(bodyText),
-        tableCount: document.querySelectorAll('table').length,
-        sessionTileCount: document.querySelectorAll('div.dynamic-cal-booking-ts').length,
-        waveHeadingCount: [...document.querySelectorAll('*')].filter(el => /left wave sessions|right wave sessions/i.test(el.textContent || '')).length,
-      },
-    };
-  });
+async function collectThresholdPageDiagnostics(page, label = 'threshold_page') {
+  return collectPageDiagnostics(page, label);
 }
 
 async function waitForThresholdCalendarShell(page, { timeoutMs = THRESHOLD_SCAN_PAGE_TIMEOUT_MS } = {}) {
@@ -8613,18 +8799,18 @@ async function waitForThresholdCalendarShell(page, { timeoutMs = THRESHOLD_SCAN_
   }, { timeout: Math.min(timeoutMs, 15_000) }).catch(() => {});
 }
 
-async function scrapeCalendarHeadersWithRetry(page, { maxAttempts = 4, waitMs = 1500 } = {}) {
+async function scrapeCalendarHeadersWithRetry(page, { maxAttempts = 4, waitMs = 1500, auditContext = null } = {}) {
   const attempts = [];
   let lastHeaderParse = null;
   let lastPageDiagnostics = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const [headerParse, pageDiagnostics] = await Promise.all([
       getCalendarHeaderParseFromPage(page),
-      collectThresholdPageDiagnostics(page),
+      collectPageDiagnostics(page, `header_scrape_attempt_${attempt}`),
     ]);
     lastHeaderParse = headerParse;
     lastPageDiagnostics = pageDiagnostics;
-    attempts.push({
+    const attemptRecord = {
       attempt,
       at: new Date().toISOString(),
       rawMonthLabel: headerParse?.rawMonthLabel ?? null,
@@ -8633,7 +8819,11 @@ async function scrapeCalendarHeadersWithRetry(page, { maxAttempts = 4, waitMs = 
       visibleIsoDatesFromHeaders: headerParse?.visibleIsoDatesFromHeaders || [],
       headerParseError: headerParse?.headerParseError ?? null,
       currentUrl: pageDiagnostics?.currentUrl ?? null,
-    });
+      bodyTextSample: pageDiagnostics?.bodyTextSample ?? null,
+      calendarReadySignals: pageDiagnostics?.calendarReadySignals ?? null,
+    };
+    attempts.push(attemptRecord);
+    pushThresholdAuditStep(auditContext, 'header_scrape_attempt', attemptRecord);
     const ready = (headerParse?.rawDayHeaderTexts?.length || 0) >= 7
       || (headerParse?.dayHeaderCandidateCount || 0) >= 7
       || (headerParse?.visibleIsoDatesFromHeaders?.length || 0) >= 7;
@@ -8841,6 +9031,7 @@ async function scanEntriesLeftThresholdsForWeek(page, {
   minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
   weekKey = null,
+  auditContext = null,
 } = {}) {
   const requestedIsoDate = requestedIsoDateInput || targetIsoDate;
   const navigationIsoDate = navigationIsoDateInput || requestedIsoDate;
@@ -8927,19 +9118,40 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     batchProgress: [],
     crashed: false,
     error: null,
+    auditTrail: auditContext?.auditTrail || [],
+    pageAvailable: page != null,
+    pageUnavailableReason: page ? null : 'page_object_missing',
   };
 
   const started = Date.now();
   try {
+    pushThresholdAuditStep(auditContext, 'navigate_calendar_start', {
+      ok: true,
+      requestedIsoDate,
+      computedWeekStart,
+      navigationIsoDate,
+      validateIsoDate: requestedIsoDate,
+    });
+
     await waitForThresholdCalendarShell(page).catch(() => {});
+    const bookingCalendarDiag = await collectPageDiagnostics(page, 'booking_calendar_wait');
+    pushThresholdAuditStep(auditContext, 'booking_calendar_wait', { ok: true, ...bookingCalendarDiag });
+    applyPageDiagnosticsTo(report, bookingCalendarDiag);
 
     const nav = await withPlaywrightGuard(
       () => navigateCalendarToShowDate(page, navigationIsoDate, {
         headerOnly: true,
         validateIsoDate: requestedIsoDate,
         waitForShell: true,
+        auditContext,
       }),
-      { stage: 'threshold_week_navigation', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS, weekKey: weekKey || computedWeekStart },
+      {
+        stage: 'threshold_week_navigation',
+        timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS,
+        weekKey: weekKey || computedWeekStart,
+        page,
+        auditContext,
+      },
     );
     report.navigation = nav;
     report.navigationDiagnostics = buildThresholdNavigationDiagnostics(nav);
@@ -9125,10 +9337,27 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     };
     report.statusReason = classifyThresholdScanStatus(report);
     collectorState.lastThresholdScanWeek = report.weekKey;
+    pushThresholdAuditStep(auditContext, 'timeout_or_success', {
+      ok: true,
+      reason: report.statusReason,
+      stage: 'threshold_scan_complete',
+      currentUrl: report.currentUrl,
+      pageTitle: report.pageTitle,
+      bodyTextLength: report.bodyTextLength,
+      bodyTextSample: report.bodyTextSample,
+      calendarReadySignals: report.calendarReadySignals,
+    });
   } catch (e) {
     const failureReason = isPlaywrightCrashError(e)
       ? recordPageCrash('threshold_week_scan', e, { weekKey: weekKey || computedWeekStart })
       : 'failed_threshold_scan';
+    const failureDiagnostics = await enrichFailureWithPageDiagnostics(
+      page,
+      auditContext,
+      report.thresholdScanStarted ? 'threshold_parse' : 'after_navigation_before_header_parse',
+      e,
+    );
+    applyPageDiagnosticsTo(report, failureDiagnostics);
     report.crashed = isPlaywrightCrashError(e);
     report.error = e.message;
     report.errors.push({ error: e.message, failureReason });
@@ -9139,6 +9368,10 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       report.statusReason = report.statusReason || 'calendar_headers_not_ready';
     }
   }
+
+  report.auditTrail = auditContext?.auditTrail || report.auditTrail || [];
+  report.pageAvailable = page != null;
+  if (!page) report.pageUnavailableReason = report.pageUnavailableReason || 'page_object_missing';
 
   report.durationMs = Date.now() - started;
   return report;
@@ -9282,7 +9515,19 @@ async function runThresholdScansChunked(dates, options = {}) {
     navigationIsoDate: routeNavigationIsoDate = null,
     computedWeekStart: routeComputedWeekStart = null,
     weekMode = true,
+    debug = false,
+    trace = false,
+    screenshot = false,
+    headed = false,
+    auditContext: externalAuditContext = null,
   } = options;
+
+  const auditContext = externalAuditContext || createThresholdAuditContext({
+    debug,
+    trace,
+    screenshot,
+    headed,
+  });
 
   const pendingWeeks = buildThresholdScanResumeQueue(dates, { resumeQueue });
   collectorState.thresholdScanWeeksRemaining = pendingWeeks.map(w => w.weekKey);
@@ -9307,8 +9552,18 @@ async function runThresholdScansChunked(dates, options = {}) {
       try {
         if (recycleBrowserEachWeek || !launched) {
           await safeCloseBrowser(launched);
-          launched = await launchBrowser();
-          await openBookingPageForThreshold(launched.page);
+          const browserLaunchStarted = Date.now();
+          launched = await launchBrowser({ headed: auditContext.debug.headed });
+          await startThresholdPlaywrightTrace(auditContext, launched.context);
+          pushThresholdAuditStep(auditContext, 'browser_launch', {
+            ok: true,
+            headed: auditContext.debug.headed,
+            elapsedMs: Date.now() - browserLaunchStarted,
+          });
+          await openBookingPageForThreshold(launched.page, { auditContext });
+          const pageOpenedDiag = await collectPageDiagnostics(launched.page, 'page_opened');
+          pushThresholdAuditStep(auditContext, 'page_opened', { ok: true, ...pageOpenedDiag });
+          await captureThresholdDebugArtifacts(launched.page, auditContext, 'page_opened', { screenshot: true });
         }
 
         const scanRequestedIsoDate = routeRequestedIsoDate
@@ -9329,6 +9584,7 @@ async function runThresholdScansChunked(dates, options = {}) {
           maxThreshold,
           dryRun,
           sourceTier,
+          auditContext,
         });
 
         const isEmptyVisibleWeek = result.statusReason === 'visible_week_no_threshold_tiles';
@@ -9367,6 +9623,10 @@ async function runThresholdScansChunked(dates, options = {}) {
           earlyExitStage: result.earlyExitStage,
           earlyExitReason: result.earlyExitReason,
           statusReason: result.statusReason,
+          auditTrail: result.auditTrail || auditContext.auditTrail,
+          pageAvailable: result.pageAvailable,
+          pageUnavailableReason: result.pageUnavailableReason,
+          headerParseError: result.headerParseError ?? null,
           exactCount: result.exactCount,
           atLeastCount: result.atLeastCount,
           ambiguousCount: result.ambiguousCount,
@@ -9396,12 +9656,27 @@ async function runThresholdScansChunked(dates, options = {}) {
         const failureReason = isPlaywrightCrashError(e)
           ? recordPageCrash('threshold_week_chunk', e, { weekKey: week.weekKey })
           : 'failed_threshold_scan';
+        const failureDiagnostics = await enrichFailureWithPageDiagnostics(
+          launched?.page,
+          auditContext,
+          'threshold_week_chunk',
+          e,
+        );
         crashed = true;
         dateResults.push({
           isoDate: week.anchorIsoDate,
           weekKey: week.weekKey,
+          requestedIsoDate: routeRequestedIsoDate || week.anchorIsoDate,
+          computedWeekStart: routeComputedWeekStart || week.computedWeekStart || null,
+          navigationIsoDate: routeNavigationIsoDate || null,
           crashed: true,
           failureReason,
+          statusReason: isPlaywrightCrashError(e) ? null : 'calendar_headers_not_ready',
+          earlyExitStage: 'threshold_week_chunk',
+          earlyExitReason: e.message,
+          error: e.message,
+          auditTrail: auditContext.auditTrail,
+          ...failureDiagnostics,
           errors: [{ error: e.message, failureReason }],
         });
         errors.push({ weekKey: week.weekKey, error: e.message, failureReason });
@@ -9417,6 +9692,7 @@ async function runThresholdScansChunked(dates, options = {}) {
       }
     }
   } finally {
+    await stopThresholdPlaywrightTrace(auditContext, 'threshold_scan');
     await safeCloseBrowser(launched);
     collectorState.thresholdScanPendingWeeks = remainingAfter.map(w => w.weekKey);
     collectorState.thresholdScanWeeksRemaining = remainingAfter.map(w => w.weekKey);
@@ -9436,6 +9712,8 @@ async function runThresholdScansChunked(dates, options = {}) {
     errors,
     pendingWeeks: remainingAfter,
     completedAt: new Date().toISOString(),
+    auditTrail: auditContext.auditTrail,
+    tracePath: auditContext.tracePath || null,
   };
   collectorState.lastThresholdScanResult = summary;
   return summary;
@@ -9510,11 +9788,18 @@ async function canAdvanceCalendar(page) {
 }
 
 // Click the booking calendar next-week chevron and verify the DOM updated.
-async function advanceCalendarWeek(page) {
+async function advanceCalendarWeek(page, auditContext = null) {
   const before = await getCalendarFingerprint(page);
   const chevron = page.locator('.glyphicon-chevron-right').first();
   if (!await chevron.count()) {
     console.log('  next-week arrow not found');
+    pushThresholdAuditStep(auditContext, 'navigation_click', {
+      ok: false,
+      direction: 'next',
+      selectorUsed: '.glyphicon-chevron-right',
+      beforeHeader: before.label || null,
+      reason: 'selector_not_found',
+    });
     return false;
   }
   const clickable = await canAdvanceCalendar(page);
@@ -9550,10 +9835,25 @@ async function advanceCalendarWeek(page) {
   const after = await getCalendarFingerprint(page);
   if (after.sig === before.sig && after.firstTs === before.firstTs && after.count > 0) {
     console.log('  calendar unchanged after next-week click — pagination stopped');
+    pushThresholdAuditStep(auditContext, 'navigation_click', {
+      ok: false,
+      direction: 'next',
+      selectorUsed: '.glyphicon-chevron-right',
+      beforeHeader: before.label || null,
+      afterHeader: after.label || null,
+      reason: 'calendar_unchanged',
+    });
     return false;
   }
 
   console.log(`  calendar advanced → "${after.label || 'n/a'}", ${after.count} tiles`);
+  pushThresholdAuditStep(auditContext, 'navigation_click', {
+    ok: true,
+    direction: 'next',
+    selectorUsed: '.glyphicon-chevron-right',
+    beforeHeader: before.label || null,
+    afterHeader: after.label || null,
+  });
   return true;
 }
 
@@ -10029,7 +10329,7 @@ async function absorbVisibleSessions(page, allByKey, datesSeen, weekOffset = 0) 
   return { pageSessions, visible, rawCount: result?.rawCount || 0, added };
 }
 
-async function retreatCalendarWeek(page) {
+async function retreatCalendarWeek(page, auditContext = null) {
   const before = await getCalendarFingerprint(page);
   const chevron = page.locator('.glyphicon-chevron-left').first();
   if (!await chevron.count()) return false;
@@ -10061,8 +10361,25 @@ async function retreatCalendarWeek(page) {
     return false;
   }
   const after = await getCalendarFingerprint(page);
-  if (after.sig === before.sig && after.firstTs === before.firstTs && after.count > 0) return false;
+  if (after.sig === before.sig && after.firstTs === before.firstTs && after.count > 0) {
+    pushThresholdAuditStep(auditContext, 'navigation_click', {
+      ok: false,
+      direction: 'prev',
+      selectorUsed: '.glyphicon-chevron-left',
+      beforeHeader: before.label || null,
+      afterHeader: after.label || null,
+      reason: 'calendar_unchanged',
+    });
+    return false;
+  }
   console.log(`  calendar retreated → "${after.label || 'n/a'}", ${after.count} tiles`);
+  pushThresholdAuditStep(auditContext, 'navigation_click', {
+    ok: true,
+    direction: 'prev',
+    selectorUsed: '.glyphicon-chevron-left',
+    beforeHeader: before.label || null,
+    afterHeader: after.label || null,
+  });
   return true;
 }
 
@@ -10081,6 +10398,7 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
   headerOnly = false,
   validateIsoDate = null,
   waitForShell = true,
+  auditContext = null,
 } = {}) {
   const validationTarget = validateIsoDate || navigationIsoDate;
   const diag = {
@@ -10126,7 +10444,7 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
 
   async function readVisibleDates() {
     if (waitForShell) await waitForThresholdCalendarShell(page).catch(() => {});
-    const scraped = await scrapeCalendarHeadersWithRetry(page);
+    const scraped = await scrapeCalendarHeadersWithRetry(page, { auditContext });
     const headerParse = scraped.headerParse || {};
     diag.headerScrapeAttempts = scraped.headerScrapeAttempts || [];
     if (scraped.pageDiagnostics) {
@@ -10171,19 +10489,21 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
   await openBookingPage(page);
   await dismissCookieBanner(page);
   await waitForThresholdCalendarShell(page).catch(() => {});
+  const reopenDiag = await collectPageDiagnostics(page, 'navigation_reopen_booking');
+  pushThresholdAuditStep(auditContext, 'page_opened', { ok: true, reason: 'navigation_reopen', ...reopenDiag });
   visible = await readVisibleDates();
   if (weekContainsTarget(visible)) return diag;
 
   const maxSteps = effectiveWeeksAhead + 3;
   for (let step = 0; step < maxSteps; step++) {
-    if (!await advanceCalendarWeek(page)) break;
+    if (!await advanceCalendarWeek(page, auditContext)) break;
     diag.clickedNextWeekCount++;
     visible = await readVisibleDates();
     if (weekContainsTarget(visible)) return diag;
   }
 
   for (let step = 0; step < maxSteps; step++) {
-    if (!await retreatCalendarWeek(page)) break;
+    if (!await retreatCalendarWeek(page, auditContext)) break;
     visible = await readVisibleDates();
     if (weekContainsTarget(visible)) return diag;
   }
@@ -10191,6 +10511,14 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
   diag.navigationError = 'target_date_not_visible_after_navigation';
   diag.targetDateVisible = false;
   diag.targetDateVisibleFromHeaders = false;
+  const finalDiag = await collectPageDiagnostics(page, 'navigation_exhausted');
+  applyPageDiagnosticsTo(diag, finalDiag);
+  pushThresholdAuditStep(auditContext, 'timeout_or_success', {
+    ok: false,
+    reason: diag.navigationError,
+    stage: 'navigation_exhausted',
+    ...finalDiag,
+  });
   return diag;
 }
 
@@ -11029,9 +11357,9 @@ async function configurePageForSpeed(page) {
   });
 }
 
-async function launchBrowser({ blockHeavyAssets = false } = {}) {
+async function launchBrowser({ blockHeavyAssets = false, headed = false } = {}) {
   const browser = await chromium.launch({
-    headless: true,
+    headless: !headed,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   });
   const context = await browser.newContext({
@@ -11138,12 +11466,14 @@ async function openBookingPage(page, { timeout = BOOKING_PAGE_TIMEOUT_MS, waitUn
   await waitForCookieBannerGone(page, 6000);
 }
 
-async function openBookingPageForThreshold(page) {
+async function openBookingPageForThreshold(page, { auditContext = null } = {}) {
   await openBookingPage(page, {
     timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS,
     waitUntil: 'domcontentloaded',
   });
   await waitForThresholdCalendarShell(page);
+  const diag = await collectPageDiagnostics(page, 'booking_calendar_wait');
+  pushThresholdAuditStep(auditContext, 'booking_calendar_wait', { ok: true, ...diag });
 }
 
 async function detectAvailableWeeks(page) {
@@ -12012,6 +12342,10 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
     : THRESHOLD_SCAN_MAX_DEFAULT;
   const wait = req.body?.wait === true || req.query?.wait === 'true';
   const dryRun = req.body?.dryRun !== false;
+  const debug = req.body?.debug === true;
+  const trace = req.body?.trace === true;
+  const screenshot = req.body?.screenshot === true;
+  const headed = req.body?.headed === true;
 
   if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
     return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
@@ -12045,6 +12379,10 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
         navigationIsoDate,
         computedWeekStart,
         weekMode,
+        debug,
+        trace,
+        screenshot,
+        headed,
       });
 
       await refreshCoverageFlags().catch(() => {});
@@ -12060,6 +12398,10 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
           isoDate,
           minThreshold,
           maxThreshold,
+          debug,
+          trace,
+          screenshot,
+          headed,
         },
       });
     } catch (e) {
