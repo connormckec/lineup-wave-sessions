@@ -57,6 +57,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
+const BOOKING_WINDOW_END = process.env.BOOKING_WINDOW_END || '2026-07-10';
 
 let lastTier1DurationMs = null;
 let lastTier2DurationMs = null;
@@ -73,7 +74,7 @@ const SCRAPE_OPTS = { excludedLevels: EXCLUDED_LEVELS, excludedWaves: EXCLUDED_W
 
 const TIER_CONFIG = {
   1: { label: 'today/tomorrow', slotCounts: true,  weekStart: 0, weekEnd: 0, minDay: 0,  maxDay: 1 },
-  2: { label: 'this week',      slotCounts: false, weekStart: 0, weekEnd: 0, minDay: 2,  maxDay: 6 },
+  2: { label: 'booking window', slotCounts: false, weekStart: 0, weekEnd: null, minDay: 2,  maxDay: null },
   3: { label: 'weeks 2–3',      slotCounts: false, weekStart: 1, weekEnd: 2, minDay: 7,  maxDay: 20 },
   4: { label: 'weeks 4+',       slotCounts: false, weekStart: 3, weekEnd: null, minDay: 21, maxDay: null },
 };
@@ -307,6 +308,9 @@ const collectorState = {
   tier2LastResult: null,
   skippedRuns: [],
   cronTasks: {},
+  dateNavigationByDate: {},
+  dateCoverageAttempts: {},
+  lastDateRangeBackfill: null,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -1005,8 +1009,101 @@ async function fetchScrapeSnapshotMeta() {
   }
 }
 
+async function buildBookingWindowDateStatuses() {
+  const dates = expectedDatesInBookingWindow();
+  const dbStats = await queryCurrentSessionsByDateFromDb();
+  const rowsByDate = {};
+
+  if (supabase) {
+    try {
+      const start = dates[0];
+      const end = dates[dates.length - 1];
+      if (start && end) {
+        const { data, error } = await supabase
+          .from('current_sessions')
+          .select('*')
+          .eq('park', PARK)
+          .gte('iso_date', start)
+          .lte('iso_date', end);
+        if (!error) {
+          for (const row of data || []) {
+            const s = currentRowToSession(row);
+            const dk = sessionDateKey(s);
+            if (!dk) continue;
+            if (!rowsByDate[dk]) rowsByDate[dk] = [];
+            rowsByDate[dk].push(s);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('  buildBookingWindowDateStatuses db query failed:', e.message);
+    }
+  }
+
+  for (const s of allStoredSessions()) {
+    const dk = sessionDateKey(s);
+    if (!dates.includes(dk)) continue;
+    if (!rowsByDate[dk]) rowsByDate[dk] = [];
+    if (!rowsByDate[dk].some(x => x.key === s.key)) rowsByDate[dk].push(s);
+  }
+
+  return dates.map((isoDate) => {
+    const rows = rowsByDate[isoDate] || [];
+    const basicRowCount = dbStats.byDate[isoDate] || rows.length;
+    const verified = rows.filter(s => sessionDetailVerified(s));
+    const suppressed = rows.filter(s => {
+      const st = effectiveDetailStatus(s);
+      return isDetailFailureStatus(st)
+        || st === 'checked_available_no_slot_count'
+        || st === 'checked_open_no_slots_visible'
+        || isInvalidCheckedWithSlotsStatus(s);
+    });
+    const attempt = collectorState.dateCoverageAttempts[isoDate]
+      || collectorState.dateNavigationByDate[isoDate]
+      || null;
+    const lastBasic = rows.reduce((max, s) => {
+      const t = s.lastBasicCheckAt || s.last_basic_check_at;
+      return t && (!max || t > max) ? t : max;
+    }, null);
+    const lastDetailed = rows.reduce((max, s) => {
+      const t = s.lastDetailedCheckAt || s.last_detailed_check_at;
+      return t && (!max || t > max) ? t : max;
+    }, null);
+    const lastSuccess = verified.length
+      ? verified.reduce((max, s) => {
+        const t = s.lastDetailedCheckAt || s.last_detailed_check_at;
+        return t && (!max || t > max) ? t : max;
+      }, null)
+      : (basicRowCount > 0 ? lastBasic : null);
+
+    let failureReason = null;
+    if (attempt?.failureReason) failureReason = attempt.failureReason;
+    else if (attempt?.navigationError) failureReason = attempt.navigationError;
+    else if (basicRowCount === 0 && persistedDatesChecked.has(isoDate)) failureReason = 'checked_empty_no_sessions';
+    else if (basicRowCount === 0) failureReason = 'not_checked_or_no_rows';
+    else if (verified.length === 0 && rows.some(s => isDetailFailureStatus(effectiveDetailStatus(s)))) {
+      failureReason = 'detail_verification_failed';
+    }
+
+    return {
+      isoDate,
+      hasBasicRows: basicRowCount > 0,
+      basicRowCount,
+      hasVerifiedDetails: verified.length > 0,
+      verifiedDetailCount: verified.length,
+      suppressedDetailCount: suppressed.length,
+      failureReason,
+      lastAttemptAt: attempt?.recordedAt || lastDetailed || lastBasic || null,
+      lastSuccessAt: lastSuccess,
+      attempted: persistedDatesChecked.has(isoDate) || !!attempt,
+      navigation: attempt,
+    };
+  });
+}
+
 async function buildCoverageDebugPayload() {
-  const expected = expectedDatesInScrapeWindow();
+  const expected = expectedDatesInBookingWindow();
+  const scrapeWindowExpected = expectedDatesInScrapeWindow();
   const dbStats = await queryCurrentSessionsByDateFromDb();
   const currentMap = dbStats.byDate;
   const availByDate = await queryAvailabilitySnapshotsByDate();
@@ -1026,10 +1123,14 @@ async function buildCoverageDebugPayload() {
   else if (missingDatesFromCurrentSessions.length) recommendedAction = 'background Tier 2/3 will fill missing dates';
 
   return {
+    bookingWindowEnd: bookingWindowEndDate(),
+    parkTodayIso: getParkTodayIso(),
+    dateStatuses: await buildBookingWindowDateStatuses(),
     scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
     effectiveWeeksAhead,
     expectedDates: expected,
     expectedDatesCount: expected.length,
+    scrapeWindowExpectedDates: scrapeWindowExpected,
     currentSessionsCount: Object.values(currentMap).reduce((a, b) => a + b, 0),
     currentSessionsByDate: currentMap,
     availabilitySnapshotsByDate: availByDate,
@@ -1056,6 +1157,7 @@ async function buildCoverageDebugPayload() {
     lastTier2Scrape: lastTierRun[2],
     lastTier3Scrape: lastTierRun[3],
     lastFullCoverageScrape,
+    lastDateRangeBackfill: collectorState.lastDateRangeBackfill,
     scrapeInProgress,
     backgroundCollectorEnabled,
     scrapeScheduleEnabled: !!scrapeScheduleEnabled,
@@ -1337,6 +1439,9 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     minutesSinceTier1Scrape: minutesSinceTier1,
     lastTier1DurationMs,
     latestDetailEnrichmentErrors: enrichmentMetrics.recentErrors.slice(-5),
+    dateNavigationDiagnostics: collectorState.dateNavigationByDate[isoDate]
+      || collectorState.dateCoverageAttempts[isoDate]
+      || null,
     ...cookieDiagnosticsPayload(),
     ...buildDetailAssociationDiagnostics(isoDate, list),
   };
@@ -2607,12 +2712,32 @@ function buildDetailAssociationDiagnostics(isoDate, sessions) {
     .map(([rawSample, keys]) => ({ rawSample: rawSample.slice(0, 120), sessionKeys: keys, count: keys.length }))
     .slice(0, 12);
 
+  const checkedWithSlots = list.filter(s =>
+    effectiveDetailStatus(s) === 'checked_with_slots'
+    && sessionDetailVerified(s)
+    && s.slots != null
+    && s.capacity != null,
+  );
+  const checkedAvailableNoSlot = list.filter(s => effectiveDetailStatus(s) === 'checked_available_no_slot_count');
+  const rowsWithDetailsUnavailable = list.filter(s => {
+    if (!s.available) return false;
+    const st = effectiveDetailStatus(s);
+    return !sessionHasDetailedData(s)
+      && (isDetailFailureStatus(st)
+        || st === 'checked_available_no_slot_count'
+        || st === 'checked_open_no_slots_visible');
+  });
+
   return {
     modalMismatchCount: modalMismatch.length,
     failedModalMismatchSample: modalMismatch.slice(0, 12),
     staleModalCount: staleModal.length,
     failedModalStaleSample: staleModal.slice(0, 12),
+    tileMismatchCount: tileMismatch.length,
     failedTileMismatchSample: tileMismatch.slice(0, 12),
+    checkedWithSlotsCount: checkedWithSlots.length,
+    checkedAvailableNoSlotCount: checkedAvailableNoSlot.length,
+    rowsWithDetailsUnavailable: rowsWithDetailsUnavailable.length,
     rowsWithCheckedWithSlotsButNullValuesSample: checkedWithSlotsButNull.slice(0, 12),
     rowsWithDefaultLikeDetailsSample: defaultLike.slice(0, 12),
     rowsWithUnparsedButDisplayedSlotsSample: unparsedButDisplayed.slice(0, 12),
@@ -3793,6 +3918,8 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     sessionsUnchanged: 0,
     unchangedReasons: [],
     errors: [],
+    detailRowsVerified: 0,
+    detailRowsSuppressed: 0,
   };
 
   let keepBrowser = false;
@@ -3839,6 +3966,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
             navigationDiagnostics: navDiag,
           }, { prior });
           sessionsByKey.set(s.key, entry);
+          stats.detailRowsSuppressed++;
           incrementDetailFailureStats(stats, entry.detailStatus);
           await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
           await markQueueItemStatus(s.key, 'pending', { error: entry.detailError });
@@ -3870,6 +3998,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
               detailError: 'no_details',
             }, { prior });
             sessionsByKey.set(s.key, entry);
+            stats.detailRowsSuppressed++;
             incrementDetailFailureStats(stats, entry.detailStatus);
             const newStatus = effectiveDetailStatus(entry);
             if (newStatus === priorStatus && priorSlots === entry.slots) {
@@ -3893,6 +4022,9 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
           const result = applyDetailPayloadToSession(entry, details, s.level, { prior, session: s });
           sessionsByKey.set(s.key, entry);
+
+          if (sessionDetailVerified(entry)) stats.detailRowsVerified++;
+          else if (isDetailFailureStatus(effectiveDetailStatus(entry)) || !sessionDetailVerified(entry)) stats.detailRowsSuppressed++;
 
           if (!hadSlots && entry.slots != null) stats.sessionsUpdatedWithSlots++;
           if (!hadCapacity && entry.capacity != null) stats.sessionsUpdatedWithCapacity++;
@@ -7025,6 +7157,43 @@ function enumerateDateKeys(fromKey, toKey) {
   return out;
 }
 
+function bookingWindowEndDate() {
+  return BOOKING_WINDOW_END;
+}
+
+function expectedDatesInBookingWindow() {
+  const today = getParkTodayIso();
+  const end = bookingWindowEndDate();
+  if (today > end) return [];
+  return enumerateDateKeys(today, end);
+}
+
+function clampDateRangeToBookingWindow(startDate, endDate) {
+  const today = getParkTodayIso();
+  const end = bookingWindowEndDate();
+  const start = startDate < today ? today : startDate;
+  const finish = endDate > end ? end : endDate;
+  if (start > finish) return { start: null, end: null, dates: [] };
+  return { start, end: finish, dates: enumerateDateKeys(start, finish) };
+}
+
+function sessionInDateRange(s, startDate, endDate) {
+  const dk = sessionDateKey(s);
+  if (!dk) return false;
+  return dk >= startDate && dk <= endDate;
+}
+
+function recordDateCoverageAttempt(isoDate, attempt) {
+  if (!isoDate || !attempt) return;
+  collectorState.dateCoverageAttempts[isoDate] = {
+    ...attempt,
+    recordedAt: new Date().toISOString(),
+  };
+  if (attempt.targetDateVisible != null || attempt.navigationError != null) {
+    collectorState.dateNavigationByDate[isoDate] = attempt;
+  }
+}
+
 function expectedDatesInScrapeWindow() {
   const dates = [];
   const start = parseDateKey(todayDateKey());
@@ -7210,6 +7379,231 @@ async function navigateCalendarToShowDate(page, targetIsoDate) {
   return diag;
 }
 
+async function scrapeBasicSessionsForDates(page, dates, { tier = 0, sourceLabel = 'date_scrape' } = {}) {
+  const allByKey = new Map();
+  const dateResults = [];
+  const datesSeen = new Set();
+
+  for (const targetIsoDate of asSessionArray(dates)) {
+    const navDiag = await navigateCalendarToShowDate(page, targetIsoDate);
+    const dateResult = {
+      targetIsoDate,
+      visibleWeekStart: navDiag.visibleWeekStart,
+      visibleWeekEnd: navDiag.visibleWeekEnd,
+      visibleDateLabels: navDiag.visibleDateLabels,
+      clickedNextWeekCount: navDiag.clickedNextWeekCount,
+      targetDateVisible: navDiag.targetDateVisible,
+      navigationError: navDiag.navigationError,
+      sessionsFound: 0,
+      rowsUpserted: 0,
+      detailRowsVerified: 0,
+      detailRowsSuppressed: 0,
+      failureReason: null,
+    };
+
+    if (!navDiag.targetDateVisible) {
+      dateResult.failureReason = navDiag.navigationError || 'target_date_not_visible';
+      persistedDatesChecked.add(targetIsoDate);
+      datesCheckedEmpty.add(targetIsoDate);
+      recordDateCoverageAttempt(targetIsoDate, dateResult);
+      dateResults.push(dateResult);
+      console.log(`  [${sourceLabel}] ${targetIsoDate} skipped — calendar navigation failed`);
+      continue;
+    }
+
+    await dismissCookieBanner(page).catch(() => {});
+    const { pageSessions, visible, rawCount } = await absorbVisibleSessions(page, allByKey, datesSeen, 0);
+    const onDate = [...allByKey.values()].filter(s => sessionDateKey(s) === targetIsoDate);
+    dateResult.sessionsFound = onDate.length;
+    dateResult.rawTilesOnPage = rawCount;
+    dateResult.visibleDateLabels = visible.length ? visible : dateResult.visibleDateLabels;
+
+    persistedDatesChecked.add(targetIsoDate);
+    if (onDate.length === 0) {
+      datesCheckedEmpty.add(targetIsoDate);
+      dateResult.failureReason = 'checked_empty_no_sessions_on_site';
+    } else {
+      datesCheckedEmpty.delete(targetIsoDate);
+    }
+
+    recordDateCoverageAttempt(targetIsoDate, dateResult);
+    dateResults.push(dateResult);
+    console.log(`  [${sourceLabel}] ${targetIsoDate}: ${onDate.length} session(s), visible=${visible.join(', ')}`);
+  }
+
+  const batch = [...allByKey.values()].map(s => ({
+    ...s,
+    tier: tier || s.tier || 2,
+    detailStatus: s.detailStatus || 'pending',
+  }));
+
+  return { batch, dateResults, datesSeen, sessionsFound: batch.length };
+}
+
+async function runDateRangeBackfillBasic(startDate, endDate, { tier = 0, reason = 'backfill_date_range' } = {}) {
+  const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
+  const report = {
+    mode: 'basic_only',
+    startDate: start,
+    endDate: end,
+    datesRequested: dates.length,
+    dateResults: [],
+    sessionsFound: 0,
+    rowsUpserted: 0,
+    snapshotsInserted: 0,
+    upsertError: null,
+    errors: [],
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+  };
+
+  if (!dates.length) {
+    report.skipped = true;
+    report.skipReason = 'empty_or_invalid_date_range';
+    return report;
+  }
+
+  const started = Date.now();
+  let launched = null;
+  try {
+    if (!tryAcquireScrapeLock(`date range backfill (${reason})`, 0)) {
+      report.skipped = true;
+      report.skipReason = 'scrape_in_progress';
+      return report;
+    }
+
+    launched = await launchBrowser();
+    const { page } = launched;
+    await openBookingPage(page);
+
+    const { batch, dateResults, sessionsFound } = await scrapeBasicSessionsForDates(page, dates, {
+      tier,
+      sourceLabel: reason,
+    });
+    report.dateResults = dateResults;
+    report.sessionsFound = sessionsFound;
+
+    if (batch.length) {
+      mergeBatchIntoStore(batch, tier || 2, { preserveSlots: true, scrapeKind: 'basic' });
+      recordTierDateCoverage(new Set(dates));
+      const writeDiag = await persistTierScrapeResults(batch, tier || 2, { slotCountsAttempted: false });
+      report.rowsUpserted = writeDiag.rowsUpserted;
+      report.snapshotsInserted = writeDiag.snapshotsInserted;
+      report.upsertError = writeDiag.upsertError;
+      if (writeDiag.upsertError) report.errors.push({ error: writeDiag.upsertError, phase: 'upsert' });
+
+      for (const dr of dateResults) {
+        dr.rowsUpserted = batch.filter(s => sessionDateKey(s) === dr.targetIsoDate).length;
+        recordDateCoverageAttempt(dr.targetIsoDate, dr);
+      }
+    }
+
+    await saveLatestSnapshotToSupabase();
+    await refreshCoverageFlags();
+    report.durationMs = Date.now() - started;
+    collectorState.lastDateRangeBackfill = { ...report, completedAt: new Date().toISOString() };
+    return report;
+  } catch (e) {
+    report.errors.push({ error: e.message });
+    report.durationMs = Date.now() - started;
+    throw e;
+  } finally {
+    releaseScrapeLock();
+    if (launched?.browser) await launched.browser.close().catch(() => {});
+  }
+}
+
+async function runDateRangeBackfillVerifiedDetail(startDate, endDate, { reason = 'backfill_verified_detail' } = {}) {
+  const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
+  const report = {
+    mode: 'verified_detail',
+    startDate: start,
+    endDate: end,
+    datesRequested: dates.length,
+    sessionsAttempted: 0,
+    detailRowsVerified: 0,
+    detailRowsSuppressed: 0,
+    sessionsUpdatedWithSlots: 0,
+    errors: [],
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+  };
+
+  if (!dates.length) {
+    report.skipped = true;
+    report.skipReason = 'empty_or_invalid_date_range';
+    return report;
+  }
+
+  const started = Date.now();
+  await ensureSessionsForStatus();
+  const targets = dates.flatMap(d => sessionsForDate(d).filter(s => s.available !== false));
+  report.sessionsQueued = targets.length;
+
+  if (!targets.length) {
+    report.skipped = true;
+    report.skipReason = 'no_open_sessions_in_range';
+    report.durationMs = Date.now() - started;
+    return report;
+  }
+
+  const enrichStats = await runDetailEnrichment({
+    sessions: targets,
+    reason,
+  });
+
+  report.sessionsAttempted = enrichStats.sessionsAttempted ?? 0;
+  report.detailRowsVerified = enrichStats.detailRowsVerified ?? 0;
+  report.detailRowsSuppressed = enrichStats.detailRowsSuppressed ?? 0;
+  report.sessionsUpdatedWithSlots = enrichStats.sessionsUpdatedWithSlots ?? 0;
+  report.errors = enrichStats.errors ?? [];
+  report.durationMs = Date.now() - started;
+  report.enrichmentStats = enrichStats;
+  return report;
+}
+
+async function runDateRangeBackfill({ startDate, endDate, mode = 'both', reason = 'admin_backfill_date_range' } = {}) {
+  const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
+  const combined = {
+    mode,
+    startDate: start,
+    endDate: end,
+    datesRequested: dates?.length || 0,
+    basic: null,
+    detail: null,
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+  };
+
+  if (!dates?.length) {
+    combined.skipped = true;
+    combined.skipReason = 'empty_or_invalid_date_range';
+    return combined;
+  }
+
+  const started = Date.now();
+  if (mode === 'basic_only' || mode === 'both') {
+    combined.basic = await runDateRangeBackfillBasic(start, end, { reason: `${reason}_basic` });
+    if (combined.basic.skipped && mode === 'basic_only') {
+      combined.skipped = combined.basic.skipped;
+      combined.skipReason = combined.basic.skipReason;
+    }
+  }
+
+  if (mode === 'verified_detail' || mode === 'both') {
+    combined.detail = await runDateRangeBackfillVerifiedDetail(start, end, {
+      reason: `${reason}_detail`,
+    });
+  }
+
+  combined.durationMs = Date.now() - started;
+  collectorState.lastDateRangeBackfill = { ...combined, completedAt: new Date().toISOString() };
+  return combined;
+}
+
 async function navigateToWeekOffset(page, weekOffset) {
   await openBookingPage(page);
   await dismissCookieBanner(page);
@@ -7228,58 +7622,43 @@ async function fillMissingDates(page, missingDates, allByKey, datesSeen) {
   for (const dateKey of missingDates) {
     if (datesSeen.has(dateKey)) continue;
 
-    const baseWeek = Math.max(0, Math.floor(daysFromToday(dateKey) / 7));
-    const offsetsToTry = [...new Set([
-      baseWeek, baseWeek - 1, baseWeek + 1, baseWeek + 2, baseWeek - 2,
-      0, 1, 2, 3, effectiveWeeksAhead - 1,
-    ].filter(w => w >= 0 && w < effectiveWeeksAhead))];
+    const navDiag = await navigateCalendarToShowDate(page, dateKey);
+    recordDateCoverageAttempt(dateKey, {
+      targetIsoDate: dateKey,
+      ...navDiag,
+      sessionsFound: 0,
+      failureReason: navDiag.targetDateVisible ? null : (navDiag.navigationError || 'target_date_not_visible'),
+    });
 
-    let found = false;
-    for (const weekOffset of offsetsToTry) {
-      if (datesSeen.has(dateKey)) break;
-      if (!await navigateToWeekOffset(page, weekOffset)) continue;
-      const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, weekOffset);
-      if (visible.includes(dateKey)) {
-        console.log(`  ✓ ${dateKey} found at week offset ${weekOffset}`);
-        found = true;
-        break;
-      }
+    if (!navDiag.targetDateVisible) {
+      console.log(`  ⚠ ${dateKey} not visible after navigation (${navDiag.navigationError || 'unknown'})`);
+      datesSeen.add(dateKey);
+      persistedDatesChecked.add(dateKey);
+      datesCheckedEmpty.add(dateKey);
+      datesCheckedDuringScrape.add(dateKey);
+      continue;
     }
 
-    if (!found) {
-      await openBookingPage(page);
-      const seenSigs = new Set();
-      for (let step = 0; step < effectiveWeeksAhead + 2; step++) {
-        const fp = await getCalendarFingerprint(page);
-        if (seenSigs.has(fp.sig) && fp.count > 0) break;
-        seenSigs.add(fp.sig);
-        const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, step);
-        if (visible.includes(dateKey)) {
-          console.log(`  ✓ ${dateKey} found during forward sweep step ${step}`);
-          found = true;
-          break;
-        }
-        if (!await advanceCalendarWeek(page)) break;
-      }
+    const localSeen = new Set(datesSeen);
+    const { pageSessions, visible } = await absorbVisibleSessions(page, allByKey, localSeen, 0);
+    for (const d of localSeen) datesSeen.add(d);
+    const count = [...allByKey.values()].filter(s => sessionDateKey(s) === dateKey).length;
+    if (count > 0 || visible.includes(dateKey)) {
+      console.log(`  ✓ ${dateKey} found after targeted navigation (${count} session(s))`);
+      if (count === 0) datesCheckedEmpty.add(dateKey);
+      else datesCheckedEmpty.delete(dateKey);
+    } else {
+      console.log(`  ⚠ ${dateKey} visible on calendar but no sessions parsed`);
+      datesCheckedEmpty.add(dateKey);
     }
-
-    if (!found) {
-      await navigateToWeekOffset(page, Math.max(0, effectiveWeeksAhead - 1));
-      for (let step = 0; step < effectiveWeeksAhead + 2; step++) {
-        const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, step);
-        if (visible.includes(dateKey)) {
-          console.log(`  ✓ ${dateKey} found during backward sweep step ${step}`);
-          found = true;
-          break;
-        }
-        if (!await retreatCalendarWeek(page)) break;
-      }
-    }
-
-    if (!found) {
-      console.log(`  ⚠ ${dateKey} not found on calendar after fill attempts (0 sessions)`);
-    }
+    recordDateCoverageAttempt(dateKey, {
+      targetIsoDate: dateKey,
+      ...navDiag,
+      sessionsFound: count,
+      targetDateVisible: true,
+    });
     datesSeen.add(dateKey);
+    persistedDatesChecked.add(dateKey);
     datesCheckedDuringScrape.add(dateKey);
   }
 }
@@ -7287,6 +7666,10 @@ async function fillMissingDates(page, missingDates, allByKey, datesSeen) {
 function tierMaxDay(tier) {
   const cfg = TIER_CONFIG[tier];
   if (cfg.maxDay != null) return cfg.maxDay;
+  if (tier === 2) {
+    const endDays = daysFromToday(bookingWindowEndDate());
+    return Math.max(6, endDays >= 0 ? endDays : 0);
+  }
   return effectiveWeeksAhead * 7 - 1;
 }
 
@@ -7637,8 +8020,29 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     await openBookingPage(page);
 
     const tierRequiredDates = targetDates.length ? targetDates : expectedDatesForTier(tier);
-    const { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
+    let { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
       await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
+
+    if (tier >= 2) {
+      const requiredInWindow = tier === 2
+        ? expectedDatesInBookingWindow().filter(d => daysFromToday(d) >= cfg.minDay)
+        : tierRequiredDates;
+      const missingDates = requiredInWindow.filter(d => {
+        const hasSessions = rawBatch.some(s => sessionDateKey(s) === d);
+        return !hasSessions && (!datesSeen.has(d) || !hasSessions);
+      });
+      if (missingDates.length) {
+        console.log(`  tier ${tier} targeted fill for ${missingDates.length} date(s): ${missingDates.join(', ')}`);
+        const fill = await scrapeBasicSessionsForDates(page, missingDates, { tier, sourceLabel: `tier${tier}_fill` });
+        report.dateRangeFill = fill.dateResults;
+        for (const s of fill.batch) {
+          if (!rawBatch.find(x => x.key === s.key)) rawBatch.push(s);
+        }
+        for (const d of fill.dateResults.filter(r => r.targetDateVisible).map(r => r.targetIsoDate)) {
+          datesSeen.add(d);
+        }
+      }
+    }
 
     const batch = dedupeBatch(filterBatchForTier(rawBatch, tier));
     const byKey = new Map(batch.map(s => [s.key, s]));
@@ -8120,6 +8524,93 @@ app.post('/api/admin/backfill-current-sessions', async (req, res) => {
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message, errors: [e.message] });
+  }
+});
+
+app.post('/api/admin/backfill-date-range', async (req, res) => {
+  const startDate = normalizeIsoDateParam(req.body?.startDate || req.body?.start_date);
+  const endDate = normalizeIsoDateParam(req.body?.endDate || req.body?.end_date);
+  const mode = req.body?.mode || 'both';
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+
+  if (!startDate || !endDate) {
+    return res.status(400).json({ error: 'startDate and endDate required (YYYY-MM-DD)' });
+  }
+  if (!['basic_only', 'verified_detail', 'both'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be basic_only, verified_detail, or both' });
+  }
+
+  try {
+    await ensureSessionsForStatus();
+
+    if (scrapeInProgress && !wait) {
+      return res.json({
+        started: false,
+        queued: false,
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        startDate,
+        endDate,
+        mode,
+        wait: false,
+        message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
+      });
+    }
+
+    if (wait && scrapeInProgress) {
+      await new Promise((resolve) => {
+        const poll = setInterval(() => {
+          if (!scrapeInProgress) { clearInterval(poll); resolve(); }
+        }, 1000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 300_000);
+      });
+    }
+
+    const runBackfill = () => runDateRangeBackfill({
+      startDate,
+      endDate,
+      mode,
+      reason: 'admin_backfill_date_range',
+    }).then(async (result) => {
+      await refreshCoverageFlags().catch(() => {});
+      return result;
+    });
+
+    if (!wait) {
+      setImmediate(() => {
+        runBackfill().catch((err) => console.error('backfill-date-range error:', err));
+      });
+      return res.json({
+        started: true,
+        queued: true,
+        wait: false,
+        startDate,
+        endDate,
+        mode,
+        bookingWindowEnd: bookingWindowEndDate(),
+        message: 'Backfill queued — poll GET /api/debug/coverage or GET /api/debug/collector (lastDateRangeBackfill)',
+      });
+    }
+
+    const result = await runBackfill();
+    res.json({
+      started: true,
+      queued: false,
+      wait: true,
+      startDate,
+      endDate,
+      mode,
+      bookingWindowEnd: bookingWindowEndDate(),
+      ...result,
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: e.message,
+      errors: [{ error: e.message }],
+      startDate,
+      endDate,
+      mode,
+    });
   }
 });
 

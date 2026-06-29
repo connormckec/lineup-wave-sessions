@@ -190,9 +190,10 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `GET /api/debug/boot` | Park timezone, saved session counts, why Browse would show not_checked |
 | `GET /api/debug/enrichment` | Enrichment queue, stale/missing counts, run duration, recent errors |
 | `POST /api/admin/backfill-current-sessions` | Restore `current_sessions` from snapshot/history after schema reset |
+| `POST /api/admin/backfill-date-range` | Scrape + upsert a date range (`startDate`, `endDate`, `mode`: `basic_only` \| `verified_detail` \| `both`, `wait`). Per-date navigation diagnostics in response `basic.dateResults`. Detail failure never blocks basic rows. |
 | `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date. Returns reconciled outcome counts (`sessionsUpdatedWithSlots`, `sessionsFailedCookieOverlay`, etc.), `skipReason` when skipped, cookie diagnostics, and `unchangedReasons`. |
 | `POST /api/admin/repair-detail-data` | Clear unverified/default-like/mismatched detail metrics while preserving basic session rows and verified detail. Optional `{ isoDate, dryRun }`. |
-| `GET /api/debug/coverage` | Expected vs actual dates across sources |
+| `GET /api/debug/coverage` | Booking window coverage: `dateStatuses[]` with `hasBasicRows`, `verifiedDetailCount`, `suppressedDetailCount`, `failureReason`, `lastAttemptAt`, plus legacy expected vs actual fields |
 
 ---
 

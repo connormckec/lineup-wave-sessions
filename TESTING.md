@@ -43,17 +43,27 @@ After schema reset or sparse `current_sessions` (only today/tomorrow):
 1. **Check coverage:**
 
 ```bash
-curl -s http://localhost:3000/api/debug/coverage | jq '{expectedDatesCount, datesInCurrentSessions, missingDates, coveragePercent, sessionsCoveragePercent, backfillRecommended, recommendedAction}'
+curl -s http://localhost:3000/api/debug/coverage | jq '{bookingWindowEnd,parkTodayIso,expectedDatesCount,dateStatuses,datesInCurrentSessions,missingDates,coveragePercent,recommendedAction}'
 curl -s http://localhost:3000/api/status | jq '{currentSessionsByDate, earliestSessionDate, latestSessionDate, uniqueDatesCount, missingDatesInScrapeWindow, backfillRecommended, fallbackAvailable}'
 ```
 
-2. **Backfill if recommended:**
+Every date from park-local today through `bookingWindowEnd` should appear in `dateStatuses` with `attempted` / `hasBasicRows` / `failureReason`.
+
+2. **Backfill booking window** (recommended after deploy or sparse data):
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/backfill-date-range \
+  -H 'Content-Type: application/json' \
+  -d '{"startDate":"2026-06-28","endDate":"2026-07-10","mode":"both","wait":true}' | jq
+```
+
+3. **Backfill from snapshots** (after schema reset):
 
 ```bash
 curl -s -X POST http://localhost:3000/api/admin/backfill-current-sessions | jq
 ```
 
-3. **Verify dates** (adjust dates as needed):
+4. **Verify dates** (adjust dates as needed):
 
 ```bash
 for d in 2026-06-28 2026-06-29 2026-06-30 2026-07-02 2026-07-10; do
@@ -63,7 +73,8 @@ done
 
 4. Arrow through those dates in the UI — sessions should render (or *Showing saved snapshot* for fallback data).
 5. After Tier 1 runs, confirm future dates **do not disappear**.
-6. Wait for or trigger Tier 2 — confirm next 7 days populate in `currentSessionsByDate`.
+6. Wait for or trigger Tier 2 — confirm dates through `2026-07-10` populate in `currentSessionsByDate`.
+7. **Acceptance:** `/api/debug/coverage` lists every date today→`bookingWindowEnd`. Tomorrow shows slot counts only when `checkedWithSlotsCount` > 0 and rows have `detailVerified`; otherwise UI shows *Open · details unavailable* (no default 10/12/2 values). `POST /api/admin/backfill-date-range` with `mode: both` must not wipe existing good today/tomorrow basic rows.
 
 **Railway:** App Sleep must be disabled for continuous background collection.
 
