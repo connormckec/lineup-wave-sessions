@@ -142,7 +142,7 @@ If fallback rows exist, API returns `statusReason: fallback_sessions_found` — 
 
 **Verification fields (stored in `raw` jsonb):** `detailVerified`, `detailConfidence` (`exact_match`, `weak_match`, `mismatch`, `default_suppressed`), `detailSourceSessionKey`, `detailSourceIsoDate`, `detailSourceStartTime`, `detailSourceSessionType`, `detailSourceWaveSide`, `detailParseOutput`.
 
-**Critical rule:** Basic scrapes must not null out verified detail fields (`detailVerified: true`) for the same `session_key`. API responses suppress unverified slots/capacity/booked/price — UI shows *details pending* instead of inferred defaults (10/12/2). Threshold-inferred slots (`thresholdInferredSlots`, `thresholdScanVerified`, `thresholdConfidence`) live in session `raw` and take display priority over modal when verified (`exact`/`at_least`). Threshold scans are chunked (one week per run, browser recycled between weeks); Playwright crashes must release the scrape lock and preserve existing rows.
+**Critical rule:** Basic scrapes must not null out verified detail fields (`detailVerified: true`) for the same `session_key`. API responses suppress unverified slots/capacity/booked/price — UI shows *details pending* instead of inferred defaults (10/12/2). Threshold-inferred slots live in session `raw`. Playwright target/page crashes (`page.evaluate: Target crashed`, etc.) must release `scrapeInProgress` immediately and preserve existing Supabase rows; use `POST /api/admin/release-scrape-lock` for manual recovery.
 
 ### `scrape_snapshots`
 

@@ -105,6 +105,8 @@ Set `"dryRun": false` to write threshold-inferred slots to `current_sessions` (s
 | `THRESHOLD_SCAN_PAGE_TIMEOUT_MS` | `45000` | `page.goto` timeout for threshold scans |
 | `THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE` | `5` | Threshold filter batches (1–5, 6–10, …) |
 | `SCRAPE_LOCK_MAX_MS` | `900000` | Force-release stuck `scrapeInProgress` lock |
+| `SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS` | `120` | Min lock age (seconds) before `POST /api/admin/release-scrape-lock` |
+| `BROWSER_CLOSE_TIMEOUT_MS` | `10000` | Max wait when closing crashed browser |
 | `BACKGROUND_THRESHOLD_SCAN_ENABLED` | `false` | Optional small background threshold batches |
 
 **Railway:** Disable **Serverless / App Sleep** — otherwise Tier 2/3 scrapes pause until someone opens the app. Long-term: separate web API service + scraper worker.

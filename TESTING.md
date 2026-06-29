@@ -132,6 +132,19 @@ curl -s http://localhost:3000/api/debug/collector | jq '{scrapeInProgress,lastPa
 - Re-run `POST /api/admin/backfill-available-dates` with `mode: threshold_slots` to resume remaining weeks (`thresholdWeeksRemaining` / `thresholdScanPendingWeeks`).
 - One-week admin scan: `POST /api/admin/scan-entries-left-thresholds` with `wait: true`, `dryRun: false`.
 
+**Tier 1 / basic scrape crash recovery:**
+
+```bash
+curl -s http://localhost:3000/api/debug/collector | jq '{scrapeInProgress,currentScrapeTier,currentScrapeAgeSeconds,lastScrapeError,lastPageCrashAt,lastPageCrashStage,scrapeLockMaxMs}'
+curl -X POST http://localhost:3000/api/admin/release-scrape-lock \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"manual_recovery","force":true}'
+```
+
+- `page.evaluate: Target crashed` and similar Playwright errors must release the scrape lock immediately (not after Supabase cleanup).
+- Saved data continues to serve via `/api/sessions?date=` after a crash.
+- Lock auto-releases after `SCRAPE_LOCK_MAX_MS` or via the admin release route.
+
 **Railway:** App Sleep must be disabled for continuous background collection.
 
 ---

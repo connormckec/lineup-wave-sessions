@@ -51,6 +51,8 @@ const THRESHOLD_FILTER_TIMEOUT_MS = parseInt(process.env.THRESHOLD_FILTER_TIMEOU
 const THRESHOLD_TILE_SCRAPE_TIMEOUT_MS = parseInt(process.env.THRESHOLD_TILE_SCRAPE_TIMEOUT_MS || '15000', 10);
 const BOOKING_PAGE_TIMEOUT_MS = parseInt(process.env.BOOKING_PAGE_TIMEOUT_MS || '45000', 10);
 const SCRAPE_LOCK_MAX_MS = parseInt(process.env.SCRAPE_LOCK_MAX_MS || '900000', 10);
+const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
+const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
 const BACKGROUND_THRESHOLD_SCAN_EVERY_MINS = Math.max(15, parseInt(process.env.BACKGROUND_THRESHOLD_SCAN_EVERY_MINS || '60', 10));
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
@@ -345,6 +347,11 @@ const collectorState = {
   thresholdScanCompletedWeeks: [],
   thresholdScanLastError: null,
   thresholdScanRecovered: false,
+  lastScrapeCrashAt: null,
+  lastScrapeCrashStage: null,
+  lastScrapeCrashTier: null,
+  scrapeLockReleasedAt: null,
+  scrapeLockReleasedReason: null,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -3253,6 +3260,9 @@ function thresholdStabilityDebugPayload() {
   return {
     lastPageCrashAt: collectorState.lastPageCrashAt,
     lastPageCrashStage: collectorState.lastPageCrashStage,
+    lastScrapeCrashAt: collectorState.lastScrapeCrashAt,
+    lastScrapeCrashStage: collectorState.lastScrapeCrashStage,
+    lastScrapeCrashTier: collectorState.lastScrapeCrashTier,
     lastThresholdScanWeek: collectorState.lastThresholdScanWeek,
     thresholdScanBatchProgress: collectorState.thresholdScanBatchProgress,
     thresholdScanWeeksRemaining: collectorState.thresholdScanWeeksRemaining,
@@ -3263,32 +3273,79 @@ function thresholdStabilityDebugPayload() {
     thresholdScanMaxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
     thresholdScanRecycleBrowserEachWeek: THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK,
     backgroundThresholdScanEnabled: BACKGROUND_THRESHOLD_SCAN_ENABLED,
+    currentScrapeAgeSeconds: getScrapeLockAgeSeconds(),
+    scrapeLockMaxMs: SCRAPE_LOCK_MAX_MS,
+    scrapeLockManualReleaseMinMs: SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS,
+    scrapeLockReleasedAt: collectorState.scrapeLockReleasedAt,
+    scrapeLockReleasedReason: collectorState.scrapeLockReleasedReason,
   };
 }
 
 function isPlaywrightCrashError(err) {
   const msg = (err?.message || String(err || '')).toLowerCase();
-  return msg.includes('page crashed')
+  return msg.includes('target crashed')
+    || msg.includes('page crashed')
+    || (msg.includes('page.evaluate') && (
+      msg.includes('crashed')
+      || msg.includes('closed')
+      || msg.includes('destroyed')
+      || msg.includes('protocol error')
+    ))
     || msg.includes('target closed')
     || msg.includes('target page, context or browser has been closed')
     || msg.includes('browser has been closed')
     || msg.includes('browser disconnected')
+    || msg.includes('browser closed')
+    || msg.includes('execution context was destroyed')
+    || msg.includes('protocol error')
     || msg.includes('navigation timeout')
-    || msg.includes('timeout')
     || msg.includes('context disposed')
     || msg.includes('net::err');
 }
 
-function recordPageCrash(stage, err, { weekKey = null, failureReason = 'failed_page_crash' } = {}) {
+function getScrapeLockAgeMs() {
+  if (!scrapeInProgress || !currentScrapeStartedAt) return null;
+  return Date.now() - new Date(currentScrapeStartedAt).getTime();
+}
+
+function getScrapeLockAgeSeconds() {
+  const ageMs = getScrapeLockAgeMs();
+  return ageMs == null ? null : Math.round(ageMs / 1000);
+}
+
+function releaseScrapeLockIfStale() {
+  if (!scrapeInProgress) return false;
+  const ageMs = getScrapeLockAgeMs();
+  if (ageMs != null && ageMs > SCRAPE_LOCK_MAX_MS) {
+    console.warn(`  releasing stale scrape lock (tier ${currentScrapeTier}, age ${Math.round(ageMs / 1000)}s)`);
+    releaseScrapeLock();
+    collectorState.scrapeLockReleasedReason = 'stale_timeout';
+    collectorState.scrapeLockReleasedAt = new Date().toISOString();
+    return true;
+  }
+  return false;
+}
+
+function recordPageCrash(stage, err, { weekKey = null, failureReason = 'failed_page_crash', tier = null } = {}) {
   const now = new Date().toISOString();
+  const message = err?.message || String(err);
   collectorState.lastPageCrashAt = now;
   collectorState.lastPageCrashStage = stage;
-  collectorState.thresholdScanLastError = err?.message || String(err);
+  collectorState.lastScrapeCrashAt = now;
+  collectorState.lastScrapeCrashStage = stage;
   collectorState.thresholdScanRecovered = false;
   if (weekKey) collectorState.lastThresholdScanWeek = weekKey;
-  lastScrapeError = collectorState.thresholdScanLastError;
-  console.error(`  [playwright crash] stage=${stage} week=${weekKey || 'n/a'} reason=${failureReason}: ${collectorState.thresholdScanLastError}`);
+  if (tier != null) collectorState.lastScrapeCrashTier = tier;
+  lastScrapeError = message;
+  console.error(`  [playwright crash] stage=${stage} tier=${tier ?? currentScrapeTier ?? 'n/a'} week=${weekKey || 'n/a'} reason=${failureReason}: ${message}`);
   return failureReason;
+}
+
+function handlePlaywrightFailure(err, stage, { tier = null, weekKey = null } = {}) {
+  recordScrapeError(err, stage);
+  if (isPlaywrightCrashError(err)) {
+    recordPageCrash(stage, err, { tier, weekKey });
+  }
 }
 
 function markThresholdScanRecovered() {
@@ -3297,13 +3354,22 @@ function markThresholdScanRecovered() {
   }
 }
 
-async function safeCloseBrowser(launched) {
+async function safeCloseBrowser(launched, { timeoutMs = BROWSER_CLOSE_TIMEOUT_MS } = {}) {
   if (!launched) return;
   try {
-    if (launched.page) await launched.page.close().catch(() => {});
-    if (launched.context) await launched.context.close().catch(() => {});
-    if (launched.browser) await launched.browser.close().catch(() => {});
-  } catch {}
+    await withTimeout((async () => {
+      if (launched.page) await launched.page.close().catch(() => {});
+      if (launched.context) await launched.context.close().catch(() => {});
+      if (launched.browser) await launched.browser.close().catch(() => {});
+    })(), timeoutMs, 'safeCloseBrowser');
+  } catch (e) {
+    console.warn(`  safeCloseBrowser: ${e.message}`);
+  }
+}
+
+async function finalizeScrapeSession(launched, { releaseLock = true } = {}) {
+  if (releaseLock) releaseScrapeLock();
+  await safeCloseBrowser(launched);
 }
 
 async function withTimeout(promise, ms, label = 'operation') {
@@ -3320,12 +3386,12 @@ async function withTimeout(promise, ms, label = 'operation') {
   }
 }
 
-async function withPlaywrightGuard(fn, { stage = 'playwright', timeout = THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey = null } = {}) {
+async function withPlaywrightGuard(fn, { stage = 'playwright', timeout = THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey = null, tier = null } = {}) {
   try {
     return await withTimeout(Promise.resolve().then(fn), timeout, stage);
   } catch (e) {
     if (isPlaywrightCrashError(e)) {
-      recordPageCrash(stage, e, { weekKey });
+      recordPageCrash(stage, e, { weekKey, tier });
     }
     throw e;
   }
@@ -5075,20 +5141,10 @@ async function runDetailEnrichmentByPriority(priority) {
 }
 
 function tryAcquireScrapeLock(context = 'scrape', tier = null) {
+  releaseScrapeLockIfStale();
   if (scrapeInProgress) {
-    if (currentScrapeStartedAt) {
-      const ageMs = Date.now() - new Date(currentScrapeStartedAt).getTime();
-      if (ageMs > SCRAPE_LOCK_MAX_MS) {
-        console.warn(`  scrape lock stale (${Math.round(ageMs / 60_000)}m, context=${context}) — force releasing`);
-        releaseScrapeLock();
-      } else {
-        console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
-        return false;
-      }
-    } else {
-      console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
-      return false;
-    }
+    console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
+    return false;
   }
   scrapeInProgress = true;
   currentScrapeTier = tier;
@@ -8407,7 +8463,10 @@ async function scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates = 
 
   const seenSigs = new Set();
   for (let weekOffset = startWeek; weekOffset <= endWeek; weekOffset++) {
-    const fp = await getCalendarFingerprint(page);
+    const fp = await withPlaywrightGuard(
+      () => getCalendarFingerprint(page),
+      { stage: 'calendar_fingerprint', timeout: BOOKING_PAGE_TIMEOUT_MS },
+    );
     if (seenSigs.has(fp.sig) && fp.count > 0) {
       console.log(`  [week offset ${weekOffset}] repeated calendar fingerprint — stopping pagination`);
       break;
@@ -8838,9 +8897,15 @@ async function getVisibleDateKeysFromPage(page) {
 }
 
 async function absorbVisibleSessions(page, allByKey, datesSeen, weekOffset = 0) {
-  const result = await page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset });
+  const result = await withPlaywrightGuard(
+    () => page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, weekOffset }),
+    { stage: 'absorb_visible_sessions', timeout: BOOKING_PAGE_TIMEOUT_MS },
+  );
   const pageSessions = asSessionArray(result?.sessions);
-  const visible = await getVisibleDateKeysFromPage(page);
+  const visible = await withPlaywrightGuard(
+    () => getVisibleDateKeysFromPage(page),
+    { stage: 'absorb_visible_dates', timeout: BOOKING_PAGE_TIMEOUT_MS },
+  );
   if (visible.length) markCalendarSpanChecked(datesSeen, visible[0], visible[visible.length - 1]);
   let added = 0;
   for (const s of pageSessions) {
@@ -9411,13 +9476,14 @@ async function runBackfillAvailableDates({
     collectorState.lastBackfillAvailableDatesResult = { ...report, completedAt: new Date().toISOString() };
     return report;
   } catch (e) {
-    if (isPlaywrightCrashError(e)) recordPageCrash('backfill_available_dates', e);
+    releaseScrapeLock();
+    handlePlaywrightFailure(e, 'backfill_available_dates');
     report.errors.push({ error: e.message });
     report.durationMs = Date.now() - started;
     throw e;
   } finally {
     releaseScrapeLock();
-    await safeCloseBrowser(launched);
+    void safeCloseBrowser(launched);
   }
 }
 
@@ -9476,7 +9542,8 @@ async function runDateRangeBackfill({
         maxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
       });
     } catch (e) {
-      if (isPlaywrightCrashError(e)) recordPageCrash('date_range_threshold_backfill', e);
+      releaseScrapeLock();
+      handlePlaywrightFailure(e, 'date_range_threshold_backfill');
       combined.threshold = { error: e.message, crashed: isPlaywrightCrashError(e) };
     } finally {
       releaseScrapeLock();
@@ -9559,13 +9626,14 @@ async function runDateRangeBackfillBasic(startDate, endDate, { tier = 0, reason 
     collectorState.lastDateRangeBackfill = { ...report, completedAt: new Date().toISOString() };
     return report;
   } catch (e) {
-    if (isPlaywrightCrashError(e)) recordPageCrash('date_range_backfill_basic', e);
+    releaseScrapeLock();
+    handlePlaywrightFailure(e, 'date_range_backfill_basic');
     report.errors.push({ error: e.message });
     report.durationMs = Date.now() - started;
     throw e;
   } finally {
     releaseScrapeLock();
-    await safeCloseBrowser(launched);
+    void safeCloseBrowser(launched);
   }
 }
 
@@ -10213,26 +10281,31 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     recordTierRunState(tier, report, { reason });
 
   } catch (e) {
-    recordScrapeError(e, `tier ${tier} scrape`);
-    if (isPlaywrightCrashError(e)) recordPageCrash(`tier_${tier}_scrape`, e);
+    releaseScrapeLock();
+    handlePlaywrightFailure(e, `tier_${tier}_scrape`, { tier });
     lastTierError[tier] = lastScrapeError;
     report.errors.push({ error: lastScrapeError });
     report.error = lastScrapeError;
     report.durationMs = Date.now() - tierStarted;
+    report.crashed = isPlaywrightCrashError(e);
     lastTierDurationMs[tier] = report.durationMs;
-    await saveScrapeErrorToSupabase(lastScrapeError);
-    await finishScrapeRun(scrapeRunId, {
+    recordTierRunState(tier, report, { reason });
+    void saveScrapeErrorToSupabase(lastScrapeError).catch((err) => {
+      console.error('  saveScrapeErrorToSupabase failed:', err.message);
+    });
+    void finishScrapeRun(scrapeRunId, {
       success: false,
       sessionsFound: sessions.length,
       datesCovered: coverage?.coveredDatesCount ?? null,
       missingDates: coverage?.missingDatesInScrapeWindow ?? null,
       error: lastScrapeError,
       errorStack: lastScrapeErrorStack,
+    }).catch((err) => {
+      console.error('  finishScrapeRun failed:', err.message);
     });
-    recordTierRunState(tier, report, { reason });
   } finally {
     releaseScrapeLock();
-    await safeCloseBrowser(launched);
+    void safeCloseBrowser(launched);
   }
 
   return report;
@@ -10262,11 +10335,11 @@ async function detectWeeksOnStartup() {
     const detected = await detectAvailableWeeks(launched.page);
     updateEffectiveWeeksCap(detected);
   } catch (e) {
-    console.error('week detection failed:', e.message);
+    handlePlaywrightFailure(e, 'week_detection');
     effectiveWeeksAhead = Math.max(1, SCRAPE_WEEKS_AHEAD);
   } finally {
     releaseWeekDetectionLock();
-    if (launched?.browser) await launched.browser.close().catch(() => {});
+    void safeCloseBrowser(launched);
   }
 }
 
@@ -10831,9 +10904,9 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
         ...result,
       };
     } catch (e) {
-      const failureReason = isPlaywrightCrashError(e)
-        ? recordPageCrash('admin_threshold_scan', e, { weekKey: isoDate })
-        : 'failed_threshold_scan';
+      releaseScrapeLock();
+      handlePlaywrightFailure(e, 'admin_threshold_scan', { weekKey: isoDate });
+      const failureReason = isPlaywrightCrashError(e) ? 'failed_page_crash' : 'failed_threshold_scan';
       return {
         skipped: false,
         crashed: true,
@@ -11411,6 +11484,57 @@ async function adminRunTierHandler(tier, req, res) {
   }
 }
 
+app.post('/api/admin/release-scrape-lock', (req, res) => {
+  const force = req.body?.force === true || req.query?.force === 'true';
+  const reason = req.body?.reason || req.query?.reason || 'manual_recovery';
+  const ageSeconds = getScrapeLockAgeSeconds();
+
+  if (!scrapeInProgress) {
+    return res.json({
+      released: false,
+      reason: 'not_locked',
+      scrapeInProgress: false,
+      currentScrapeAgeSeconds: null,
+      scrapeLockMaxMs: SCRAPE_LOCK_MAX_MS,
+    });
+  }
+
+  if (!force && ageSeconds != null && ageSeconds * 1000 < SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS) {
+    return res.status(409).json({
+      released: false,
+      reason: 'lock_too_young',
+      scrapeInProgress: true,
+      currentScrapeTier,
+      currentScrapeStartedAt,
+      currentScrapeAgeSeconds: ageSeconds,
+      minReleaseAgeSeconds: Math.round(SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS / 1000),
+      scrapeLockMaxMs: SCRAPE_LOCK_MAX_MS,
+      hint: 'Pass force=true to release immediately',
+    });
+  }
+
+  const previousTier = currentScrapeTier;
+  const previousStartedAt = currentScrapeStartedAt;
+  releaseScrapeLock();
+  collectorState.scrapeLockReleasedAt = new Date().toISOString();
+  collectorState.scrapeLockReleasedReason = reason;
+  collectorState.thresholdScanRecovered = true;
+
+  res.json({
+    released: true,
+    reason,
+    force,
+    previousTier,
+    previousStartedAt,
+    previousScrapeAgeSeconds: ageSeconds,
+    scrapeInProgress: false,
+    scrapeLockMaxMs: SCRAPE_LOCK_MAX_MS,
+    lastScrapeError,
+    lastPageCrashAt: collectorState.lastPageCrashAt,
+    lastPageCrashStage: collectorState.lastPageCrashStage,
+  });
+});
+
 app.post('/api/admin/run-tier1', (req, res) => adminRunTierHandler(1, req, res));
 app.post('/api/admin/run-tier2', (req, res) => adminRunTierHandler(2, req, res));
 app.post('/api/admin/run-tier3', (req, res) => adminRunTierHandler(3, req, res));
@@ -11770,7 +11894,14 @@ async function buildCollectorDebugPayload() {
   }
 
   let recommendedAction = 'none';
-  if (!scrapeScheduleEnabled) {
+  if (scrapeInProgress) {
+    const lockAgeSec = getScrapeLockAgeSeconds();
+    if (lockAgeSec != null && lockAgeSec * 1000 > SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS) {
+      recommendedAction = `Scrape lock held ${lockAgeSec}s (tier ${currentScrapeTier}) — POST /api/admin/release-scrape-lock with force=true or wait for SCRAPE_LOCK_MAX_MS`;
+    } else if (lockAgeSec != null) {
+      recommendedAction = `Scrape in progress (tier ${currentScrapeTier}, ${lockAgeSec}s) — saved data still served from Supabase`;
+    }
+  } else if (!scrapeScheduleEnabled) {
     recommendedAction = 'Scheduler not started — check server logs for cron errors';
   } else if (lastTierRun[1] == null && minutesSinceTier1 == null && msSinceStart > 10 * 60_000) {
     recommendedAction = 'Tier 1 never ran — POST /api/admin/run-tier1 or check Playwright/Chromium logs';
@@ -11864,8 +11995,9 @@ async function runBackgroundThresholdBatch() {
     collectorState.lastThresholdScanResult = { ...result, source: 'background_scheduler' };
     return { skipped: false, ...result };
   } catch (e) {
-    if (isPlaywrightCrashError(e)) recordPageCrash('background_threshold_batch', e);
-    return { skipped: false, crashed: true, error: e.message };
+    releaseScrapeLock();
+    handlePlaywrightFailure(e, 'background_threshold_batch');
+    return { skipped: false, crashed: isPlaywrightCrashError(e), error: e.message };
   } finally {
     releaseScrapeLock();
   }
@@ -11957,6 +12089,12 @@ function startBackgroundCollector() {
 
   collectorState.initialScrapeScheduled = true;
   console.log('  Initial scrape scheduled — Tier 1 in 10s (priority), week detection in parallel');
+
+  setInterval(() => {
+    if (releaseScrapeLockIfStale()) {
+      collectorState.thresholdScanRecovered = true;
+    }
+  }, 60_000);
 
   setTimeout(() => runTierScrapeAsync(1, { reason: 'startup_tier1' }), 10_000);
 
