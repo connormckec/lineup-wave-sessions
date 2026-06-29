@@ -10279,10 +10279,10 @@ async function runDebugEntriesLeftGridChangeContract(page, thresholds) {
 }
 
 function scrapeCalendarTileParserContract() {
-  const BOOKABLE_CODES = new Set(['AT', 'AB', 'ET', 'EB', 'PRG', 'INT', 'PT', 'PB', 'BGN']);
   const DAY_HEADER_RE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.\s*(\d+)\s*$/i;
   const TIME_LABEL_RE = /^(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}am|\d{1,2}pm)$/i;
   const FILTER_TEXT_RE = /entries?\s*left|at least \d+ entries|show only activities|show only events/i;
+  const VISIBLE_CODE_RE = /^(AT|AB|ET|EB|PRG|INT|PT|PB|BGN)\*?$/i;
   const LEVEL_TO_CODE = {
     'advanced trick': 'AT',
     'advanced tricks': 'AT',
@@ -10329,6 +10329,10 @@ function scrapeCalendarTileParserContract() {
   function rectCenter(rect) {
     return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
   }
+  function pointInBounds(x, y, bounds) {
+    if (!bounds) return false;
+    return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+  }
   function levelToCode(level) {
     const norm = normalizeText(level).toLowerCase();
     if (!norm) return null;
@@ -10338,20 +10342,13 @@ function scrapeCalendarTileParserContract() {
     }
     return null;
   }
-  function normalizeSessionCodeFromText(text) {
+  function normalizeVisibleSessionCode(text) {
     const raw = normalizeText(text);
     if (!raw) return null;
-    const up = raw.toUpperCase();
-    if (/^PB\d*$/i.test(raw)) return { sessionCode: 'PB', sourceText: raw };
-    if (/^EB\d*$/i.test(raw)) return { sessionCode: 'EB', sourceText: raw };
-    if (BOOKABLE_CODES.has(up)) return { sessionCode: up, sourceText: raw };
-    return null;
-  }
-  function waveSideShortFromLabel(label) {
-    const low = String(label || '').toLowerCase();
-    if (/\bleft\b/.test(low)) return 'left';
-    if (/\bright\b/.test(low)) return 'right';
-    return null;
+    const compact = raw.replace(/\s+/g, '');
+    const m = compact.match(VISIBLE_CODE_RE);
+    if (!m) return null;
+    return { sessionCode: m[1].toUpperCase(), sourceText: raw };
   }
   function findCalendarContainer() {
     let best = null;
@@ -10359,7 +10356,7 @@ function scrapeCalendarTileParserContract() {
     for (const el of document.querySelectorAll('div, section, main, table, tbody, article')) {
       if (!isVisible(el)) continue;
       const text = el.innerText || '';
-      if (!text.includes('Left Wave Sessions')) continue;
+      if (!text.includes('Left Wave Sessions') || !text.includes('Right Wave Sessions')) continue;
       if (text.length > bestLen) {
         best = el;
         bestLen = text.length;
@@ -10367,71 +10364,155 @@ function scrapeCalendarTileParserContract() {
     }
     return best || document.body;
   }
-  function buildWaveSectionBounds(container) {
-    let leftLabel = null;
-    let rightLabel = null;
+  function findSectionLabel(container, labelText) {
+    let best = null;
     for (const el of container.querySelectorAll('*')) {
       if (!isVisible(el)) continue;
       const t = normalizeText(el.innerText || el.textContent || '');
-      if (t === 'Left Wave Sessions' || (t.startsWith('Left Wave Sessions') && t.length < 40)) leftLabel = el;
-      if (t === 'Right Wave Sessions' || (t.startsWith('Right Wave Sessions') && t.length < 40)) rightLabel = el;
+      if (t !== labelText && !(t.startsWith(labelText) && t.length < 50)) continue;
+      if (!best || el.getBoundingClientRect().top < best.getBoundingClientRect().top) best = el;
     }
-    const leftRect = leftLabel?.getBoundingClientRect() || null;
-    const rightRect = rightLabel?.getBoundingClientRect() || null;
-    const splitY = leftRect && rightRect ? (leftRect.bottom + rightRect.top) / 2 : null;
-    return { leftRect, rightRect, splitY };
+    return best;
   }
-  function collectDayHeaderColumns(container) {
-    const raw = [];
-    for (const el of container.querySelectorAll('th, td, div, span')) {
-      if (!isVisible(el)) continue;
-      const t = normalizeText(el.innerText || el.textContent || '');
-      const m = t.match(DAY_HEADER_RE);
-      if (!m) continue;
-      const rect = el.getBoundingClientRect();
-      raw.push({
-        dayHeader: t,
-        dayNum: parseInt(m[2], 10),
-        weekday: m[1],
-        centerX: rect.left + rect.width / 2,
-        rect,
-        el,
-      });
+  function findSectionGridRoot(labelEl, container) {
+    if (!labelEl) return null;
+    let node = labelEl.parentElement;
+    let best = null;
+    while (node && node !== container && node !== document.body) {
+      const tiles = node.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
+      const rect = node.getBoundingClientRect();
+      if (tiles.length > 0 && rect.height > 80) best = node;
+      node = node.parentElement;
     }
-    raw.sort((a, b) => a.centerX - b.centerX);
+    return best || labelEl.parentElement;
+  }
+  function buildWaveSections(container) {
+    const leftLabel = findSectionLabel(container, 'Left Wave Sessions');
+    const rightLabel = findSectionLabel(container, 'Right Wave Sessions');
+    const leftRoot = findSectionGridRoot(leftLabel, container);
+    const rightRoot = findSectionGridRoot(rightLabel, container);
+    const rightTop = rightLabel?.getBoundingClientRect().top ?? null;
+
+    function sectionBounds(labelEl, rootEl, endY) {
+      if (!labelEl || !rootEl) return null;
+      const labelRect = labelEl.getBoundingClientRect();
+      const rootRect = rootEl.getBoundingClientRect();
+      const top = labelRect.bottom;
+      const bottom = endY != null ? endY : rootRect.bottom;
+      if (bottom <= top) return null;
+      return {
+        top,
+        bottom,
+        left: rootRect.left,
+        right: rootRect.right,
+        width: rootRect.width,
+        height: bottom - top,
+      };
+    }
+
+    return {
+      left: sectionBounds(leftLabel, leftRoot, rightTop),
+      right: sectionBounds(rightLabel, rightRoot, null),
+      leftRoot,
+      rightRoot,
+    };
+  }
+  function waveSideFromPoint(x, y, sections) {
+    const inLeft = pointInBounds(x, y, sections.left);
+    const inRight = pointInBounds(x, y, sections.right);
+    if (inLeft && !inRight) return 'left';
+    if (inRight && !inLeft) return 'right';
+    if (sections.right && y >= sections.right.top - 4) return inRight ? 'right' : null;
+    if (sections.left && y < (sections.right?.top ?? Number.POSITIVE_INFINITY)) return inLeft ? 'left' : null;
+    return null;
+  }
+  function dedupeDayHeaders(items) {
+    items.sort((a, b) => a.centerX - b.centerX);
     const deduped = [];
-    for (const item of raw) {
-      const near = deduped.find((d) => Math.abs(d.centerX - item.centerX) < 12);
+    for (const item of items) {
+      const near = deduped.find((d) => Math.abs(d.centerX - item.centerX) < 14);
       if (!near) deduped.push(item);
-      else if ((item.el.innerText || '').length < (near.el.innerText || '').length) {
-        const idx = deduped.indexOf(near);
-        deduped[idx] = item;
+      else if ((item.el.innerText || '').length <= (near.el.innerText || '').length) {
+        deduped[deduped.indexOf(near)] = item;
       }
     }
     return deduped;
   }
-  function collectTimeRowLabels(container) {
-    const rows = [];
-    for (const el of container.querySelectorAll('th, td, div, span')) {
+  function dedupeTimeRows(items) {
+    items.sort((a, b) => a.centerY - b.centerY);
+    const deduped = [];
+    for (const item of items) {
+      const near = deduped.find((d) => Math.abs(d.centerY - item.centerY) < 8);
+      if (!near) deduped.push(item);
+    }
+    return deduped;
+  }
+  function collectDayHeaderColumnsInSection(sectionBounds, sectionRoot) {
+    if (!sectionBounds || !sectionRoot) return [];
+    const raw = [];
+    for (const el of sectionRoot.querySelectorAll('th')) {
+      if (!isVisible(el)) continue;
+      const t = normalizeText(el.innerText || el.textContent || '');
+      if (!DAY_HEADER_RE.test(t)) continue;
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      if (!pointInBounds(cx, cy, sectionBounds)) continue;
+      if (cy > sectionBounds.top + 100) continue;
+      raw.push({
+        dayHeader: t,
+        dayNum: parseInt(t.match(DAY_HEADER_RE)[2], 10),
+        weekday: t.match(DAY_HEADER_RE)[1],
+        centerX: cx,
+        centerY: cy,
+        rect,
+        el,
+      });
+    }
+    return dedupeDayHeaders(raw);
+  }
+  function collectTimeRowLabelsInSection(sectionBounds, sectionRoot) {
+    if (!sectionBounds || !sectionRoot) return [];
+    const gutterRight = sectionBounds.left + Math.max(80, sectionBounds.width * 0.14);
+    const raw = [];
+    for (const el of sectionRoot.querySelectorAll('th, td')) {
       if (!isVisible(el)) continue;
       const t = normalizeText(el.innerText || el.textContent || '');
       if (!TIME_LABEL_RE.test(t)) continue;
       const rect = el.getBoundingClientRect();
-      rows.push({
-        timeLabel: t.replace(/\s+/g, '').toLowerCase().replace(/^(\d{1,2})(am|pm)$/, '$1$2'),
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      if (!pointInBounds(cx, cy, sectionBounds)) continue;
+      if (cx > gutterRight) continue;
+      raw.push({
+        timeLabel: t.replace(/\s+/g, '').toLowerCase(),
         rawTimeLabel: t,
-        centerY: rect.top + rect.height / 2,
-        centerX: rect.left + rect.width / 2,
+        centerY: cy,
+        centerX: cx,
         rect,
       });
     }
-    rows.sort((a, b) => a.centerY - b.centerY);
-    const deduped = [];
-    for (const item of rows) {
-      const near = deduped.find((d) => Math.abs(d.centerY - item.centerY) < 8 && Math.abs(d.centerX - item.centerX) < 40);
-      if (!near) deduped.push(item);
-    }
-    return deduped;
+    return dedupeTimeRows(raw);
+  }
+  function buildSectionSpatialIndex(sectionKey, sectionBounds, sectionRoot) {
+    const dayColumns = collectDayHeaderColumnsInSection(sectionBounds, sectionRoot);
+    const timeRows = collectTimeRowLabelsInSection(sectionBounds, sectionRoot);
+    return {
+      dayHeaderCount: dayColumns.length,
+      timeRowCount: timeRows.length,
+      dayHeaders: dayColumns.map((c) => c.dayHeader),
+      sectionBounds: sectionBounds ? {
+        top: Math.round(sectionBounds.top),
+        bottom: Math.round(sectionBounds.bottom),
+        left: Math.round(sectionBounds.left),
+        right: Math.round(sectionBounds.right),
+        width: Math.round(sectionBounds.width),
+        height: Math.round(sectionBounds.height),
+      } : null,
+      dayColumns,
+      timeRows,
+      sectionKey,
+    };
   }
   function parseMonthYearFromContainer(container) {
     for (const el of container.querySelectorAll('*')) {
@@ -10495,16 +10576,6 @@ function scrapeCalendarTileParserContract() {
     }
     return bestDist < 80 ? best : null;
   }
-  function waveSideFromSpatial(centerY, waveBounds, waveIndex) {
-    const fromIndex = waveIndex === 1 ? 'left' : waveIndex === 2 ? 'right' : null;
-    if (waveBounds.splitY != null) {
-      const fromY = centerY < waveBounds.splitY ? 'left' : 'right';
-      return fromY || fromIndex;
-    }
-    if (waveBounds.leftRect && centerY <= waveBounds.leftRect.bottom + 120) return 'left';
-    if (waveBounds.rightRect && centerY >= waveBounds.rightRect.top - 40) return 'right';
-    return fromIndex;
-  }
   function shouldExcludeCandidate(el, text) {
     const t = normalizeText(text);
     if (!t) return 'empty_text';
@@ -10521,11 +10592,26 @@ function scrapeCalendarTileParserContract() {
     const time = normalizeText(timeLabel).toLowerCase();
     return `${isoDate}|${time || '?'}|${waveSide || '?'}|${sessionCode || '?'}`;
   }
+  function resolveSectionContext(x, y, sections, spatialIndex) {
+    const waveSide = waveSideFromPoint(x, y, sections);
+    if (!waveSide) return null;
+    const section = spatialIndex.sections[waveSide];
+    if (!section) return null;
+    return {
+      waveSide,
+      dayColumns: section.dayColumns,
+      timeRows: section.timeRows,
+    };
+  }
 
   const container = findCalendarContainer();
-  const waveBounds = buildWaveSectionBounds(container);
-  const dayColumns = collectDayHeaderColumns(container);
-  const timeRows = collectTimeRowLabels(container);
+  const sections = buildWaveSections(container);
+  const spatialIndex = {
+    sections: {
+      left: buildSectionSpatialIndex('left', sections.left, sections.leftRoot),
+      right: buildSectionSpatialIndex('right', sections.right, sections.rightRoot),
+    },
+  };
   const monthYear = parseMonthYearFromContainer(container);
   const parseWarnings = [];
   const excluded = [];
@@ -10560,6 +10646,16 @@ function scrapeCalendarTileParserContract() {
       return Math.abs(px - cx) < 8 && Math.abs(py - cy) < 8;
     });
   }
+  function recordTitleVisibleMismatch(entry, titleInferredCode, titleText) {
+    parseWarnings.push({
+      type: 'title_visible_code_mismatch',
+      sourceText: entry.sourceText,
+      visibleNormalizedCode: entry.sessionCode,
+      titleInferredCode,
+      titleText,
+      identityKey: entry.identityKey,
+    });
+  }
 
   for (const el of container.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
     totalCandidateNodes += 1;
@@ -10572,37 +10668,39 @@ function scrapeCalendarTileParserContract() {
       continue;
     }
     const cls = el.className || '';
-    const titleHtml = el.dataset.originalTitle || '';
-    const tileText = normalizeText(el.innerText || el.textContent || titleHtml.replace(/<[^>]+>/g, ' '));
-    const exclude = shouldExcludeCandidate(el, tileText);
+    const titleText = el.dataset.originalTitle || null;
+    const visibleText = normalizeText(el.innerText || el.textContent || '');
+    const exclude = shouldExcludeCandidate(el, visibleText);
     if (exclude) {
-      recordExcluded(el, tileText, exclude);
+      recordExcluded(el, visibleText, exclude);
       continue;
     }
     if (cls.includes('expired_timeslot') || cls.includes('disabled') || cls.includes('unavailable')) {
-      recordExcluded(el, tileText, 'unavailable_tile');
+      recordExcluded(el, visibleText, 'unavailable_tile');
       continue;
     }
-    const lm = titleHtml.match(/Session level\s*:<\/b>\s*([^<]+)/i);
+    const visibleCode = normalizeVisibleSessionCode(visibleText);
+    if (!visibleCode) {
+      recordExcluded(el, visibleText, 'unknown_session_code');
+      continue;
+    }
+    const lm = titleText ? titleText.match(/Session level\s*:<\/b>\s*([^<]+)/i) : null;
+    const titleInferredCode = lm ? levelToCode(normalizeText(lm[1])) : null;
     const wm = cls.match(/booking-agenda-clickable_(\d+)_(\d+)/);
-    const fm = titleHtml.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
-    const level = lm ? normalizeText(lm[1]) : tileText;
-    const codeFromLevel = levelToCode(level);
-    const codeFromText = normalizeSessionCodeFromText(tileText);
-    const sessionCode = codeFromLevel || codeFromText?.sessionCode;
-    if (!sessionCode) {
-      recordExcluded(el, tileText, 'unknown_session_code');
-      continue;
-    }
-    const sourceText = codeFromText?.sourceText || tileText || level;
+    const fm = titleText ? titleText.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i) : null;
     const ts = wm ? +wm[1] : null;
-    const waveIndex = wm ? +wm[2] : null;
     const d = ts ? new Date(ts * 1000) : null;
     const isoFromTs = d
       ? new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d)
       : null;
     const bbox = rectOf(el);
     const center = rectCenter(bbox);
+    const sectionCtx = resolveSectionContext(center.x, center.y, sections, spatialIndex);
+    if (!sectionCtx) {
+      recordExcluded(el, visibleCode.sourceText, 'wave_side_unmapped');
+      continue;
+    }
+    const { waveSide, dayColumns, timeRows } = sectionCtx;
     const dayCol = nearestDayColumn(center.x, dayColumns);
     const timeRow = nearestTimeRow(center.y, timeRows);
     const isoFromSpatial = dayCol
@@ -10610,33 +10708,35 @@ function scrapeCalendarTileParserContract() {
       : null;
     const isoDate = isoFromTs || isoFromSpatial;
     const timeLabel = fm ? normalizeText(fm[1]) : (timeRow?.rawTimeLabel || '?');
-    const waveSide = waveSideFromSpatial(center.y, waveBounds, waveIndex)
-      || (waveIndex === 1 ? 'left' : waveIndex === 2 ? 'right' : null);
-    if (!isoDate || !waveSide) {
-      parseWarnings.push(`dom_tile_incomplete:${sourceText}`);
-      recordExcluded(el, sourceText, !isoDate ? 'missing_iso_date' : 'missing_wave_side');
+    if (!isoDate) {
+      recordExcluded(el, visibleCode.sourceText, 'missing_iso_date');
       continue;
     }
-    recordParsed({
+    const entry = {
       isoDate,
       timeLabel,
       waveSide,
-      sessionCode,
-      identityKey: buildIdentityKey(isoDate, timeLabel, waveSide, sessionCode),
-      sourceText,
+      sessionCode: visibleCode.sessionCode,
+      identityKey: buildIdentityKey(isoDate, timeLabel, waveSide, visibleCode.sessionCode),
+      sourceText: visibleCode.sourceText,
+      titleText,
       boundingBox: bbox,
       confidence: isoFromTs && fm ? 'high' : 'medium',
-      parseMethod: isoFromTs ? 'dom_tile_title' : 'dom_tile_spatial',
-    });
+      parseMethod: isoFromTs ? 'dom_tile_visible_code' : 'dom_tile_spatial',
+    };
+    if (titleInferredCode && titleInferredCode !== visibleCode.sessionCode) {
+      recordTitleVisibleMismatch(entry, titleInferredCode, titleText);
+    }
+    recordParsed(entry);
   }
 
   for (const el of container.querySelectorAll('td, div, span')) {
     if (el.matches('div.dynamic-cal-booking-ts[data-original-title]')) continue;
     if (el.querySelector('div.dynamic-cal-booking-ts[data-original-title]')) continue;
     const text = normalizeText(el.innerText || el.textContent || '');
-    if (!text || text.length > 12) continue;
-    const codeInfo = normalizeSessionCodeFromText(text);
-    if (!codeInfo) continue;
+    if (!text || text.length > 16) continue;
+    const visibleCode = normalizeVisibleSessionCode(text);
+    if (!visibleCode) continue;
     totalCandidateNodes += 1;
     const exclude = shouldExcludeCandidate(el, text);
     if (exclude) {
@@ -10649,29 +10749,35 @@ function scrapeCalendarTileParserContract() {
       continue;
     }
     const center = rectCenter(bbox);
+    const sectionCtx = resolveSectionContext(center.x, center.y, sections, spatialIndex);
+    if (!sectionCtx) {
+      recordExcluded(el, visibleCode.sourceText, 'wave_side_unmapped');
+      continue;
+    }
+    const { waveSide, dayColumns, timeRows } = sectionCtx;
     const dayCol = nearestDayColumn(center.x, dayColumns);
     const timeRow = nearestTimeRow(center.y, timeRows);
     const isoDate = dayCol ? isoDateFromDayHeader(dayCol.dayHeader, monthYear, dayColumns) : null;
-    const waveSide = waveSideFromSpatial(center.y, waveBounds, null);
-    if (!isoDate || !timeRow || !waveSide) {
-      recordExcluded(el, text, 'spatial_mapping_incomplete');
+    if (!isoDate || !timeRow) {
+      recordExcluded(el, visibleCode.sourceText, 'spatial_mapping_incomplete');
       continue;
     }
     recordParsed({
       isoDate,
       timeLabel: timeRow.rawTimeLabel,
       waveSide,
-      sessionCode: codeInfo.sessionCode,
-      identityKey: buildIdentityKey(isoDate, timeRow.rawTimeLabel, waveSide, codeInfo.sessionCode),
-      sourceText: codeInfo.sourceText,
+      sessionCode: visibleCode.sessionCode,
+      identityKey: buildIdentityKey(isoDate, timeRow.rawTimeLabel, waveSide, visibleCode.sessionCode),
+      sourceText: visibleCode.sourceText,
+      titleText: null,
       boundingBox: bbox,
       confidence: 'medium',
       parseMethod: 'spatial_code_node',
     });
   }
 
-  if (!dayColumns.length) parseWarnings.push('no_day_header_columns_found');
-  if (!timeRows.length) parseWarnings.push('no_time_row_labels_found');
+  if (!spatialIndex.sections.left.dayHeaderCount) parseWarnings.push('left_section_no_day_headers_found');
+  if (!spatialIndex.sections.right.dayHeaderCount) parseWarnings.push('right_section_no_day_headers_found');
 
   return {
     totalCandidateNodes,
@@ -10680,9 +10786,20 @@ function scrapeCalendarTileParserContract() {
     duplicateCount,
     parseWarnings,
     spatialIndex: {
-      dayHeaderCount: dayColumns.length,
-      timeRowCount: timeRows.length,
-      dayHeaders: dayColumns.map((c) => c.dayHeader),
+      sections: {
+        left: {
+          dayHeaderCount: spatialIndex.sections.left.dayHeaderCount,
+          timeRowCount: spatialIndex.sections.left.timeRowCount,
+          dayHeaders: spatialIndex.sections.left.dayHeaders,
+          sectionBounds: spatialIndex.sections.left.sectionBounds,
+        },
+        right: {
+          dayHeaderCount: spatialIndex.sections.right.dayHeaderCount,
+          timeRowCount: spatialIndex.sections.right.timeRowCount,
+          dayHeaders: spatialIndex.sections.right.dayHeaders,
+          sectionBounds: spatialIndex.sections.right.sectionBounds,
+        },
+      },
       calendarContainerTag: container?.tagName || null,
     },
   };
@@ -10715,6 +10832,7 @@ function finalizeTileParserContractResult(raw) {
       sessionCode: item.sessionCode,
       identityKey,
       sourceText: item.sourceText,
+      titleText: item.titleText ?? null,
       boundingBox: item.boundingBox,
       confidence: item.confidence,
       parseMethod: item.parseMethod,
@@ -10779,12 +10897,16 @@ async function runDebugEntriesLeftTileParserContract(page, threshold = 1) {
 
   const raw = await scrapeTileParserContractFromPage(page);
   const tileParserResult = finalizeTileParserContractResult(raw);
+  const waveSidesOk = (tileParserResult.countsByWaveSide?.left ?? 0) > 0
+    && (tileParserResult.countsByWaveSide?.right ?? 0) > 0;
 
   return {
     thresholdSelection,
     gridSnapshot,
     tileParserResult,
-    error: tileParserResult.parsedCount > 0 ? null : 'tile_parser_no_identities_parsed',
+    error: tileParserResult.parsedCount > 0
+      ? (waveSidesOk ? null : 'tile_parser_missing_wave_side_counts')
+      : 'tile_parser_no_identities_parsed',
   };
 }
 
@@ -10945,7 +11067,9 @@ async function runDebugEntriesLeftControl({
       const selectionOk = parserRun.thresholdSelection?.filterSetOk === true;
       const snapshotOk = parserRun.gridSnapshot?.gridSnapshotValid === true;
       const parsedOk = (parserRun.tileParserResult?.parsedCount ?? 0) > 0;
-      const contractOk = selectionOk && snapshotOk && parsedOk && !parserRun.error;
+      const waveSidesOk = (parserRun.tileParserResult?.countsByWaveSide?.left ?? 0) > 0
+        && (parserRun.tileParserResult?.countsByWaveSide?.right ?? 0) > 0;
+      const contractOk = selectionOk && snapshotOk && parsedOk && waveSidesOk && !parserRun.error;
       return {
         gate: 5,
         mode,

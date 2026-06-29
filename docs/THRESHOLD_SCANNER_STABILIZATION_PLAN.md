@@ -269,7 +269,7 @@ curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin
   }'
 ```
 
-**Acceptance:** Excludes X cells, day headers, time labels, filter chips, hidden/stale DOM; dedupes parent/child; `parsedCount > 0`; `countsByDate` spans the visible week. No inference, no writes.
+**Acceptance:** Excludes X cells, day headers, time labels, filter chips, hidden/stale DOM; dedupes parent/child; visible tile text wins over title metadata; `countsByWaveSide` includes both `left` and `right`; `parsedCount > 0`. No inference, no writes.
 
 ---
 
