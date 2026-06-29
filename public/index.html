@@ -1772,36 +1772,28 @@ function formatRelativeTime(iso) {
 }
 
 function freshnessLabel(s) {
-  const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
   const basicAt = s.lastBasicCheckAt || s.last_basic_check_at || s.lastScraped;
-  const hasDetails = sessionDetailVerified(s) && (s.slots != null || s.slots === 0 || s.capacity != null || s.priceText || s.priceMin != null);
-  const detailStatus = s.detailStatus || s.detail_status;
+  const scheduleRel = basicAt ? formatRelativeTime(basicAt) : null;
 
-  if (isDetailFailedStatus(detailStatus) && detailedAt) {
-    const rel = formatRelativeTime(detailedAt);
-    const scheduleRel = basicAt ? formatRelativeTime(basicAt) : null;
-    const parts = [];
-    if (scheduleRel) parts.push(`schedule updated ${scheduleRel}`);
-    if (rel) parts.push(`details failed ${rel}`);
-    return parts.join(' · ');
+  if (sessionThresholdSlotsTrusted(s)) {
+    const verifiedAt = s.threshold_scan_at || s.thresholdScanAt;
+    const rel = verifiedAt ? formatRelativeTime(verifiedAt) : scheduleRel;
+    if (rel) return `slots verified ${rel}`;
+    return scheduleRel ? `schedule updated ${scheduleRel}` : '';
   }
 
-  if (hasDetails && detailedAt && !isDetailFailedStatus(detailStatus)) {
-    const rel = formatRelativeTime(detailedAt);
-    return rel ? `details updated ${rel}` : '';
+  const trusted = trustedSlotsForSession(s, null);
+  if (trusted.source === 'modal' && sessionDetailVerified(s)) {
+    const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
+    const rel = detailedAt ? formatRelativeTime(detailedAt) : null;
+    if (rel) return `details updated ${rel}`;
   }
 
-  if (basicAt) {
-    const rel = formatRelativeTime(basicAt);
-    if (detailStatus === 'checked_no_slots_visible' || detailStatus === 'checked_open_no_slots_visible') {
-      return rel ? `schedule updated ${rel} · details unavailable` : 'details unavailable';
-    }
-    if (detailStatus === 'checking' || detailStatus === 'pending' || !detailStatus) {
-      return rel ? `schedule updated ${rel} · details pending` : 'details pending';
-    }
-    return rel ? `schedule updated ${rel}` : '';
+  if (s.available !== false) {
+    return scheduleRel ? `schedule updated ${scheduleRel}` : '';
   }
-  return '';
+
+  return scheduleRel ? `schedule updated ${scheduleRel}` : '';
 }
 
 function sessionDaysSet() {
@@ -1848,12 +1840,10 @@ function sessionConditionDisplay(s, hist) {
     return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots: 0 };
   }
   if (slots == null) {
-    const detailHint = formatDetailStatusLine(s);
-    const sub = detailHint === 'details unavailable' ? 'details unavailable' : 'details pending';
     return {
       primary: 'Open',
-      sub: detailHint ? sub : null,
-      desktop: detailHint ? `Open · ${sub}` : 'Open',
+      sub: 'details unavailable',
+      desktop: 'Open · details unavailable',
       color: '#00c9a7',
       slots: null,
     };

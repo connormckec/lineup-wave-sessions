@@ -55,6 +55,7 @@ const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUA
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
 const BACKGROUND_THRESHOLD_SCAN_EVERY_MINS = Math.max(15, parseInt(process.env.BACKGROUND_THRESHOLD_SCAN_EVERY_MINS || '60', 10));
+const BACKGROUND_DETAIL_ENRICHMENT_ENABLED = process.env.BACKGROUND_DETAIL_ENRICHMENT_ENABLED === 'true';
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
 const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5', 10) || 5);
@@ -93,7 +94,7 @@ const API_SESSIONS_DURATION_SAMPLES = [];
 const SCRAPE_OPTS = { excludedLevels: EXCLUDED_LEVELS, excludedWaves: EXCLUDED_WAVES };
 
 const TIER_CONFIG = {
-  1: { label: 'today/tomorrow', slotCounts: true,  weekStart: 0, weekEnd: 0, minDay: 0,  maxDay: 1 },
+  1: { label: 'today/tomorrow', slotCounts: false, weekStart: 0, weekEnd: 0, minDay: 0,  maxDay: 1 },
   2: { label: 'booking window', slotCounts: false, weekStart: 0, weekEnd: null, minDay: 2,  maxDay: null },
   3: { label: 'weeks 2–3',      slotCounts: false, weekStart: 1, weekEnd: 2, minDay: 7,  maxDay: 20 },
   4: { label: 'weeks 4+',       slotCounts: false, weekStart: 3, weekEnd: null, minDay: 21, maxDay: null },
@@ -1455,6 +1456,8 @@ function isTodayOrTomorrowIso(isoDate) {
 
 function scheduleBackgroundDateDetail(isoDate, sessions, { reason = 'api_date_request' } = {}) {
   if (!isoDate) return;
+  if (reason === 'api_sessions_date' || String(reason).startsWith('api_sessions')) return;
+  if (!BACKGROUND_DETAIL_ENRICHMENT_ENABLED) return;
   const needing = sessionsMissingDetails(sessions).filter(s => sessionDetailQueueEligible(s));
   if (!needing.length) return;
   const priority = isTodayOrTomorrowIso(isoDate) ? 1 : 2;
@@ -1507,6 +1510,9 @@ function sessionDetailQueueEligible(s, { force = false, availabilityChanged = fa
   const priority = enrichmentPriorityForSession(s);
   const days = daysFromToday(s.isoDate || s.dateKey || todayDateKey());
   const status = effectiveDetailStatus(s);
+
+  if (thresholdSlotsTrusted(s) && !watchKeys.has(s.key)) return false;
+  if (!BACKGROUND_DETAIL_ENRICHMENT_ENABLED && !watchKeys.has(s.key) && !force) return false;
 
   if (!s.available && !watchKeys.has(s.key)) return false;
   if (status === 'checking') return false;
@@ -3316,6 +3322,7 @@ function thresholdStabilityDebugPayload() {
     thresholdScanMaxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
     thresholdScanRecycleBrowserEachWeek: THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK,
     backgroundThresholdScanEnabled: BACKGROUND_THRESHOLD_SCAN_ENABLED,
+    backgroundDetailEnrichmentEnabled: BACKGROUND_DETAIL_ENRICHMENT_ENABLED,
     currentScrapeAgeSeconds: getScrapeLockAgeSeconds(),
     scrapeLockMaxMs: SCRAPE_LOCK_MAX_MS,
     scrapeLockManualReleaseMinMs: SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS,
@@ -10743,7 +10750,7 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
       console.error(`  tier ${tier} availability_snapshots insert failed: ${writeDiag.snapshotInsertError}`);
     }
 
-    if (!cfg.slotCounts) {
+    if (!cfg.slotCounts && BACKGROUND_DETAIL_ENRICHMENT_ENABLED) {
       const needing = merged.filter(s => sessionDetailQueueEligible(s));
       if (needing.length) {
         await enqueueSessionsForEnrichment(needing, {
@@ -10759,16 +10766,6 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     await refreshCoverageFlags();
     if (tier >= 2) lastFullCoverageScrape = lastSuccessfulScrape;
     if (tier === 1) await prunePastSessionsFromSupabase();
-
-    if (cfg.slotCounts && !report.slotCountsError) {
-      const stillNeeding = merged.filter(s => s.available && !sessionHasDetailedData(s) && daysFromToday(sessionDateKey(s)) <= 1);
-      if (stillNeeding.length) {
-        console.log(`  tier 1 follow-up: ${stillNeeding.length} today/tomorrow session(s) still missing details`);
-        setImmediate(() => {
-          runDetailEnrichment({ sessions: stillNeeding, reason: 'tier1_followup' }).catch(console.error);
-        });
-      }
-    }
 
     await finishScrapeRun(scrapeRunId, {
       success: true,
@@ -10989,7 +10986,6 @@ app.get('/api/sessions', async (req, res) => {
       }
 
       res.json({ ...payload, apiDurationMs, supabaseQueryMs: payload.supabaseQueryMs ?? lastSupabaseDateQueryMs });
-      scheduleBackgroundDateDetail(isoDate, payload.sessions, { reason: 'api_sessions_date' });
     } catch (e) {
       console.error(`/api/sessions?date=${isoDate} error:`, e.message);
       const schemaErr = isMissingTableError(e) ? formatSchemaError('current_sessions') : null;
@@ -12559,21 +12555,27 @@ function startBackgroundCollector() {
     },
     'Tier 4 daily',
   );
-  collectorState.cronTasks.enrichP1 = scheduleCronSafe(
-    collectorState.tier1Interval,
-    () => setTimeout(() => runDetailEnrichmentByPriority(1).catch(console.error), ENRICHMENT_P1_OFFSET_MS),
-    'Detail enrichment P1',
-  );
-  collectorState.cronTasks.enrichP2 = scheduleCronSafe(
-    `*/${ENRICHMENT_TIER2_EVERY_MINS} * * * *`,
-    () => runDetailEnrichmentByPriority(2).catch(console.error),
-    'Detail enrichment P2',
-  );
-  collectorState.cronTasks.enrichP3 = scheduleCronSafe(
-    '0 */12 * * *',
-    () => runDetailEnrichmentByPriority(3).catch(console.error),
-    'Detail enrichment P3',
-  );
+  collectorState.cronTasks.enrichP1 = BACKGROUND_DETAIL_ENRICHMENT_ENABLED
+    ? scheduleCronSafe(
+      collectorState.tier1Interval,
+      () => setTimeout(() => runDetailEnrichmentByPriority(1).catch(console.error), ENRICHMENT_P1_OFFSET_MS),
+      'Detail enrichment P1',
+    )
+    : null;
+  collectorState.cronTasks.enrichP2 = BACKGROUND_DETAIL_ENRICHMENT_ENABLED
+    ? scheduleCronSafe(
+      `*/${ENRICHMENT_TIER2_EVERY_MINS} * * * *`,
+      () => runDetailEnrichmentByPriority(2).catch(console.error),
+      'Detail enrichment P2',
+    )
+    : null;
+  collectorState.cronTasks.enrichP3 = BACKGROUND_DETAIL_ENRICHMENT_ENABLED
+    ? scheduleCronSafe(
+      '0 */12 * * *',
+      () => runDetailEnrichmentByPriority(3).catch(console.error),
+      'Detail enrichment P3',
+    )
+    : null;
 
   if (BACKGROUND_THRESHOLD_SCAN_ENABLED) {
     const thresholdCron = `*/${BACKGROUND_THRESHOLD_SCAN_EVERY_MINS} * * * *`;
