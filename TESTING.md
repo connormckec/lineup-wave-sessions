@@ -43,7 +43,7 @@ After schema reset or sparse `current_sessions` (only today/tomorrow):
 1. **Check coverage:**
 
 ```bash
-curl -s http://localhost:3000/api/debug/coverage | jq '{discoveredAvailableDates,discoveredAvailableDatesCount,datesWithBasicRows,datesWithVerifiedDetails,missingDiscoveredDates,datesAttempted,datesSucceeded,datesFailed,failureReasonCounts,recommendedAction,lastBackfillAvailableDatesResult}'
+curl -s http://localhost:3000/api/debug/coverage | jq '{discoveredAvailableDates,discoveredAvailableDatesSource,lastDiscoveryRunAt,datesWithBasicRows,datesWithVerifiedDetails,verifiedDetailCountsByDate,pendingDetailCountsByDate}'
 curl -s http://localhost:3000/api/status | jq '{currentSessionsByDate, earliestSessionDate, latestSessionDate, uniqueDatesCount, missingDatesInScrapeWindow, backfillRecommended, fallbackAvailable}'
 ```
 

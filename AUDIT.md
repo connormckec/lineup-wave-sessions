@@ -196,7 +196,7 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `POST /api/admin/enrich-detail-queue` | Drain verified detail queue for one date (`isoDate`, `limit`, `wait`). Sequential modal verification; tracks `detailAttemptCount` / `nextDetailRetryAt` in session raw. |
 | `POST /api/admin/enrich-all-available-details` | Process detail queue across all discovered booking dates (`limitPerDate`, `wait`). |
 | `POST /api/admin/repair-detail-data` | Clear unverified/default-like/mismatched detail metrics while preserving basic session rows and verified detail. Optional `{ isoDate, dryRun }`. |
-| `GET /api/debug/coverage` | Dynamic coverage: `discoveredAvailableDates`, `datesWithBasicRows`, `datesWithVerifiedDetails`, `verifiedDetailCountsByDate`, `pendingDetailCountsByDate`, `failedDetailCountsByDate`, attempt/success/fail counts, `lastBackfillAvailableDatesResult`, plus `dateStatuses[]` |
+| `GET /api/debug/coverage` | Dynamic coverage: `discoveredAvailableDates`, `discoveredAvailableDatesSource`, `lastDiscoveryRunAt`, `lastBackfillAvailableDatesResult`, detail counts by date, attempt/success/fail stats, plus `dateStatuses[]` |
 
 ---
 

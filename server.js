@@ -367,6 +367,15 @@ function buildScrapeMetaPayload() {
     weeksScraped: lastWeeksScraped ?? 0,
     datesCheckedDuringScrape: [...persistedDatesChecked],
     datesCheckedEmpty: [...datesCheckedEmpty],
+    discoveredAvailableDates: collectorState.discoveredAvailableDates || [],
+    lastDiscoveryAt: collectorState.lastDiscoveryAt || null,
+    lastBackfillAvailableDatesResult: collectorState.lastBackfillAvailableDatesResult
+      ? {
+        completedAt: collectorState.lastBackfillAvailableDatesResult.completedAt || null,
+        discoveredAvailableDates: collectorState.lastBackfillAvailableDatesResult.discoveredAvailableDates || [],
+        discoveryDiagnostics: collectorState.lastBackfillAvailableDatesResult.discoveryDiagnostics || null,
+      }
+      : null,
   };
 }
 
@@ -413,6 +422,17 @@ function applyLoadedSnapshot(snapSessions, meta, loadedAt) {
     }
     if (Array.isArray(meta.datesCheckedEmpty)) {
       for (const d of meta.datesCheckedEmpty) datesCheckedEmpty.add(d);
+    }
+    if (Array.isArray(meta.discoveredAvailableDates) && meta.discoveredAvailableDates.length) {
+      collectorState.discoveredAvailableDates = [...meta.discoveredAvailableDates].sort();
+    }
+    if (meta.lastDiscoveryAt) collectorState.lastDiscoveryAt = meta.lastDiscoveryAt;
+    if (meta.lastBackfillAvailableDatesResult) {
+      collectorState.lastBackfillAvailableDatesResult = meta.lastBackfillAvailableDatesResult;
+      const bfDates = meta.lastBackfillAvailableDatesResult.discoveredAvailableDates;
+      if (Array.isArray(bfDates) && bfDates.length && !collectorState.discoveredAvailableDates.length) {
+        collectorState.discoveredAvailableDates = [...bfDates].sort();
+      }
     }
   }
   if (loadedAt) {
@@ -1112,11 +1132,12 @@ async function buildAvailableDatesCoverageStatuses() {
 }
 
 async function buildCoverageDebugPayload() {
-  const discovered = getDiscoveredAvailableDates();
-  const expected = expectedAvailableBookingDates();
-  const scrapeWindowExpected = expectedDatesInScrapeWindow();
   const dbStats = await queryCurrentSessionsByDateFromDb();
   const currentMap = dbStats.byDate;
+  const discovery = resolveDiscoveredAvailableDates({ dbByDate: currentMap });
+  const discovered = discovery.dates;
+  const expected = discovered.length ? discovered : deriveDiscoveredDatesFromCurrentSessions(currentMap);
+  const scrapeWindowExpected = expectedDatesInScrapeWindow();
   const availByDate = await queryAvailabilitySnapshotsByDate();
   const snapMeta = await fetchScrapeSnapshotMeta();
   const snapDates = Object.keys(snapMeta.scrapeSnapshotsByDate || {});
@@ -1172,7 +1193,9 @@ async function buildCoverageDebugPayload() {
   const fallback = await checkFallbackAvailable();
 
   let recommendedAction = 'none';
-  if (!discovered.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
+  if (discovery.source === 'none' && datesWithBasicRows.length) {
+    recommendedAction = 'discovered dates derived from current_sessions — run POST /api/admin/backfill-available-dates to refresh discovery';
+  } else if (!discovered.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
   else if (sparse && fallback) recommendedAction = 'POST /api/admin/backfill-current-sessions';
   else if (sparse) recommendedAction = 'POST /api/admin/backfill-available-dates or wait for Tier 2 scrape';
   else if (missingDiscoveredDates.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
@@ -1184,9 +1207,10 @@ async function buildCoverageDebugPayload() {
     maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
     maxHorizonDate: maxHorizonDateKey(),
     discoveredAvailableDates: discovered,
+    discoveredAvailableDatesSource: discovery.source,
     discoveredAvailableDatesCount: discovered.length,
-    lastDiscoveryAt: collectorState.lastDiscoveryAt,
-    discoveryDiagnostics: collectorState.discoveryDiagnostics,
+    lastDiscoveryRunAt: discovery.lastDiscoveryRunAt,
+    lastBackfillAvailableDatesResult: collectorState.lastBackfillAvailableDatesResult,
     datesWithBasicRows,
     datesWithVerifiedDetails,
     ...detailCounts,
@@ -1198,7 +1222,7 @@ async function buildCoverageDebugPayload() {
     datesFailed,
     datesFailedCount: datesFailed.length,
     failureReasonCounts,
-    lastBackfillAvailableDatesResult: collectorState.lastBackfillAvailableDatesResult,
+    discoveryDiagnostics: collectorState.discoveryDiagnostics,
     dateStatuses: await buildAvailableDatesCoverageStatuses(),
     scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
     effectiveWeeksAhead,
@@ -2634,12 +2658,93 @@ function sessionLookupContext(session) {
   };
 }
 
+function bodyHasConsentBannerCopy(text) {
+  if (!text) return false;
+  const low = String(text).replace(/\s+/g, ' ').trim().toLowerCase();
+  if (low.includes('this website uses cookies')) return true;
+  if (low.includes('allow cookies') && low.includes('refuse cookies')) return true;
+  if (low.includes('allow cookies') && low.includes('refuse')) return true;
+  if (low.includes('accept cookies') && low.includes('cookie')) return true;
+  return false;
+}
+
+function isWeakCookiePolicyNavOnly(text) {
+  if (!text) return false;
+  const low = String(text).replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!low.includes('cookie')) return false;
+  if (bodyHasConsentBannerCopy(low)) return false;
+  return low.includes('cookie policy') || /^cookie policy menu\b/.test(low);
+}
+
 function isCookieBannerText(text) {
   if (!text) return false;
+  if (isWeakCookiePolicyNavOnly(text)) return false;
   const low = String(text).toLowerCase();
-  return (low.includes('cookie') && (low.includes('allow') || low.includes('refuse') || low.includes('consent')))
-    || low.includes('this website uses cookies')
+  return bodyHasConsentBannerCopy(low)
     || (low.includes('refuse cookies') && low.includes('allow cookies'));
+}
+
+function cookieConsentBannerVisibleScript() {
+  return () => {
+    function norm(t) {
+      return String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+    function hasConsentCopy(text) {
+      const t = norm(text);
+      if (t.includes('this website uses cookies')) return true;
+      if (t.includes('allow cookies') && t.includes('refuse cookies')) return true;
+      if (t.includes('allow cookies') && t.includes('refuse')) return true;
+      if (t.includes('accept cookies') && t.includes('cookie')) return true;
+      return false;
+    }
+    function isPolicyNavOnly(text) {
+      const t = norm(text);
+      if (!t.includes('cookie')) return false;
+      if (hasConsentCopy(t)) return false;
+      return t.includes('cookie policy');
+    }
+    function elementVisible(el) {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && parseFloat(style.opacity || '1') > 0.05
+        && rect.width > 40
+        && rect.height > 20;
+    }
+    function hasConsentButtons(root) {
+      let hasAllow = false;
+      let hasRefuse = false;
+      for (const el of root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')) {
+        if (!elementVisible(el)) continue;
+        const t = norm(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+        if (/\ballow cookies\b/.test(t) || /\baccept cookies\b/.test(t) || t === 'accept') hasAllow = true;
+        if (/\brefuse cookies\b/.test(t) || /\breject all\b/.test(t)) hasRefuse = true;
+      }
+      return hasAllow && hasRefuse;
+    }
+
+    const selectors = [
+      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
+      '[class*="gdpr" i]', '[id*="gdpr" i]', '[class*="cc-" i]', '.cc-window', '#cookie-law-info-bar',
+      '[class*="CookieConsent" i]', '#CybotCookiebotDialog', '#onetrust-banner-sdk',
+      'dialog', '[role="dialog"]', '[role="alertdialog"]',
+    ];
+
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!elementVisible(el)) continue;
+        const text = el.innerText || el.textContent || '';
+        if (isPolicyNavOnly(text)) continue;
+        if (hasConsentCopy(text)) return true;
+        if (hasConsentButtons(el)) return true;
+      }
+    }
+
+    const body = document.body?.innerText || '';
+    if (isPolicyNavOnly(body) && !hasConsentCopy(body)) return false;
+    return hasConsentCopy(body) && (norm(body).includes('allow cookies') || norm(body).includes('refuse cookies'));
+  };
 }
 
 function modalTextLooksLikeSessionDetail(text, session) {
@@ -3474,7 +3579,54 @@ function attachCookieDiagnosticsToStats(stats) {
   return stats;
 }
 
-function finalizeEnrichmentStats(stats) {
+function emptyCookieRequestDiagnostics() {
+  return {
+    cookieDismissAttempted: 0,
+    cookieDismissSucceeded: 0,
+    cookieBannerStillVisible: false,
+    cookieClickMethod: null,
+    modalTextAfterCookieDismissSample: null,
+    cookieDismissLastAttempt: null,
+    cookieDismissAttempts: [],
+  };
+}
+
+function buildEnrichmentRunDiagnostics(stats = {}) {
+  const attempted = (stats.sessionsAttempted ?? 0) > 0;
+  const skippedBeforeAttempt = !!stats.skipped && !attempted;
+  const activeBackground = scrapeInProgress || detailEnrichmentInProgress;
+
+  if (skippedBeforeAttempt) {
+    return {
+      currentRequestDiagnostics: emptyCookieRequestDiagnostics(),
+      activeRunDiagnostics: activeBackground
+        ? { ...cookieDiagnosticsPayload(), source: 'active_background_run' }
+        : null,
+    };
+  }
+
+  return {
+    currentRequestDiagnostics: cookieDiagnosticsPayload(),
+    activeRunDiagnostics: null,
+  };
+}
+
+function formatEnrichmentApiResponse(result, extra = {}) {
+  const payload = { ...result, ...extra };
+  const diag = buildEnrichmentRunDiagnostics(result);
+  if (result?.skipped && (result.sessionsAttempted ?? 0) === 0) {
+    delete payload.cookieDismissAttempted;
+    delete payload.cookieDismissSucceeded;
+    delete payload.cookieBannerStillVisible;
+    delete payload.cookieClickMethod;
+    delete payload.modalTextAfterCookieDismissSample;
+    delete payload.cookieDismissLastAttempt;
+    delete payload.cookieDismissAttempts;
+  }
+  return { ...payload, ...diag };
+}
+
+function finalizeEnrichmentStats(stats, { includeCookieDiagnostics = null } = {}) {
   const outcomeTotal = (stats.sessionsUpdatedWithSlots || 0)
     + (stats.sessionsMarkedPacked || 0)
     + (stats.sessionsCheckedOpenNoSlotsVisible || 0)
@@ -3487,7 +3639,9 @@ function finalizeEnrichmentStats(stats) {
     + (stats.sessionsUnchanged || 0);
   stats.outcomeTotal = outcomeTotal;
   stats.outcomeReconciles = stats.sessionsAttempted === 0 || outcomeTotal === stats.sessionsAttempted;
-  attachCookieDiagnosticsToStats(stats);
+  const attachCookies = includeCookieDiagnostics ?? ((stats.sessionsAttempted ?? 0) > 0);
+  if (attachCookies) attachCookieDiagnosticsToStats(stats);
+  Object.assign(stats, buildEnrichmentRunDiagnostics(stats));
   return stats;
 }
 
@@ -5312,55 +5466,15 @@ async function setupBookingBrowserContext(context) {
 }
 
 async function isCookieBannerVisible(page) {
-  return page.evaluate(() => {
-    const body = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
-    const hasCookieCopy = body.includes('this website uses cookies')
-      || (body.includes('cookie') && (body.includes('allow cookies') || body.includes('refuse cookies')));
-    const selectors = [
-      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
-      '[class*="gdpr" i]', '[id*="gdpr" i]', '[class*="cc-" i]', '.cc-window', '#cookie-law-info-bar',
-      '[class*="CookieConsent" i]', '#CybotCookiebotDialog', '#onetrust-banner-sdk',
-    ];
-    for (const sel of selectors) {
-      for (const el of document.querySelectorAll(sel)) {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        const visible = style.display !== 'none'
-          && style.visibility !== 'hidden'
-          && parseFloat(style.opacity || '1') > 0.05
-          && rect.width > 40
-          && rect.height > 20;
-        if (visible) return true;
-      }
-    }
-    return hasCookieCopy && (body.includes('allow cookies') || body.includes('refuse cookies'));
-  }).catch(() => false);
+  return page.evaluate(cookieConsentBannerVisibleScript()).catch(() => false);
 }
 
 async function waitForCookieBannerGone(page, timeout = 6000) {
-  await page.waitForFunction(() => {
-    const body = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
-    const hasBannerText = body.includes('this website uses cookies')
-      || (body.includes('cookie') && body.includes('allow cookies') && body.includes('refuse cookies'));
-    if (!hasBannerText) return true;
-    const selectors = [
-      '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
-      '[class*="gdpr" i]', '.cc-window', '#cookie-law-info-bar', '#CybotCookiebotDialog', '#onetrust-banner-sdk',
-    ];
-    for (const sel of selectors) {
-      for (const el of document.querySelectorAll(sel)) {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        const visible = style.display !== 'none'
-          && style.visibility !== 'hidden'
-          && parseFloat(style.opacity || '1') > 0.05
-          && rect.width > 40
-          && rect.height > 20;
-        if (visible) return false;
-      }
-    }
-    return !hasBannerText;
-  }, { timeout }).catch(() => {});
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (!(await isCookieBannerVisible(page))) return;
+    await page.waitForTimeout(200);
+  }
 }
 
 async function collectCookieBannerContext(frame, frameLabel = 'main') {
@@ -5421,6 +5535,22 @@ async function collectCookieBannerContext(frame, frameLabel = 'main') {
       return /\brefuse cookies\b/.test(t) || /\breject all\b/.test(t) || t === 'decline';
     }
 
+    function hasConsentCopy(text) {
+      const t = low(text);
+      if (t.includes('this website uses cookies')) return true;
+      if (t.includes('allow cookies') && t.includes('refuse cookies')) return true;
+      if (t.includes('allow cookies') && t.includes('refuse')) return true;
+      if (t.includes('accept cookies') && t.includes('cookie')) return true;
+      return false;
+    }
+
+    function isPolicyNavOnly(text) {
+      const t = low(text);
+      if (!t.includes('cookie')) return false;
+      if (hasConsentCopy(t)) return false;
+      return t.includes('cookie policy');
+    }
+
     function findBannerElement(root) {
       const selectors = [
         '[class*="cookie" i]', '[id*="cookie" i]', '[class*="consent" i]', '[id*="consent" i]',
@@ -5432,18 +5562,17 @@ async function collectCookieBannerContext(frame, frameLabel = 'main') {
           const meta = elementMeta(el);
           const text = low(meta.text);
           if (!meta.visible || meta.boundingBox.width < 40) continue;
-          if (text.includes('cookie') || text.includes('consent') || text.includes('this website uses')) {
-            return el;
-          }
+          if (isPolicyNavOnly(text)) continue;
+          if (hasConsentCopy(text)) return el;
+          if (collectCandidates(root, el).length) return el;
         }
       }
-      for (const el of root.querySelectorAll('div, section, aside, footer, dialog, [role="dialog"], [role="alertdialog"]')) {
+      for (const el of root.querySelectorAll('div, section, aside, dialog, [role="dialog"], [role="alertdialog"]')) {
         const meta = elementMeta(el);
         const text = low(meta.text);
         if (!meta.visible || meta.boundingBox.width < 120) continue;
-        if (text.includes('this website uses cookies') || (text.includes('cookie') && text.includes('allow cookies'))) {
-          return el;
-        }
+        if (isPolicyNavOnly(text)) continue;
+        if (hasConsentCopy(text)) return el;
       }
       return null;
     }
@@ -5787,7 +5916,8 @@ async function attemptCookieDismissInFrame(frame, frameLabel, { preferAllow = tr
     attempt.failureReason = 'event_fallback_clicked_but_banner_still_visible';
   }
 
-  attempt.failureReason = attempt.failureReason || 'no_clickable_candidate_matched';
+  attempt.failureReason = attempt.failureReason
+    || (bodyHasConsentBannerCopy(ctx.beforeText) ? 'no_clickable_candidate_matched' : 'no_consent_banner_detected');
   return { success: false, method: attempt.method, attempt };
 }
 
@@ -5832,16 +5962,17 @@ async function clickCookieConsentButton(page) {
 }
 
 async function dismissCookieBanner(page) {
-  cookieDismissDiagnostics.cookieDismissAttempted++;
   const attemptStart = emptyCookieAttemptDiagnostics();
   try {
     if (!(await isCookieBannerVisible(page))) {
       cookieDismissDiagnostics.cookieBannerStillVisible = false;
-      attemptStart.method = 'already_hidden';
+      attemptStart.method = 'no_consent_banner_detected';
+      attemptStart.failureReason = 'no_consent_banner_detected';
       recordCookieAttempt(attemptStart);
-      return { success: true, method: 'already_hidden' };
+      return { success: true, method: 'no_consent_banner_detected' };
     }
 
+    cookieDismissDiagnostics.cookieDismissAttempted++;
     attemptStart.beforeText = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600)).catch(() => null);
     attemptStart.iframeCount = page.frames().length;
 
@@ -7480,19 +7611,61 @@ function maxHorizonDateKey(maxHorizonDays = MAX_BOOKING_HORIZON_DAYS) {
 }
 
 function getDiscoveredAvailableDates() {
-  return collectorState.discoveredAvailableDates || [];
+  return resolveDiscoveredAvailableDates().dates;
 }
 
-function expectedAvailableBookingDates() {
-  const discovered = getDiscoveredAvailableDates();
-  if (discovered.length) return discovered;
+function deriveDiscoveredDatesFromCurrentSessions(dbByDate = null) {
   const today = getParkTodayIso();
   const maxDate = maxHorizonDateKey();
-  return [...new Set(
+  const fromDb = dbByDate && typeof dbByDate === 'object'
+    ? Object.keys(dbByDate).filter(d => (dbByDate[d] || 0) > 0 && d >= today && d <= maxDate)
+    : [];
+  const fromMemory = [...new Set(
     allStoredSessions()
       .map(sessionDateKey)
       .filter(d => d && d >= today && d <= maxDate),
-  )].sort();
+  )];
+  return [...new Set([...fromDb, ...fromMemory])].sort();
+}
+
+function resolveDiscoveredAvailableDates({ dbByDate = null } = {}) {
+  const memory = (collectorState.discoveredAvailableDates || []).filter(Boolean);
+  if (memory.length) {
+    return {
+      dates: [...memory].sort(),
+      source: 'memory',
+      lastDiscoveryRunAt: collectorState.lastDiscoveryAt || null,
+    };
+  }
+
+  const backfill = collectorState.lastBackfillAvailableDatesResult;
+  const backfillDates = backfill?.discoveredAvailableDates;
+  if (Array.isArray(backfillDates) && backfillDates.length) {
+    return {
+      dates: [...backfillDates].sort(),
+      source: 'last_backfill_result',
+      lastDiscoveryRunAt: backfill.completedAt || collectorState.lastDiscoveryAt || null,
+    };
+  }
+
+  const fromSessions = deriveDiscoveredDatesFromCurrentSessions(dbByDate);
+  if (fromSessions.length) {
+    return {
+      dates: fromSessions,
+      source: dbByDate ? 'db' : 'current_sessions_fallback',
+      lastDiscoveryRunAt: collectorState.lastDiscoveryAt || lastSuccessfulScrape || null,
+    };
+  }
+
+  return {
+    dates: [],
+    source: 'none',
+    lastDiscoveryRunAt: collectorState.lastDiscoveryAt || null,
+  };
+}
+
+function expectedAvailableBookingDates() {
+  return resolveDiscoveredAvailableDates().dates;
 }
 
 function clampDateRangeToHorizon(startDate, endDate, maxHorizonDays = MAX_BOOKING_HORIZON_DAYS) {
@@ -9770,13 +9943,12 @@ app.post('/api/admin/enrich-detail-queue', async (req, res) => {
       limit,
       reason: 'admin_enrich_detail_queue',
     });
-    res.json({
+    res.json(formatEnrichmentApiResponse(result, {
       isoDate,
       limit,
       wait: true,
       detailQueueEligibleCount: eligible.length,
-      ...result,
-    });
+    }));
   } catch (e) {
     res.status(500).json({ isoDate, error: e.message, errors: [{ error: e.message }] });
   }
