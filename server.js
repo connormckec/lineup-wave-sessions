@@ -9953,6 +9953,199 @@ async function runDebugEntriesLeftSelectionContract(page, thresholds) {
   return selectionResults;
 }
 
+function scrapeCalendarGridContractSnapshot() {
+  const SESSION_LIKE_RE = /\b(?:AT|AB|ET|EB|PRG|INT|PT|PB|BGN|X)\b/gi;
+  function normalizeText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+  function hashText(text) {
+    let hash = 5381;
+    const normalized = normalizeText(text);
+    for (let i = 0; i < normalized.length; i++) hash = ((hash << 5) + hash) + normalized.charCodeAt(i);
+    return String(hash >>> 0);
+  }
+  function isVisible(el) {
+    if (!el?.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    let node = el;
+    while (node && node !== document.body) {
+      const st = window.getComputedStyle(node);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      node = node.parentElement;
+    }
+    return true;
+  }
+  function findCalendarGridRoot() {
+    const tiles = document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
+    if (tiles.length) {
+      let node = tiles[0];
+      while (node && node !== document.body) {
+        if (node.tagName === 'TABLE') return node;
+        if (node.classList && [...node.classList].some((c) => /dynamic-cal|agenda|calendar|booking/i.test(c))) return node;
+        node = node.parentElement;
+      }
+    }
+    for (const sel of ['table.dynamic-cal', 'table', '.agenda', '[class*="dynamic-cal"]', '.panel-body']) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) return el;
+    }
+    return null;
+  }
+  function countSessionLikeTokens(text) {
+    const matches = normalizeText(text).match(SESSION_LIKE_RE);
+    return matches ? matches.length : 0;
+  }
+
+  const gridRoot = findCalendarGridRoot();
+  const calendarGridText = gridRoot ? normalizeText(gridRoot.innerText || gridRoot.textContent || '') : '';
+  const bodyText = normalizeText(document.body?.innerText || document.body?.textContent || '');
+  const gridTextForCount = calendarGridText || bodyText;
+  const sampleSource = calendarGridText || bodyText;
+
+  return {
+    bodyTextHash: hashText(bodyText),
+    calendarGridTextHash: hashText(calendarGridText),
+    visibleSessionLikeTextCount: countSessionLikeTokens(gridTextForCount),
+    bodyTextSampleAroundGrid: sampleSource.slice(0, 500),
+  };
+}
+
+async function captureCalendarGridContractSnapshot(page) {
+  assertPlaywrightPage(page, 'captureCalendarGridContractSnapshot');
+  return page.evaluate(scrapeCalendarGridContractSnapshot);
+}
+
+function calendarGridContractChanged(before, after) {
+  if (!before || !after) return false;
+  return before.bodyTextHash !== after.bodyTextHash
+    || before.calendarGridTextHash !== after.calendarGridTextHash
+    || before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount;
+}
+
+function classifyCalendarGridChangeReason(before, after) {
+  const reasons = [];
+  if (before.bodyTextHash !== after.bodyTextHash) reasons.push('body_text_hash_changed');
+  if (before.calendarGridTextHash !== after.calendarGridTextHash) reasons.push('calendar_grid_text_hash_changed');
+  if (before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount) {
+    reasons.push('visible_session_like_text_count_changed');
+  }
+  return reasons.length ? reasons.join(',') : 'grid_changed';
+}
+
+function mapEntriesLeftSelectionContractFields(setResult) {
+  return {
+    beforeLabel: setResult?.beforeLabel ?? null,
+    matchingOptionText: setResult?.matchingOptionText ?? null,
+    afterLabel: setResult?.afterLabel ?? null,
+    filterSetOk: setResult?.filterSetOk === true,
+    filterSetError: setResult?.filterSetError ?? null,
+  };
+}
+
+async function waitForCalendarGridChangeAfterThreshold(page, gridBefore, threshold, {
+  timeoutMs = 8000,
+  pollMs = 375,
+} = {}) {
+  assertPlaywrightPage(page, 'waitForCalendarGridChangeAfterThreshold');
+  const started = Date.now();
+  let lastAfter = gridBefore;
+
+  while (Date.now() - started < timeoutMs) {
+    const afterLabel = await readEntriesLeftCurrentLabelFromPage(page);
+    const labelOk = entriesLeftSelectedLabelMatchesThreshold(afterLabel, threshold);
+    const after = await captureCalendarGridContractSnapshot(page);
+    lastAfter = after;
+    if (labelOk && calendarGridContractChanged(gridBefore, after)) {
+      return {
+        gridAfter: after,
+        gridChanged: true,
+        gridChangeReason: classifyCalendarGridChangeReason(gridBefore, after),
+        waitedMs: Date.now() - started,
+        labelOk,
+      };
+    }
+    await page.waitForTimeout(pollMs);
+  }
+
+  const afterLabel = await readEntriesLeftCurrentLabelFromPage(page);
+  const labelOk = entriesLeftSelectedLabelMatchesThreshold(afterLabel, threshold);
+  const gridAfter = lastAfter === gridBefore
+    ? await captureCalendarGridContractSnapshot(page)
+    : lastAfter;
+  const gridChanged = calendarGridContractChanged(gridBefore, gridAfter);
+
+  return {
+    gridAfter,
+    gridChanged,
+    gridChangeReason: gridChanged
+      ? classifyCalendarGridChangeReason(gridBefore, gridAfter)
+      : (labelOk ? 'entries_left_label_set_but_grid_unchanged' : 'entries_left_label_not_verified_after_grid_wait'),
+    waitedMs: Date.now() - started,
+    labelOk,
+  };
+}
+
+async function runEntriesLeftThresholdGridChangeContract(page, threshold, options = {}) {
+  assertPlaywrightPage(page, 'runEntriesLeftThresholdGridChangeContract');
+  const requestedThreshold = Math.max(1, Number(threshold) || 1);
+  const gridBefore = await captureCalendarGridContractSnapshot(page);
+  const setResult = await setEntriesLeftThreshold(page, requestedThreshold, options);
+  const selection = mapEntriesLeftSelectionContractFields(setResult);
+
+  if (!selection.filterSetOk) {
+    const gridAfter = await captureCalendarGridContractSnapshot(page);
+    return {
+      requestedThreshold,
+      selection,
+      gridBefore,
+      gridAfter,
+      gridChanged: calendarGridContractChanged(gridBefore, gridAfter),
+      gridChangeReason: selection.filterSetError || 'selection_failed',
+      waitedMs: 0,
+    };
+  }
+
+  const waitResult = await waitForCalendarGridChangeAfterThreshold(
+    page,
+    gridBefore,
+    requestedThreshold,
+    {
+      timeoutMs: options.gridWaitMs ?? 8000,
+      pollMs: options.gridPollMs ?? 375,
+    },
+  );
+
+  return {
+    requestedThreshold,
+    selection,
+    gridBefore,
+    gridAfter: waitResult.gridAfter,
+    gridChanged: waitResult.gridChanged,
+    gridChangeReason: waitResult.gridChangeReason,
+    waitedMs: waitResult.waitedMs,
+  };
+}
+
+async function runDebugEntriesLeftGridChangeContract(page, thresholds) {
+  const gridChangeResults = [];
+  for (const threshold of thresholds) {
+    const result = await runEntriesLeftThresholdGridChangeContract(page, threshold);
+    gridChangeResults.push(result);
+    if (!result.selection?.filterSetOk) break;
+    await page.waitForTimeout(400);
+  }
+  return gridChangeResults;
+}
+
+function entriesLeftDebugGateForMode(mode) {
+  if (mode === 'grid_change_contract') return 4;
+  if (mode === 'selection_contract') return 3;
+  return 2;
+}
+
 async function runDebugEntriesLeftControl({
   isoDate,
   weekMode = true,
@@ -9961,7 +10154,7 @@ async function runDebugEntriesLeftControl({
   debug = true,
   mode = 'recon',
 } = {}) {
-  const gateNum = mode === 'selection_contract' ? 3 : 2;
+  const gateNum = entriesLeftDebugGateForMode(mode);
   const requestedIsoDate = isoDate;
   const computedWeekStart = getMondayWeekStartIso(isoDate);
   const navigationIsoDate = weekMode ? computedWeekStart : isoDate;
@@ -10048,6 +10241,46 @@ async function runDebugEntriesLeftControl({
         thresholdWriteSafe: false,
         crashed: false,
         error: allOk ? null : (selectionResults.find((r) => !r.filterSetOk)?.filterSetError || 'selection_contract_failed'),
+      };
+    }
+
+    if (mode === 'grid_change_contract') {
+      const gridChangeResults = await runDebugEntriesLeftGridChangeContract(launched.page, thresholds);
+      const selectionOk = gridChangeResults.length > 0
+        && gridChangeResults.every((r) => r.selection?.filterSetOk);
+      const contractOk = selectionOk && gridChangeResults.every((r) => (
+        r.gridChanged === true
+        || (r.gridChanged === false && Boolean(r.gridChangeReason))
+      ));
+      return {
+        gate: 4,
+        mode,
+        dryRun,
+        debug,
+        isoDate: requestedIsoDate,
+        computedWeekStart,
+        navigationIsoDate,
+        weekMode,
+        thresholds,
+        rawMonthLabel: nav.rawMonthLabel,
+        rawDayHeaderTexts: nav.rawDayHeaderTexts,
+        visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
+        targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+        currentUrl: pageDiag.currentUrl,
+        pageTitle: pageDiag.pageTitle,
+        gridChangeResults,
+        gridChangeContractOk: contractOk,
+        durationMs: Date.now() - started,
+        writesPerformed: false,
+        thresholdWriteSafe: false,
+        crashed: false,
+        error: contractOk
+          ? null
+          : (
+            gridChangeResults.find((r) => !r.selection?.filterSetOk)?.selection?.filterSetError
+            || gridChangeResults.find((r) => r.selection?.filterSetOk && !r.gridChangeReason)?.gridChangeReason
+            || 'grid_change_contract_failed'
+          ),
       };
     }
 
@@ -13777,8 +14010,11 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   const wait = req.body?.wait === true || req.query?.wait === 'true';
   const dryRun = req.body?.dryRun !== false;
   const debug = req.body?.debug !== false;
-  const mode = req.body?.mode === 'selection_contract' ? 'selection_contract' : 'recon';
-  const gate = mode === 'selection_contract' ? 3 : 2;
+  const modeRaw = req.body?.mode;
+  const mode = modeRaw === 'selection_contract' || modeRaw === 'grid_change_contract'
+    ? modeRaw
+    : 'recon';
+  const gate = entriesLeftDebugGateForMode(mode);
 
   if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
     return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
@@ -13849,9 +14085,11 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         weekMode,
         thresholds,
         dryRun,
-        message: mode === 'selection_contract'
-          ? 'Entries-left selection contract queued — retry with wait=true'
-          : 'Entries-left control recon queued — retry with wait=true',
+        message: mode === 'grid_change_contract'
+          ? 'Entries-left grid-change contract queued — retry with wait=true'
+          : mode === 'selection_contract'
+            ? 'Entries-left selection contract queued — retry with wait=true'
+            : 'Entries-left control recon queued — retry with wait=true',
       });
     }
 

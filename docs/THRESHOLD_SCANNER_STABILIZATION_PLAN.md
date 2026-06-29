@@ -182,13 +182,30 @@ If N=2 is not selectable: `filterSetError: "entries_left_option_not_found"`, `op
 
 **Only after Gate 3 passes.**
 
-For N=1,2,3 collect:
+For N=1,2,3 collect per threshold:
 
-- `beforeGridHash`, `afterGridHash`
-- `beforeTileCount`, `afterTileCount`
-- `gridChanged`, `visibleTileCount`
+```js
+{
+  requestedThreshold: N,
+  selection: { beforeLabel, matchingOptionText, afterLabel, filterSetOk, filterSetError },
+  gridBefore: { bodyTextHash, calendarGridTextHash, visibleSessionLikeTextCount, bodyTextSampleAroundGrid },
+  gridAfter: { ... },
+  gridChanged: true | false,
+  gridChangeReason,
+  waitedMs
+}
+```
 
-**Acceptance:** Label changes correctly; grid changes or returns explicit reason. No slot inference.
+**Acceptance curl:**
+
+```bash
+curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin/debug-entries-left-control \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-30","weekMode":true,"thresholds":[1,2,3],"dryRun":true,"debug":true,"wait":true,"mode":"grid_change_contract"}' \
+  | jq '{gate,currentUrl,rawMonthLabel,targetDateVisibleFromHeaders,gridChangeResults,writesPerformed,thresholdWriteSafe,error,crashed}'
+```
+
+**Acceptance:** Label changes correctly; grid changes or returns explicit `gridChangeReason`. No slot inference, no writes.
 
 ---
 
