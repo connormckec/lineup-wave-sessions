@@ -10876,7 +10876,117 @@ async function runDebugEntriesLeftThresholdInferenceContract(page, thresholds, {
   };
 }
 
+function runThresholdPresenceInference(visibleByThreshold, maxTested, tileByIdentity) {
+  const presenceByIdentity = buildThresholdPresenceMap(visibleByThreshold, maxTested);
+  const inferences = [];
+
+  for (const [identityKey, thresholdsSeen] of presenceByIdentity.entries()) {
+    const sortedSeen = [...thresholdsSeen].sort((a, b) => a - b);
+    const tile = tileByIdentity.get(identityKey) || null;
+    const inference = inferSlotsFromThresholdPresence(sortedSeen, maxTested, {
+      sessionCode: tile?.sessionCode ?? null,
+    });
+    inferences.push({
+      identityKey,
+      thresholdsSeen: sortedSeen,
+      inference,
+      tile,
+    });
+  }
+
+  return {
+    inferences,
+    exactCount: inferences.filter((row) => row.inference?.thresholdConfidence === 'exact').length,
+    atLeastCount: inferences.filter((row) => row.inference?.thresholdConfidence === 'at_least').length,
+    noMatchCount: inferences.filter((row) => row.inference?.thresholdConfidence === 'no_match').length,
+  };
+}
+
+async function runDebugEntriesLeftFullScanContract(page, {
+  isoDate,
+  navigation,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+} = {}) {
+  const minT = Math.max(1, Number(minThreshold) || 1);
+  const maxT = Math.max(
+    minT,
+    Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+  );
+  const thresholdCandidates = [];
+  for (let t = minT; t <= maxT; t += 1) thresholdCandidates.push(t);
+
+  const visibleByThreshold = new Map();
+  const tileByIdentity = new Map();
+  const thresholdsScanned = [];
+  let thresholdStopReason = null;
+  let thresholdScanMaxReached = null;
+  let scanFailed = false;
+
+  for (const threshold of thresholdCandidates) {
+    const run = await runDebugEntriesLeftThresholdFixtureParse(page, threshold, { isoDate, navigation });
+
+    if (!run.thresholdSelection?.filterSetOk) {
+      thresholdStopReason = run.thresholdSelection?.filterSetError
+        || 'entries_left_option_unavailable_or_not_selected';
+      break;
+    }
+    if (!run.tileParserContractOk) {
+      thresholdStopReason = resolveTileParserContractError(run.tileParserValidation, run.tileParserResult)
+        || 'tile_parser_contract_failed';
+      scanFailed = true;
+      break;
+    }
+
+    thresholdsScanned.push(threshold);
+    thresholdScanMaxReached = threshold;
+    visibleByThreshold.set(threshold, run.identityKeys || new Set());
+    if (run.parseResult) mergeTileByIdentityFromParseResult(tileByIdentity, run.parseResult);
+    await page.waitForTimeout(400);
+  }
+
+  const visibleTileCountsByThreshold = Object.fromEntries(
+    [...visibleByThreshold.entries()].map(([t, keys]) => [t, keys.size]),
+  );
+
+  const maxTested = thresholdScanMaxReached || 0;
+  const inferenceSummary = maxTested > 0
+    ? runThresholdPresenceInference(visibleByThreshold, maxTested, tileByIdentity)
+    : { exactCount: 0, atLeastCount: 0, noMatchCount: 0 };
+  const { exactCount, atLeastCount, noMatchCount } = inferenceSummary;
+
+  const countsNonIncreasing = thresholdCountsNonIncreasing(visibleTileCountsByThreshold, thresholdsScanned);
+  const fullScanContractOk = !scanFailed
+    && thresholdsScanned.length > 0
+    && countsNonIncreasing
+    && exactCount > 0;
+
+  let error = null;
+  if (scanFailed) {
+    error = thresholdStopReason;
+  } else if (!thresholdsScanned.length) {
+    error = thresholdStopReason || 'no_thresholds_scanned';
+  } else if (!countsNonIncreasing) {
+    error = 'visible_tile_counts_increased';
+  } else if (exactCount <= 0) {
+    error = 'no_exact_inferences';
+  }
+
+  return {
+    thresholdsScanned,
+    visibleTileCountsByThreshold,
+    exactCount,
+    atLeastCount,
+    noMatchCount,
+    thresholdStopReason,
+    thresholdScanMaxReached,
+    fullScanContractOk,
+    error,
+  };
+}
+
 function entriesLeftDebugGateForMode(mode) {
+  if (mode === 'full_scan_contract') return 7;
   if (mode === 'threshold_inference_contract') return 6;
   if (mode === 'tile_parser_contract') return 5;
   if (mode === 'grid_change_contract') return 4;
@@ -10889,6 +10999,8 @@ async function runDebugEntriesLeftControl({
   weekMode = true,
   thresholds = [1, 2, 3],
   threshold = 1,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
   dryRun = true,
   debug = true,
   mode = 'recon',
@@ -11102,6 +11214,48 @@ async function runDebugEntriesLeftControl({
         thresholdWriteSafe: false,
         crashed: false,
         error: inferenceRun.error,
+      };
+    }
+
+    if (mode === 'full_scan_contract') {
+      const fullScanRun = await runDebugEntriesLeftFullScanContract(launched.page, {
+        isoDate: requestedIsoDate,
+        navigation: nav,
+        minThreshold,
+        maxThreshold,
+      });
+      return {
+        gate: 7,
+        mode,
+        dryRun,
+        debug,
+        isoDate: requestedIsoDate,
+        computedWeekStart,
+        navigationIsoDate,
+        weekMode,
+        minThreshold: Math.max(1, Number(minThreshold) || 1),
+        maxThreshold: Math.max(
+          1,
+          Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+        ),
+        currentUrl: pageDiag.currentUrl,
+        rawMonthLabel: nav.rawMonthLabel,
+        rawDayHeaderTexts: nav.rawDayHeaderTexts,
+        visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
+        targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+        thresholdsScanned: fullScanRun.thresholdsScanned,
+        visibleTileCountsByThreshold: fullScanRun.visibleTileCountsByThreshold,
+        exactCount: fullScanRun.exactCount,
+        atLeastCount: fullScanRun.atLeastCount,
+        noMatchCount: fullScanRun.noMatchCount,
+        thresholdStopReason: fullScanRun.thresholdStopReason,
+        thresholdScanMaxReached: fullScanRun.thresholdScanMaxReached,
+        fullScanContractOk: fullScanRun.fullScanContractOk,
+        durationMs: Date.now() - started,
+        writesPerformed: false,
+        thresholdWriteSafe: false,
+        crashed: false,
+        error: fullScanRun.error,
       };
     }
 
@@ -14831,6 +14985,12 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   const threshold = req.body?.threshold != null
     ? Math.max(1, parseInt(req.body.threshold, 10) || 1)
     : 1;
+  const minThreshold = req.body?.minThreshold != null
+    ? Math.max(1, parseInt(req.body.minThreshold, 10) || 1)
+    : 1;
+  const maxThreshold = req.body?.maxThreshold != null
+    ? Math.max(1, parseInt(req.body.maxThreshold, 10) || THRESHOLD_SCAN_MAX_DEFAULT)
+    : THRESHOLD_SCAN_MAX_DEFAULT;
   const wait = req.body?.wait === true || req.query?.wait === 'true';
   const dryRun = req.body?.dryRun !== false;
   const debug = req.body?.debug !== false;
@@ -14839,6 +14999,7 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
     || modeRaw === 'grid_change_contract'
     || modeRaw === 'tile_parser_contract'
     || modeRaw === 'threshold_inference_contract'
+    || modeRaw === 'full_scan_contract'
     ? modeRaw
     : 'recon';
   const gate = entriesLeftDebugGateForMode(mode);
@@ -14866,6 +15027,8 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         weekMode,
         thresholds,
         threshold,
+        minThreshold,
+        maxThreshold,
         dryRun,
         debug,
         mode,
@@ -14913,7 +15076,9 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         weekMode,
         thresholds,
         dryRun,
-        message: mode === 'threshold_inference_contract'
+        message: mode === 'full_scan_contract'
+          ? 'Entries-left full scan contract queued — retry with wait=true'
+          : mode === 'threshold_inference_contract'
           ? 'Entries-left threshold inference contract queued — retry with wait=true'
           : mode === 'tile_parser_contract'
           ? 'Entries-left tile parser contract queued — retry with wait=true'
