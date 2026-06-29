@@ -11239,6 +11239,60 @@ function buildGate8SessionLookup(currentSessions) {
   return sessionByIdentityKey;
 }
 
+function buildGate8DateTimeWaveKey(isoDate, timeLabel, waveSide) {
+  if (!isoDate) return null;
+  return `${isoDate}|${normalizeGate8TimeLabelForIdentity(timeLabel)}|${waveSide || '?'}`;
+}
+
+function extractGate8SessionRawField(session, field) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  return raw[field] ?? session[field] ?? null;
+}
+
+function summarizeGate8SameDateTimeWaveCandidate(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  return {
+    session_key: session.key ?? null,
+    identityKey: buildGate8SessionIdentityKey(session),
+    sessionCode: extractGate8SessionCode(session),
+    candidateRawLevel: raw.level ?? session.level ?? session.session_type ?? null,
+    candidateRawSessionLevel: raw.sessionLevel ?? null,
+    candidateRawTitleText: raw.titleText ?? null,
+    candidateRawSourceText: raw.sourceText ?? raw.tileText ?? session.tileText ?? null,
+  };
+}
+
+function findGate8SameDateTimeWaveCandidates(inferenceRow, currentSessions) {
+  const parts = parseIdentityKeyFields(inferenceRow.identityKey);
+  const targetKey = buildGate8DateTimeWaveKey(parts.isoDate, parts.timeLabel, parts.waveSide);
+  if (!targetKey) return [];
+
+  return currentSessions
+    .filter((session) => {
+      const sessionDtWKey = buildGate8DateTimeWaveKey(
+        extractGate8SessionIsoDate(session),
+        extractGate8SessionTimeLabel(session),
+        extractGate8SessionWaveSide(session),
+      );
+      return sessionDtWKey === targetKey;
+    })
+    .map((session) => summarizeGate8SameDateTimeWaveCandidate(session));
+}
+
+function buildGate8UnmatchedInferenceDiagnostic(row, currentSessions) {
+  const sameDateTimeWaveCandidates = findGate8SameDateTimeWaveCandidates(row, currentSessions);
+  return {
+    identityKey: row.identityKey,
+    canonicalIdentityKey: canonicalizeGate8IdentityKey(row.identityKey),
+    thresholdsSeen: row.thresholdsSeen,
+    thresholdConfidence: row.inference?.thresholdConfidence,
+    inferenceSessionCode: parseIdentityKeyFields(row.identityKey).sessionCode,
+    sameDateTimeWaveCandidateCount: sameDateTimeWaveCandidates.length,
+    sameDateTimeWaveCandidates,
+    sameDateTimeWaveCandidate: sameDateTimeWaveCandidates[0] ?? null,
+  };
+}
+
 function buildGate8MatchDiagnostics(inferences, isoDate, currentSessions, sessionByIdentityKey, rowsPrepared) {
   const inferenceForIsoDate = filterGate8InferencesForIsoDate(inferences, isoDate);
   const currentSessionMatchKeys = currentSessions
@@ -11264,12 +11318,9 @@ function buildGate8MatchDiagnostics(inferences, isoDate, currentSessions, sessio
     currentSessionsFetchedForIsoDateCount: currentSessions.length,
     currentSessionMatchKeysSample: currentSessionMatchKeys.slice(0, 12),
     inferenceKeysForIsoDateSample: inferenceForIsoDate.slice(0, 12).map((row) => row.identityKey),
-    unmatchedInferenceSample: unmatchedInference.slice(0, 12).map((row) => ({
-      identityKey: row.identityKey,
-      canonicalIdentityKey: canonicalizeGate8IdentityKey(row.identityKey),
-      thresholdsSeen: row.thresholdsSeen,
-      thresholdConfidence: row.inference?.thresholdConfidence,
-    })),
+    unmatchedInferenceSample: unmatchedInference
+      .slice(0, 12)
+      .map((row) => buildGate8UnmatchedInferenceDiagnostic(row, currentSessions)),
     unmatchedCurrentSessionSample: unmatchedSessions.slice(0, 12).map((session) => ({
       session_key: session.key,
       identityKey: buildGate8SessionIdentityKey(session),
