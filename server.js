@@ -10598,7 +10598,12 @@ function collectIdentityKeysFromParseResult(parseResult) {
 function mergeTileByIdentityFromParseResult(tileByIdentity, parseResult) {
   for (const entry of parseResult?.parsedIdentitiesSample || []) {
     if (entry?.identityKey && !tileByIdentity.has(entry.identityKey)) {
-      tileByIdentity.set(entry.identityKey, entry);
+      tileByIdentity.set(entry.identityKey, enrichTileMetadataFromIdentityKey(entry.identityKey, entry));
+    }
+  }
+  for (const identityKey of parseResult?.identityKeys || []) {
+    if (!tileByIdentity.has(identityKey)) {
+      tileByIdentity.set(identityKey, enrichTileMetadataFromIdentityKey(identityKey));
     }
   }
 }
@@ -10612,21 +10617,64 @@ function thresholdCountsNonIncreasing(visibleTileCountsByThreshold, thresholds) 
   return true;
 }
 
+function parseIdentityKeyFields(identityKey) {
+  const parts = String(identityKey || '').split('|');
+  const isoDate = parts[0] && parts[0] !== '?' ? parts[0] : null;
+  const timeLabel = parts[1] && parts[1] !== '?' ? parts[1] : null;
+  const waveSide = parts[2] && parts[2] !== '?' ? parts[2] : null;
+  const sessionCode = parts[3] && parts[3] !== '?' ? parts[3] : null;
+  return { isoDate, timeLabel, waveSide, sessionCode };
+}
+
+function enrichTileMetadataFromIdentityKey(identityKey, tile = null) {
+  const fromKey = parseIdentityKeyFields(identityKey);
+  return {
+    identityKey,
+    isoDate: tile?.isoDate ?? fromKey.isoDate,
+    timeLabel: tile?.timeLabel ?? fromKey.timeLabel,
+    waveSide: tile?.waveSide ?? fromKey.waveSide,
+    sessionCode: tile?.sessionCode ?? fromKey.sessionCode,
+  };
+}
+
+function evaluateGate6ThresholdFilterEffective(visibleTileCountsByThreshold, thresholds, exactCount) {
+  const counts = thresholds.map((t) => visibleTileCountsByThreshold[t] ?? null);
+  const flatCounts = counts.length > 1
+    && counts.every((c) => c != null && c === counts[0] && c > 0);
+  let hasTileCountDecrease = false;
+  for (let i = 1; i < counts.length; i += 1) {
+    if (counts[i] != null && counts[i - 1] != null && counts[i] < counts[i - 1]) {
+      hasTileCountDecrease = true;
+      break;
+    }
+  }
+  const thresholdFilterNotEffective = flatCounts && exactCount === 0;
+  return {
+    thresholdFilterEffective: !thresholdFilterNotEffective,
+    thresholdFilterNotEffective,
+    flatCounts,
+    hasTileCountDecrease,
+  };
+}
+
 function buildGate6InferenceSamples(inferences, confidence, limit = 12) {
   return inferences
     .filter((row) => row.inference?.thresholdConfidence === confidence)
     .slice(0, limit)
-    .map((row) => ({
-      identityKey: row.identityKey,
-      thresholdsSeen: row.thresholdsSeen,
-      availableEntries: row.inference?.thresholdInferredSlots ?? null,
-      thresholdConfidence: row.inference?.thresholdConfidence,
-      thresholdMaxVisible: row.inference?.thresholdMaxVisible ?? null,
-      sessionCode: row.tile?.sessionCode ?? null,
-      waveSide: row.tile?.waveSide ?? null,
-      isoDate: row.tile?.isoDate ?? null,
-      timeLabel: row.tile?.timeLabel ?? null,
-    }));
+    .map((row) => {
+      const tile = enrichTileMetadataFromIdentityKey(row.identityKey, row.tile);
+      return {
+        identityKey: row.identityKey,
+        thresholdsSeen: row.thresholdsSeen,
+        availableEntries: row.inference?.thresholdInferredSlots ?? null,
+        thresholdConfidence: row.inference?.thresholdConfidence,
+        thresholdMaxVisible: row.inference?.thresholdMaxVisible ?? null,
+        sessionCode: tile.sessionCode,
+        waveSide: tile.waveSide,
+        isoDate: tile.isoDate,
+        timeLabel: tile.timeLabel,
+      };
+    });
 }
 
 async function runDebugEntriesLeftThresholdFixtureParse(page, threshold, { isoDate, navigation } = {}) {
@@ -10775,11 +10823,11 @@ async function runDebugEntriesLeftThresholdInferenceContract(page, thresholds, {
   const atLeastCount = atLeastInferences.length;
   const noMatchCount = inferences.filter((row) => row.inference?.thresholdConfidence === 'no_match').length;
 
-  const writeSafety = evaluateThresholdWriteSafety({
-    thresholdsScanned: thresholdList.filter((t) => visibleByThreshold.has(t)),
+  const filterEval = evaluateGate6ThresholdFilterEffective(
     visibleTileCountsByThreshold,
-    thresholdPresenceBySession,
-  });
+    thresholdList.filter((t) => visibleByThreshold.has(t)),
+    exactCount,
+  );
 
   const selectionOk = thresholdResults.length > 0
     && thresholdResults.every((row) => row.thresholdSelection?.filterSetOk);
@@ -10787,7 +10835,7 @@ async function runDebugEntriesLeftThresholdInferenceContract(page, thresholds, {
     && thresholdResults.every((row) => row.tileParserContractOk);
   const countsNonIncreasing = thresholdCountsNonIncreasing(visibleTileCountsByThreshold, thresholdList);
   const hasInferenceResults = exactCount + atLeastCount > 0;
-  const filterEffective = writeSafety.statusReason !== 'threshold_filter_not_effective';
+  const filterEffective = filterEval.thresholdFilterEffective;
 
   const inferenceContractOk = !stoppedEarly
     && selectionOk
@@ -10808,7 +10856,7 @@ async function runDebugEntriesLeftThresholdInferenceContract(page, thresholds, {
   } else if (!hasInferenceResults) {
     error = 'no_threshold_inferences';
   } else if (!filterEffective) {
-    error = writeSafety.statusReason || 'threshold_filter_not_effective';
+    error = 'threshold_filter_not_effective';
   }
 
   return {
@@ -10822,8 +10870,8 @@ async function runDebugEntriesLeftThresholdInferenceContract(page, thresholds, {
     noMatchCount,
     inferenceContractOk,
     thresholdFilterEffective: filterEffective,
-    pctVisibleAtAllThresholds: writeSafety.pctVisibleAtAllThresholds ?? null,
-    hasTileCountDecrease: writeSafety.hasTileCountDecrease ?? null,
+    flatCounts: filterEval.flatCounts,
+    hasTileCountDecrease: filterEval.hasTileCountDecrease,
     error,
   };
 }
