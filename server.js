@@ -39,6 +39,9 @@ const INTERNAL_BETA = process.env.INTERNAL_BETA_NOTIFICATIONS === 'true';
 const INTERNAL_DEFAULT_NTFY_TOPIC = 'ap-surf-connor-2026';
 const INTERNAL_DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
+const THRESHOLD_SCAN_MAX_DEFAULT = parseInt(process.env.THRESHOLD_SCAN_MAX || '20', 10);
+const THRESHOLD_SCAN_MIN_DEFAULT = 1;
+const THRESHOLD_FILTER_SETTLE_MS = parseInt(process.env.THRESHOLD_FILTER_SETTLE_MS || '1200', 10);
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
 const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5', 10) || 5);
@@ -321,6 +324,7 @@ const collectorState = {
   lastBackfillAvailableDatesResult: null,
   detailQueueDrainScheduled: false,
   lastDetailQueueBatch: null,
+  lastThresholdScanResult: null,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -1201,6 +1205,7 @@ async function buildCoverageDebugPayload() {
   else if (missingDiscoveredDates.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
 
   const detailCounts = computeDetailCountsByDate(discovered.length ? discovered : expected);
+  const thresholdCoverage = computeThresholdCoverageByDate(discovered.length ? discovered : expected);
 
   return {
     parkTodayIso: getParkTodayIso(),
@@ -1260,6 +1265,8 @@ async function buildCoverageDebugPayload() {
     scrapeScheduleEnabled: !!scrapeScheduleEnabled,
     inMemorySessionsCount: sessionsByKey.size,
     inMemoryDatesCount: Object.keys(currentSessionsByDateMap()).length,
+    ...thresholdCoverage,
+    lastThresholdScanResult: collectorState.lastThresholdScanResult,
   };
 }
 
@@ -1769,6 +1776,7 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
       || collectorState.dateCoverageAttempts[isoDate]
       || null,
     ...buildDateDetailQueueDiagnostics(isoDate, list),
+    ...buildDateThresholdDiagnostics(isoDate, list),
     ...cookieDiagnosticsPayload(),
     ...buildDetailAssociationDiagnostics(isoDate, list),
   };
@@ -1955,6 +1963,17 @@ function currentRowToSession(row) {
     detailSourceSessionType: raw.detailSourceSessionType ?? null,
     detailSourceWaveSide: raw.detailSourceWaveSide ?? null,
     tileText: raw.tileText ?? null,
+    thresholdInferredSlots: raw.thresholdInferredSlots ?? null,
+    thresholdMaxVisible: raw.thresholdMaxVisible ?? null,
+    thresholdScanVerified: raw.thresholdScanVerified ?? false,
+    thresholdScanAt: raw.thresholdScanAt ?? null,
+    thresholdScanMaxTested: raw.thresholdScanMaxTested ?? null,
+    thresholdScanMethod: raw.thresholdScanMethod ?? null,
+    thresholdConfidence: raw.thresholdConfidence ?? null,
+    thresholdDiagnostics: raw.thresholdDiagnostics ?? null,
+    modalSlots: raw.modalSlots ?? null,
+    thresholdSlots: raw.thresholdSlots ?? null,
+    slotsAgree: raw.slotsAgree ?? null,
   };
 }
 
@@ -2013,6 +2032,17 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       currentModalTextHash: s.currentModalTextHash ?? null,
       tileClickDiagnostics: s.tileClickDiagnostics ?? null,
       tileText: s.tileText ?? s.detailRawTileText ?? null,
+      thresholdInferredSlots: s.thresholdInferredSlots ?? null,
+      thresholdMaxVisible: s.thresholdMaxVisible ?? null,
+      thresholdScanVerified: s.thresholdScanVerified ?? false,
+      thresholdScanAt: s.thresholdScanAt ?? null,
+      thresholdScanMaxTested: s.thresholdScanMaxTested ?? null,
+      thresholdScanMethod: s.thresholdScanMethod ?? null,
+      thresholdConfidence: s.thresholdConfidence ?? null,
+      thresholdDiagnostics: s.thresholdDiagnostics ?? null,
+      modalSlots: s.modalSlots ?? null,
+      thresholdSlots: s.thresholdSlots ?? null,
+      slotsAgree: s.slotsAgree ?? null,
     },
     last_seen_at: now,
     last_scraped_at: now,
@@ -2898,6 +2928,306 @@ function isDefaultLikeDetailValues(slots, capacity, estimatedBooked) {
   return false;
 }
 
+const THRESHOLD_SESSION_FIELDS = [
+  'thresholdInferredSlots',
+  'thresholdMaxVisible',
+  'thresholdScanVerified',
+  'thresholdScanAt',
+  'thresholdScanMaxTested',
+  'thresholdScanMethod',
+  'thresholdConfidence',
+  'thresholdDiagnostics',
+  'modalSlots',
+  'thresholdSlots',
+  'slotsAgree',
+];
+
+function thresholdFieldOnSession(s, field) {
+  if (!s) return null;
+  if (s[field] != null) return s[field];
+  if (s.raw && s.raw[field] != null) return s.raw[field];
+  return null;
+}
+
+function thresholdConfidenceOnSession(s) {
+  return thresholdFieldOnSession(s, 'thresholdConfidence');
+}
+
+function sessionThresholdScanVerified(s) {
+  if (!s) return false;
+  return s.thresholdScanVerified === true || s.raw?.thresholdScanVerified === true;
+}
+
+function getThresholdInferredSlots(s) {
+  const v = thresholdFieldOnSession(s, 'thresholdInferredSlots');
+  return v == null ? null : Number(v);
+}
+
+function getThresholdScanMaxTested(s) {
+  const v = thresholdFieldOnSession(s, 'thresholdScanMaxTested');
+  return v == null ? THRESHOLD_SCAN_MAX_DEFAULT : Number(v);
+}
+
+function thresholdSlotsTrusted(s) {
+  if (!sessionThresholdScanVerified(s)) return false;
+  const conf = thresholdConfidenceOnSession(s);
+  return conf === 'exact' || conf === 'at_least';
+}
+
+function normalizeTimeForMatch(time) {
+  if (!time || time === '?') return null;
+  return String(time).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function resolveTrustedSlotDisplay(s) {
+  const modalVerified = sessionDetailVerified(s);
+  const modalSlots = modalVerified && !isDefaultLikeDetailValues(s.slots, s.capacity, s.estimatedBooked)
+    ? s.slots
+    : null;
+
+  if (thresholdSlotsTrusted(s)) {
+    const inferred = getThresholdInferredSlots(s);
+    const conf = thresholdConfidenceOnSession(s);
+    const maxTested = getThresholdScanMaxTested(s);
+    if (inferred != null) {
+      return {
+        slots: inferred,
+        source: 'threshold',
+        confidence: conf,
+        atLeast: conf === 'at_least',
+        slotsDisplay: conf === 'at_least' ? `${maxTested}+` : String(inferred),
+        thresholdScanMaxTested: maxTested,
+      };
+    }
+  }
+
+  if (modalVerified && modalSlots != null) {
+    return {
+      slots: modalSlots,
+      source: 'modal',
+      confidence: 'exact',
+      atLeast: false,
+      slotsDisplay: String(modalSlots),
+      thresholdScanMaxTested: null,
+    };
+  }
+
+  return {
+    slots: null,
+    source: null,
+    confidence: null,
+    atLeast: false,
+    slotsDisplay: null,
+    thresholdScanMaxTested: null,
+  };
+}
+
+function slotsComparisonFields(s) {
+  const modalSlots = sessionDetailVerified(s) && s.slots != null ? s.slots : null;
+  const thresholdSlots = thresholdSlotsTrusted(s) ? getThresholdInferredSlots(s) : null;
+  let slotsAgree = null;
+  if (modalSlots != null && thresholdSlots != null) {
+    if (thresholdConfidenceOnSession(s) === 'at_least') {
+      slotsAgree = modalSlots >= thresholdSlots;
+    } else {
+      slotsAgree = modalSlots === thresholdSlots;
+    }
+  }
+  return { modalSlots, thresholdSlots, slotsAgree };
+}
+
+function thresholdDiagnosticsFields(s) {
+  const cmp = slotsComparisonFields(s);
+  return {
+    key: s.key,
+    isoDate: sessionDateKey(s),
+    time: s.time,
+    level: s.level,
+    waveSide: s.waveSide,
+    thresholdInferredSlots: getThresholdInferredSlots(s),
+    thresholdMaxVisible: thresholdFieldOnSession(s, 'thresholdMaxVisible'),
+    thresholdConfidence: thresholdConfidenceOnSession(s),
+    thresholdScanVerified: sessionThresholdScanVerified(s),
+    thresholdScanAt: thresholdFieldOnSession(s, 'thresholdScanAt'),
+    thresholdScanMaxTested: getThresholdScanMaxTested(s),
+    thresholdDiagnostics: thresholdFieldOnSession(s, 'thresholdDiagnostics'),
+    ...cmp,
+  };
+}
+
+function inferThresholdSlotsFromMaxVisible(maxVisible, maxTested, { inBasicScrape = false } = {}) {
+  if (!maxVisible || maxVisible < 1) {
+    if (inBasicScrape) {
+      return {
+        thresholdInferredSlots: null,
+        thresholdMaxVisible: 0,
+        thresholdConfidence: 'no_match',
+        thresholdScanVerified: false,
+        reason: 'not_available_under_filter',
+      };
+    }
+    return {
+      thresholdInferredSlots: null,
+      thresholdMaxVisible: null,
+      thresholdConfidence: 'no_match',
+      thresholdScanVerified: false,
+      reason: 'not_seen_at_any_threshold',
+    };
+  }
+  if (maxVisible >= maxTested) {
+    return {
+      thresholdInferredSlots: maxVisible,
+      thresholdMaxVisible: maxVisible,
+      thresholdConfidence: 'at_least',
+      thresholdScanVerified: true,
+      reason: 'visible_through_max_threshold',
+    };
+  }
+  return {
+    thresholdInferredSlots: maxVisible,
+    thresholdMaxVisible: maxVisible,
+    thresholdConfidence: 'exact',
+    thresholdScanVerified: true,
+    reason: 'disappeared_after_threshold',
+  };
+}
+
+function applyThresholdFieldsToSession(entry, inference, {
+  maxTested,
+  diagnostics = null,
+  overwriteModalSlots = false,
+} = {}) {
+  const now = new Date().toISOString();
+  entry.thresholdInferredSlots = inference.thresholdInferredSlots ?? null;
+  entry.thresholdMaxVisible = inference.thresholdMaxVisible ?? null;
+  entry.thresholdScanVerified = inference.thresholdScanVerified === true;
+  entry.thresholdScanAt = now;
+  entry.thresholdScanMaxTested = maxTested;
+  entry.thresholdScanMethod = 'entries_left_filter';
+  entry.thresholdConfidence = inference.thresholdConfidence || 'failed';
+  entry.thresholdDiagnostics = diagnostics || inference.reason || null;
+
+  const modalVerified = sessionDetailVerified(entry);
+  const modalSlots = modalVerified ? entry.slots : null;
+  const thresholdSlots = thresholdSlotsTrusted(entry) ? entry.thresholdInferredSlots : null;
+  entry.modalSlots = modalSlots;
+  entry.thresholdSlots = thresholdSlots;
+  entry.slotsAgree = slotsComparisonFields(entry).slotsAgree;
+
+  if (!modalVerified && thresholdSlotsTrusted(entry) && overwriteModalSlots !== false) {
+    if (entry.thresholdConfidence === 'exact') {
+      entry.slots = entry.thresholdInferredSlots;
+    }
+  }
+}
+
+function matchThresholdTileToSessions(thresholdTile, candidates) {
+  const list = asSessionArray(candidates);
+  if (!thresholdTile?.key) return { confidence: 'failed', reason: 'missing_threshold_tile_key' };
+
+  const keyMatches = list.filter(s => s.key === thresholdTile.key);
+  if (keyMatches.length === 1) {
+    return { session: keyMatches[0], confidence: 'exact_key', matchMethod: 'session_key' };
+  }
+  if (keyMatches.length > 1) {
+    return {
+      confidence: 'ambiguous',
+      reason: 'duplicate_session_key',
+      candidates: keyMatches,
+      sample: keyMatches.slice(0, 3).map(s => ({ key: s.key, time: s.time, level: s.level, waveSide: s.waveSide })),
+    };
+  }
+
+  const tileTime = normalizeTimeForMatch(thresholdTile.time);
+  const identityMatches = list.filter((s) => {
+    const sameDate = sessionDateKey(s) === thresholdTile.isoDate;
+    const sameTime = tileTime && normalizeTimeForMatch(s.time) === tileTime;
+    const sameType = (s.level || '').trim().toLowerCase() === (thresholdTile.level || '').trim().toLowerCase();
+    const sameSide = !s.waveSide || !thresholdTile.waveSide
+      || s.waveSide === thresholdTile.waveSide;
+    return sameDate && sameTime && sameType && sameSide;
+  });
+
+  if (identityMatches.length === 1) {
+    return {
+      session: identityMatches[0],
+      confidence: 'identity_match',
+      matchMethod: 'iso_date_time_type_side',
+    };
+  }
+  if (identityMatches.length > 1) {
+    return {
+      confidence: 'ambiguous',
+      reason: 'multiple_identity_matches',
+      candidates: identityMatches,
+      sample: identityMatches.slice(0, 3).map(s => ({
+        key: s.key,
+        time: s.time,
+        level: s.level,
+        waveSide: s.waveSide,
+        tileText: s.tileText,
+      })),
+    };
+  }
+
+  return { confidence: 'no_match', reason: 'no_matching_basic_session' };
+}
+
+function buildDateThresholdDiagnostics(isoDate, sessions) {
+  const list = asSessionArray(sessions);
+  const verified = list.filter(s => sessionThresholdScanVerified(s));
+  const exact = list.filter(s => thresholdConfidenceOnSession(s) === 'exact');
+  const atLeast = list.filter(s => thresholdConfidenceOnSession(s) === 'at_least');
+  const ambiguous = list.filter(s => thresholdConfidenceOnSession(s) === 'ambiguous');
+  const noMatch = list.filter(s => thresholdConfidenceOnSession(s) === 'no_match');
+  const comparisons = list
+    .filter(s => sessionDetailVerified(s) || sessionThresholdScanVerified(s))
+    .map((s) => ({ key: s.key, ...slotsComparisonFields(s) }));
+  const disagreementSample = comparisons.filter(c => c.slotsAgree === false).slice(0, 8);
+
+  return {
+    thresholdScanVerifiedCount: verified.length,
+    thresholdExactCount: exact.length,
+    thresholdAtLeastCount: atLeast.length,
+    thresholdAmbiguousCount: ambiguous.length,
+    thresholdNoMatchCount: noMatch.length,
+    thresholdScanSample: verified.slice(0, 8).map(thresholdDiagnosticsFields),
+    thresholdAmbiguousSample: ambiguous.slice(0, 8).map(thresholdDiagnosticsFields),
+    thresholdDuplicateMatchSample: ambiguous
+      .filter(s => (thresholdFieldOnSession(s, 'thresholdDiagnostics') || '').includes('duplicate'))
+      .slice(0, 8)
+      .map(thresholdDiagnosticsFields),
+    modalThresholdComparisonSample: comparisons.slice(0, 8),
+    disagreementSample,
+  };
+}
+
+function computeThresholdCoverageByDate(dates) {
+  const checkDates = asSessionArray(dates);
+  const datesWithThresholdScans = [];
+  const thresholdCountsByDate = {};
+  for (const isoDate of checkDates) {
+    const rows = sessionsForDate(isoDate);
+    const scanned = rows.filter(s => thresholdFieldOnSession(s, 'thresholdScanAt'));
+    if (!scanned.length) continue;
+    datesWithThresholdScans.push(isoDate);
+    thresholdCountsByDate[isoDate] = {
+      total: rows.length,
+      thresholdScanVerified: rows.filter(s => sessionThresholdScanVerified(s)).length,
+      exact: rows.filter(s => thresholdConfidenceOnSession(s) === 'exact').length,
+      atLeast: rows.filter(s => thresholdConfidenceOnSession(s) === 'at_least').length,
+      ambiguous: rows.filter(s => thresholdConfidenceOnSession(s) === 'ambiguous').length,
+      noMatch: rows.filter(s => thresholdConfidenceOnSession(s) === 'no_match').length,
+      lastThresholdScanAt: scanned
+        .map(s => thresholdFieldOnSession(s, 'thresholdScanAt'))
+        .filter(Boolean)
+        .sort()
+        .pop() || null,
+    };
+  }
+  return { datesWithThresholdScans: datesWithThresholdScans.sort(), thresholdCountsByDate };
+}
+
 function applyDetailSourceFields(entry, session, validation) {
   const src = validation?.parsedFromModal || {};
   entry.detailSourceSessionKey = session?.key || null;
@@ -2936,11 +3266,42 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
   if (!s) return s;
   const out = { ...s };
   const verified = sessionDetailVerified(s);
+  const trustedDisplay = resolveTrustedSlotDisplay(s);
   const parserOutput = out.detailParseOutput || out.raw?.detailParseOutput
     || buildParserOutputFromText(out.detailRawText || out.raw?.detailRawText || '');
 
+  out.thresholdInferredSlots = getThresholdInferredSlots(s);
+  out.thresholdMaxVisible = thresholdFieldOnSession(s, 'thresholdMaxVisible');
+  out.thresholdScanVerified = sessionThresholdScanVerified(s);
+  out.thresholdScanAt = thresholdFieldOnSession(s, 'thresholdScanAt');
+  out.thresholdScanMaxTested = getThresholdScanMaxTested(s);
+  out.thresholdScanMethod = thresholdFieldOnSession(s, 'thresholdScanMethod');
+  out.thresholdConfidence = thresholdConfidenceOnSession(s);
+  out.thresholdDiagnostics = thresholdFieldOnSession(s, 'thresholdDiagnostics');
+  out.slotsSource = trustedDisplay.source;
+  out.slotsAtLeast = trustedDisplay.atLeast;
+  out.slotsDisplay = trustedDisplay.slotsDisplay;
+  const cmp = slotsComparisonFields(s);
+  out.modalSlots = cmp.modalSlots;
+  out.thresholdSlots = cmp.thresholdSlots;
+  out.slotsAgree = cmp.slotsAgree;
+
   if (!debug) {
-    if (!verified) {
+    if (trustedDisplay.source === 'threshold') {
+      out.slots = trustedDisplay.slots;
+      out.capacity = null;
+      out.estimatedBooked = null;
+      out.fillRate = null;
+    } else if (verified) {
+      if (isDefaultLikeDetailValues(out.slots, out.capacity, out.estimatedBooked)) {
+        out.slots = null;
+        out.capacity = null;
+        out.estimatedBooked = null;
+        out.fillRate = null;
+        out.detailVerified = false;
+        out.detailConfidence = 'default_suppressed';
+      }
+    } else {
       if (out.detailStatus !== 'checked_packed' || !verified) {
         out.slots = null;
         out.capacity = null;
@@ -2953,13 +3314,6 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
       if (!modalAssociationVerifiedOnSession(s)) {
         out.detailRawText = null;
       }
-    } else if (isDefaultLikeDetailValues(out.slots, out.capacity, out.estimatedBooked)) {
-      out.slots = null;
-      out.capacity = null;
-      out.estimatedBooked = null;
-      out.fillRate = null;
-      out.detailVerified = false;
-      out.detailConfidence = 'default_suppressed';
     }
   }
 
@@ -3254,6 +3608,7 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
     'priceText', 'priceMin', 'priceMax', 'currency',
     'lastDetailedCheckAt', 'detailError', 'detailWarning',
     'detailAttemptCount', 'lastDetailAttemptAt', 'nextDetailRetryAt',
+    ...THRESHOLD_SESSION_FIELDS,
   ];
 
   if (scrapeKind === 'basic' && existing) {
@@ -3981,7 +4336,9 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
         s.level,
         { inferCapacityFromLevel: snapshotType === 'detailed' && s.slots != null },
       );
-      const type = snapshotType === 'detailed' || sessionHasDetailedData(s) ? 'detailed' : 'basic';
+      const type = snapshotType === 'entries_left_threshold'
+        ? 'entries_left_threshold'
+        : (snapshotType === 'detailed' || sessionHasDetailedData(s) ? 'detailed' : 'basic');
       const hour = sessionHourFromSession(s);
       return sanitizeCurrentSessionRow({
         scraped_at: scrapedAt,
@@ -7217,6 +7574,424 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
   return { sessions: out, rawCount, duplicateSkips: rawCount - out.length };
 }
 
+async function scrapeVisibleSessionsFromPage(page, options = {}) {
+  return page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, ...options });
+}
+
+async function setEntriesLeftFilter(page, minThreshold) {
+  await dismissCookieBanner(page).catch(() => {});
+  const n = Math.max(1, Number(minThreshold) || 1);
+
+  let changed = await page.evaluate((threshold) => {
+    const want = new RegExp(`at\\s*least\\s*${threshold}\\s*entries?\\s*left`, 'i');
+    const wantLoose = new RegExp(`\\b${threshold}\\s*entries?\\s*left`, 'i');
+
+    for (const sel of document.querySelectorAll('select')) {
+      for (const opt of sel.options) {
+        const label = (opt.textContent || opt.label || '').replace(/\s+/g, ' ').trim();
+        if (want.test(label) || wantLoose.test(label) || opt.value === String(threshold)) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          sel.dispatchEvent(new Event('input', { bubbles: true }));
+          return { ok: true, method: 'select', label, threshold };
+        }
+      }
+    }
+
+    const clickables = [...document.querySelectorAll('option, li, a, button, span, label, div')];
+    for (const el of clickables) {
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 80) continue;
+      if (want.test(t) || wantLoose.test(t)) {
+        el.click();
+        return { ok: true, method: 'click', label: t, threshold };
+      }
+    }
+
+    const filterLabels = [...document.querySelectorAll('label, span, th, div, button')].filter(el =>
+      /entries?\s*left/i.test(el.textContent || ''),
+    );
+    for (const labelEl of filterLabels) {
+      labelEl.click();
+      const parent = labelEl.closest('form, .panel, .filter, .dropdown, .row, div') || document.body;
+      for (const optEl of parent.querySelectorAll('option, li, a, button, span')) {
+        const t = (optEl.textContent || '').replace(/\s+/g, ' ').trim();
+        if (want.test(t) || wantLoose.test(t)) {
+          optEl.click();
+          return { ok: true, method: 'dropdown_click', label: t, threshold };
+        }
+      }
+    }
+
+    return { ok: false, reason: 'filter_option_not_found', threshold };
+  }, n);
+
+  if (!changed?.ok) {
+    const loc = page.getByText(new RegExp(`At least\\s*${n}\\s*entries?\\s*left`, 'i')).first();
+    if (await loc.count() && await loc.isVisible().catch(() => false)) {
+      await loc.click().catch(() => {});
+      changed = { ok: true, method: 'playwright_text', threshold: n };
+    }
+  }
+
+  if (changed?.ok) {
+    await page.waitForTimeout(THRESHOLD_FILTER_SETTLE_MS);
+    await page.waitForFunction(() =>
+      document.querySelectorAll('div.dynamic-cal-booking-ts').length >= 0,
+    ).catch(() => {});
+  }
+
+  return changed || { ok: false, reason: 'filter_set_failed', threshold: n };
+}
+
+function buildThresholdSurvivalMap(visibleByThreshold, maxTested) {
+  const survival = new Map();
+  for (let t = 1; t <= maxTested; t++) {
+    const visible = visibleByThreshold.get(t) || new Set();
+    for (const key of visible) {
+      survival.set(key, Math.max(survival.get(key) || 0, t));
+    }
+  }
+  return survival;
+}
+
+function matchThresholdResultsToSessions({
+  survivalMap,
+  tileByKey,
+  basicSessions,
+  maxTested,
+}) {
+  const results = [];
+  const ambiguousSamples = [];
+  const matchedSessionKeys = new Set();
+
+  for (const [tileKey, maxVisible] of survivalMap.entries()) {
+    const tile = tileByKey.get(tileKey);
+    if (!tile) continue;
+    const weekCandidates = basicSessions.filter(s => {
+      const dk = sessionDateKey(s);
+      return dk === tile.isoDate;
+    });
+    const match = matchThresholdTileToSessions(tile, weekCandidates);
+    const inference = inferThresholdSlotsFromMaxVisible(maxVisible, maxTested, { inBasicScrape: false });
+
+    if (match.session) {
+      matchedSessionKeys.add(match.session.key);
+      results.push({
+        session: match.session,
+        tile,
+        maxVisible,
+        inference,
+        matchConfidence: match.confidence,
+        matchMethod: match.matchMethod,
+        thresholdConfidence: inference.thresholdConfidence,
+      });
+    } else if (match.confidence === 'ambiguous') {
+      ambiguousSamples.push({ tileKey, maxVisible, ...match });
+      results.push({
+        session: null,
+        tile,
+        maxVisible,
+        inference: {
+          thresholdInferredSlots: null,
+          thresholdMaxVisible: maxVisible,
+          thresholdConfidence: 'ambiguous',
+          thresholdScanVerified: false,
+          reason: match.reason,
+        },
+        matchConfidence: 'ambiguous',
+        ambiguousSample: match.sample,
+      });
+    }
+  }
+
+  for (const basic of basicSessions) {
+    if (matchedSessionKeys.has(basic.key)) continue;
+    const maxVisible = survivalMap.get(basic.key) || 0;
+    const inference = inferThresholdSlotsFromMaxVisible(maxVisible, maxTested, { inBasicScrape: true });
+    results.push({
+      session: basic,
+      tile: null,
+      maxVisible,
+      inference,
+      matchConfidence: inference.thresholdConfidence === 'no_match' ? 'no_match' : 'basic_only',
+      thresholdConfidence: inference.thresholdConfidence,
+    });
+  }
+
+  return { results, ambiguousSamples };
+}
+
+async function scanEntriesLeftThresholdsForWeek(page, {
+  targetIsoDate,
+  thresholds,
+  minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+} = {}) {
+  const minT = Math.max(1, Number(minThreshold) || THRESHOLD_SCAN_MIN_DEFAULT);
+  const maxT = Math.max(minT, Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT);
+  const thresholdList = Array.isArray(thresholds) && thresholds.length
+    ? thresholds.map(t => Number(t)).filter(t => Number.isFinite(t) && t >= minT && t <= maxT).sort((a, b) => a - b)
+    : Array.from({ length: maxT - minT + 1 }, (_, i) => minT + i);
+
+  const report = {
+    targetIsoDate,
+    minThreshold: minT,
+    maxThreshold: maxT,
+    thresholds: thresholdList,
+    navigation: null,
+    visibleWeekStart: null,
+    visibleWeekEnd: null,
+    targetDateVisible: false,
+    filterResults: [],
+    visibleByThreshold: {},
+    survivalMap: {},
+    inferred: [],
+    ambiguousSamples: [],
+    sessionsMatched: 0,
+    sessionsWritten: 0,
+    errors: [],
+    durationMs: 0,
+    method: 'entries_left_filter',
+  };
+
+  const started = Date.now();
+  try {
+    const nav = await navigateCalendarToShowDate(page, targetIsoDate);
+    report.navigation = nav;
+    report.visibleWeekStart = nav.visibleWeekStart;
+    report.visibleWeekEnd = nav.visibleWeekEnd;
+    report.targetDateVisible = nav.targetDateVisible;
+
+    if (!nav.targetDateVisible) {
+      report.errors.push({ error: nav.navigationError || 'target_date_not_visible' });
+      report.durationMs = Date.now() - started;
+      return report;
+    }
+
+    const visibleByThreshold = new Map();
+    const tileByKey = new Map();
+    const filterResults = [];
+
+    for (const threshold of thresholdList) {
+      const filterSet = await setEntriesLeftFilter(page, threshold);
+      filterResults.push({ threshold, ...filterSet });
+      if (!filterSet?.ok) {
+        report.errors.push({ threshold, error: filterSet?.reason || 'filter_set_failed' });
+        continue;
+      }
+
+      const scrape = await scrapeVisibleSessionsFromPage(page, { weekOffset: 0 });
+      const keys = new Set();
+      for (const tile of scrape.sessions || []) {
+        keys.add(tile.key);
+        if (!tileByKey.has(tile.key)) tileByKey.set(tile.key, tile);
+      }
+      visibleByThreshold.set(threshold, keys);
+      report.visibleByThreshold[threshold] = keys.size;
+    }
+
+    report.filterResults = filterResults;
+    const survivalMap = buildThresholdSurvivalMap(visibleByThreshold, maxT);
+    report.survivalMap = Object.fromEntries(survivalMap.entries());
+
+    const weekDates = await getVisibleDateKeysFromPage(page);
+    const basicSessions = weekDates.flatMap(d => sessionsForDate(d));
+    const uniqueBasic = [...new Map(basicSessions.map(s => [s.key, s])).values()];
+
+    const { results, ambiguousSamples } = matchThresholdResultsToSessions({
+      survivalMap,
+      tileByKey,
+      basicSessions: uniqueBasic,
+      maxTested: maxT,
+    });
+
+    report.inferred = results.map(r => ({
+      key: r.session?.key || r.tile?.key || null,
+      isoDate: r.session ? sessionDateKey(r.session) : r.tile?.isoDate,
+      time: r.session?.time || r.tile?.time,
+      level: r.session?.level || r.tile?.level,
+      waveSide: r.session?.waveSide || r.tile?.waveSide,
+      maxVisible: r.maxVisible,
+      thresholdInferredSlots: r.inference?.thresholdInferredSlots,
+      thresholdConfidence: r.inference?.thresholdConfidence,
+      thresholdScanVerified: r.inference?.thresholdScanVerified,
+      matchConfidence: r.matchConfidence,
+      matchMethod: r.matchMethod || null,
+      ambiguousSample: r.ambiguousSample || null,
+    }));
+    report.ambiguousSamples = ambiguousSamples;
+    report.sessionsMatched = results.filter(r => r.session && r.inference?.thresholdScanVerified).length;
+  } catch (e) {
+    report.errors.push({ error: e.message });
+  }
+
+  report.durationMs = Date.now() - started;
+  return report;
+}
+
+async function applyThresholdScanReport(report, { dryRun = true, sourceTier = 2 } = {}) {
+  const writeReport = {
+    dryRun,
+    sessionsEligible: 0,
+    sessionsWritten: 0,
+    rowsUpserted: 0,
+    snapshotsInserted: 0,
+    skippedAmbiguous: 0,
+    skippedNoMatch: 0,
+    skippedNoSession: 0,
+    errors: [],
+  };
+
+  const toWrite = [];
+  for (const item of report.inferred || []) {
+    if (!item.key) {
+      writeReport.skippedNoSession++;
+      continue;
+    }
+    const existing = sessionsByKey.get(item.key);
+    if (!existing) {
+      writeReport.skippedNoSession++;
+      continue;
+    }
+
+    if (item.thresholdConfidence === 'ambiguous') {
+      const entry = { ...existing };
+      applyThresholdFieldsToSession(entry, {
+        thresholdInferredSlots: null,
+        thresholdMaxVisible: item.maxVisible,
+        thresholdConfidence: 'ambiguous',
+        thresholdScanVerified: false,
+        reason: item.ambiguousSample ? 'ambiguous_match' : 'ambiguous',
+      }, {
+        maxTested: report.maxThreshold,
+        diagnostics: item.ambiguousSample || item.matchConfidence,
+        overwriteModalSlots: false,
+      });
+      if (!dryRun) toWrite.push(entry);
+      writeReport.skippedAmbiguous++;
+      continue;
+    }
+
+    if (item.thresholdConfidence === 'no_match') {
+      const entry = { ...existing };
+      applyThresholdFieldsToSession(entry, {
+        thresholdInferredSlots: null,
+        thresholdMaxVisible: item.maxVisible || 0,
+        thresholdConfidence: 'no_match',
+        thresholdScanVerified: false,
+        reason: 'not_available_under_filter',
+      }, {
+        maxTested: report.maxThreshold,
+        diagnostics: 'not_visible_at_threshold_1',
+        overwriteModalSlots: false,
+      });
+      if (!dryRun) toWrite.push(entry);
+      writeReport.skippedNoMatch++;
+      continue;
+    }
+
+    if (!item.thresholdScanVerified) continue;
+    writeReport.sessionsEligible++;
+
+    const entry = { ...existing };
+    applyThresholdFieldsToSession(entry, {
+      thresholdInferredSlots: item.thresholdInferredSlots,
+      thresholdMaxVisible: item.maxVisible,
+      thresholdConfidence: item.thresholdConfidence,
+      thresholdScanVerified: true,
+      reason: item.matchConfidence,
+    }, {
+      maxTested: report.maxThreshold,
+      diagnostics: { matchConfidence: item.matchConfidence, matchMethod: item.matchMethod },
+      overwriteModalSlots: !sessionDetailVerified(entry),
+    });
+
+    if (!dryRun) toWrite.push(entry);
+  }
+
+  if (!dryRun && toWrite.length) {
+    mergeBatchIntoStore(toWrite, sourceTier, { preserveSlots: true, scrapeKind: 'basic' });
+    const upsert = await upsertCurrentSessionsToSupabase(toWrite, sourceTier, { scrapeKind: 'basic' });
+    writeReport.rowsUpserted = upsert.rowsUpserted || 0;
+    if (upsert.error) writeReport.errors.push({ phase: 'upsert', error: upsert.error });
+
+    const snapSessions = toWrite
+      .filter(s => thresholdSlotsTrusted(s))
+      .map(s => ({
+        ...s,
+        slots: s.thresholdInferredSlots,
+      }));
+    if (snapSessions.length) {
+      const snap = await saveAvailabilitySnapshotsToSupabase(snapSessions, sourceTier, {
+        snapshotType: 'entries_left_threshold',
+      });
+      writeReport.snapshotsInserted = snap.snapshotsInserted || 0;
+      if (snap.error) writeReport.errors.push({ phase: 'snapshots', error: snap.error });
+    }
+    writeReport.sessionsWritten = toWrite.length;
+  } else {
+    writeReport.sessionsWritten = 0;
+  }
+
+  return writeReport;
+}
+
+async function runThresholdScanForWeek(page, options = {}) {
+  const report = await scanEntriesLeftThresholdsForWeek(page, options);
+  const write = await applyThresholdScanReport(report, {
+    dryRun: options.dryRun !== false,
+    sourceTier: options.sourceTier || 2,
+  });
+  const combined = {
+    ...report,
+    write,
+    completedAt: new Date().toISOString(),
+  };
+  collectorState.lastThresholdScanResult = combined;
+  return combined;
+}
+
+async function runThresholdScansForDates(page, dates, options = {}) {
+  const scannedWeeks = new Set();
+  const dateResults = [];
+  const errors = [];
+
+  for (const isoDate of asSessionArray(dates).sort()) {
+    const nav = await navigateCalendarToShowDate(page, isoDate);
+    const weekKey = nav.visibleWeekStart || isoDate;
+    if (scannedWeeks.has(weekKey)) {
+      dateResults.push({ isoDate, weekKey, skipped: true, skipReason: 'week_already_scanned' });
+      continue;
+    }
+    scannedWeeks.add(weekKey);
+
+    const result = await runThresholdScanForWeek(page, {
+      ...options,
+      targetIsoDate: isoDate,
+    });
+    dateResults.push({
+      isoDate,
+      weekKey,
+      targetDateVisible: result.targetDateVisible,
+      sessionsMatched: result.sessionsMatched,
+      write: result.write,
+      errors: result.errors,
+    });
+    if (result.errors?.length) errors.push(...result.errors);
+  }
+
+  const summary = {
+    weeksScanned: scannedWeeks.size,
+    dateResults,
+    errors,
+    lastThresholdScanResult: collectorState.lastThresholdScanResult,
+    completedAt: new Date().toISOString(),
+  };
+  collectorState.lastThresholdScanResult = summary;
+  return summary;
+}
+
 async function getCalendarFingerprint(page) {
   return page.evaluate(() => {
     const timestamps = [];
@@ -8127,6 +8902,9 @@ async function runBackfillAvailableDates({
   mode = 'both',
   maxHorizonDays,
   reason = 'admin_backfill_available_dates',
+  dryRun = false,
+  minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
 } = {}) {
   const horizon = Number.isFinite(Number(maxHorizonDays)) && Number(maxHorizonDays) > 0
     ? Math.min(Number(maxHorizonDays), MAX_BOOKING_HORIZON_DAYS * 2)
@@ -8142,6 +8920,12 @@ async function runBackfillAvailableDates({
     snapshotsInserted: 0,
     verifiedDetailsWritten: 0,
     detailValuesSuppressed: 0,
+    thresholdWeeksScanned: 0,
+    thresholdSessionsMatched: 0,
+    thresholdRowsUpserted: 0,
+    thresholdSnapshotsInserted: 0,
+    thresholdDryRun: dryRun,
+    threshold: null,
     discoveryDiagnostics: null,
     detail: null,
     durationMs: 0,
@@ -8160,7 +8944,7 @@ async function runBackfillAvailableDates({
       return report;
     }
 
-    if (mode === 'basic_only' || mode === 'both') {
+    if (mode === 'basic_only' || mode === 'both' || mode === 'basic_plus_threshold') {
       launched = await launchBrowser();
       const { page } = launched;
       await openBookingPage(page);
@@ -8193,6 +8977,51 @@ async function runBackfillAvailableDates({
       }
 
       await saveLatestSnapshotToSupabase();
+    }
+
+    if (mode === 'threshold_slots' || mode === 'basic_plus_threshold') {
+      if (!launched) {
+        launched = await launchBrowser();
+        const { page } = launched;
+        await openBookingPage(page);
+      }
+      await ensureSessionsForStatus();
+      if (!report.discoveredAvailableDates.length) {
+        report.discoveredAvailableDates = getDiscoveredAvailableDates();
+      }
+      if (!report.discoveredAvailableDates.length) {
+        const today = getParkTodayIso();
+        report.discoveredAvailableDates = [...new Set(
+          allStoredSessions()
+            .map(sessionDateKey)
+            .filter(d => d && d >= today),
+        )].sort();
+      }
+
+      if (!report.discoveredAvailableDates.length) {
+        if (mode === 'threshold_slots') {
+          report.skipped = true;
+          report.skipReason = 'no_dates_for_threshold_scan';
+        }
+      } else {
+        const thresholdSummary = await runThresholdScansForDates(launched.page, report.discoveredAvailableDates, {
+          dryRun,
+          minThreshold,
+          maxThreshold,
+          sourceTier: 2,
+        });
+        report.threshold = thresholdSummary;
+        report.thresholdWeeksScanned = thresholdSummary.weeksScanned || 0;
+        report.thresholdSessionsMatched = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.sessionsMatched || 0), 0);
+        report.thresholdRowsUpserted = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.write?.rowsUpserted || 0), 0);
+        report.thresholdSnapshotsInserted = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.write?.snapshotsInserted || 0), 0);
+        if (thresholdSummary.errors?.length) {
+          report.errors.push(...thresholdSummary.errors.slice(0, 5));
+        }
+      }
     }
 
     if (mode === 'verified_detail' || mode === 'both') {
@@ -8423,10 +9252,53 @@ async function runDateRangeBackfill({ startDate, endDate, mode = 'both', reason 
     if (combined.basic.skipped && mode === 'basic_only') {
       combined.skipped = combined.basic.skipped;
       combined.skipReason = combined.basic.skipReason;
+      }
     }
-  }
 
-  if (mode === 'verified_detail' || mode === 'both') {
+    if (mode === 'threshold_slots' || mode === 'basic_plus_threshold') {
+      if (!launched) {
+        launched = await launchBrowser();
+        const { page } = launched;
+        await openBookingPage(page);
+      }
+      await ensureSessionsForStatus();
+      if (!report.discoveredAvailableDates.length) {
+        report.discoveredAvailableDates = getDiscoveredAvailableDates();
+      }
+      if (!report.discoveredAvailableDates.length) {
+        const today = getParkTodayIso();
+        report.discoveredAvailableDates = [...new Set(
+          allStoredSessions()
+            .map(sessionDateKey)
+            .filter(d => d && d >= today),
+        )].sort();
+      }
+
+      if (!report.discoveredAvailableDates.length) {
+        report.skipped = mode === 'threshold_slots';
+        if (mode === 'threshold_slots') report.skipReason = 'no_dates_for_threshold_scan';
+      } else {
+        const thresholdSummary = await runThresholdScansForDates(launched.page, report.discoveredAvailableDates, {
+          dryRun,
+          minThreshold,
+          maxThreshold,
+          sourceTier: 2,
+        });
+        report.threshold = thresholdSummary;
+        report.thresholdWeeksScanned = thresholdSummary.weeksScanned || 0;
+        report.thresholdSessionsMatched = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.sessionsMatched || 0), 0);
+        report.thresholdRowsUpserted = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.write?.rowsUpserted || 0), 0);
+        report.thresholdSnapshotsInserted = (thresholdSummary.dateResults || [])
+          .reduce((sum, dr) => sum + (dr.write?.snapshotsInserted || 0), 0);
+        if (thresholdSummary.errors?.length) {
+          report.errors.push(...thresholdSummary.errors.slice(0, 5));
+        }
+      }
+    }
+
+    if (mode === 'verified_detail' || mode === 'both') {
     combined.detail = await runDateRangeBackfillVerifiedDetail(start, end, {
       reason: `${reason}_detail`,
     });
@@ -9484,9 +10356,18 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
   const maxHorizonDays = req.body?.maxHorizonDays != null
     ? parseInt(req.body.maxHorizonDays, 10)
     : undefined;
+  const dryRun = req.body?.dryRun === true;
+  const minThreshold = req.body?.minThreshold != null
+    ? parseInt(req.body.minThreshold, 10)
+    : THRESHOLD_SCAN_MIN_DEFAULT;
+  const maxThreshold = req.body?.maxThreshold != null
+    ? parseInt(req.body.maxThreshold, 10)
+    : THRESHOLD_SCAN_MAX_DEFAULT;
 
-  if (!['basic_only', 'verified_detail', 'both'].includes(mode)) {
-    return res.status(400).json({ error: 'mode must be basic_only, verified_detail, or both' });
+  if (!['basic_only', 'verified_detail', 'both', 'threshold_slots', 'basic_plus_threshold'].includes(mode)) {
+    return res.status(400).json({
+      error: 'mode must be basic_only, verified_detail, both, threshold_slots, or basic_plus_threshold',
+    });
   }
 
   try {
@@ -9501,6 +10382,9 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
         mode,
         wait: false,
         maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
+        dryRun,
+        minThreshold,
+        maxThreshold,
         message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
       });
     }
@@ -9518,6 +10402,9 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
       mode,
       maxHorizonDays,
       reason: 'admin_backfill_available_dates',
+      dryRun,
+      minThreshold,
+      maxThreshold,
     }).then(async (result) => {
       await refreshCoverageFlags().catch(() => {});
       return result;
@@ -9533,7 +10420,10 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
         wait: false,
         mode,
         maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
-        message: 'Backfill queued — poll GET /api/debug/coverage (discoveredAvailableDates, lastBackfillAvailableDatesResult)',
+        dryRun,
+        minThreshold,
+        maxThreshold,
+        message: 'Backfill queued — poll GET /api/debug/coverage (discoveredAvailableDates, lastBackfillAvailableDatesResult, lastThresholdScanResult)',
       });
     }
 
@@ -9544,6 +10434,9 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
       wait: true,
       mode,
       maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
+      dryRun,
+      minThreshold,
+      maxThreshold,
       ...result,
     });
   } catch (e) {
@@ -9552,6 +10445,122 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
       errors: [{ error: e.message }],
       mode,
     });
+  }
+});
+
+app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
+  const isoDate = req.body?.isoDate;
+  const weekMode = req.body?.weekMode !== false;
+  const minThreshold = req.body?.minThreshold != null
+    ? parseInt(req.body.minThreshold, 10)
+    : THRESHOLD_SCAN_MIN_DEFAULT;
+  const maxThreshold = req.body?.maxThreshold != null
+    ? parseInt(req.body.maxThreshold, 10)
+    : THRESHOLD_SCAN_MAX_DEFAULT;
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+  const dryRun = req.body?.dryRun !== false;
+
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+    return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
+  }
+
+  const runScan = async () => {
+    if (!tryAcquireScrapeLock('entries-left threshold scan', 0)) {
+      return {
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        isoDate,
+        weekMode,
+        dryRun,
+      };
+    }
+
+    let launched = null;
+    try {
+      await ensureSessionsForStatus();
+      launched = await launchBrowser();
+      const { page } = launched;
+      await openBookingPage(page);
+
+      const result = weekMode
+        ? await runThresholdScanForWeek(page, {
+          targetIsoDate: isoDate,
+          minThreshold,
+          maxThreshold,
+          dryRun,
+          sourceTier: 2,
+        })
+        : await runThresholdScansForDates(page, [isoDate], {
+          minThreshold,
+          maxThreshold,
+          dryRun,
+          sourceTier: 2,
+        });
+
+      await refreshCoverageFlags().catch(() => {});
+      return {
+        skipped: false,
+        isoDate,
+        weekMode,
+        dryRun,
+        minThreshold,
+        maxThreshold,
+        ...result,
+      };
+    } finally {
+      releaseScrapeLock();
+      if (launched?.browser) await launched.browser.close().catch(() => {});
+    }
+  };
+
+  try {
+    if (scrapeInProgress && !wait) {
+      return res.json({
+        started: false,
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        isoDate,
+        weekMode,
+        dryRun,
+        message: 'Another scrape is running — retry with wait=true',
+      });
+    }
+
+    if (wait && scrapeInProgress) {
+      await new Promise((resolve) => {
+        const poll = setInterval(() => {
+          if (!scrapeInProgress) { clearInterval(poll); resolve(); }
+        }, 1000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 300_000);
+      });
+    }
+
+    if (!wait) {
+      setImmediate(() => {
+        runScan().catch((err) => console.error('scan-entries-left-thresholds error:', err));
+      });
+      return res.json({
+        started: true,
+        queued: true,
+        wait: false,
+        isoDate,
+        weekMode,
+        dryRun,
+        minThreshold,
+        maxThreshold,
+        message: 'Threshold scan queued — poll GET /api/debug/coverage (lastThresholdScanResult)',
+      });
+    }
+
+    const result = await runScan();
+    res.json({
+      started: true,
+      queued: false,
+      wait: true,
+      ...result,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, isoDate, weekMode, dryRun });
   }
 });
 

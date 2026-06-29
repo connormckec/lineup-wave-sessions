@@ -82,7 +82,19 @@ curl -X POST https://YOUR-APP/api/admin/backfill-available-dates \
 curl https://YOUR-APP/api/debug/coverage
 ```
 
-`POST /api/admin/backfill-available-dates` discovers every date the booking calendar exposes, then scrapes them. Inputs: `mode` (`basic_only` | `verified_detail` | `both`), `wait`, and optional `maxHorizonDays` (safety guardrail, default 120). Basic rows are always upserted even when detail verification fails. `POST /api/admin/backfill-date-range` remains available for explicit start/end ranges (clamped to `maxHorizonDays`).
+`POST /api/admin/backfill-available-dates` discovers every date the booking calendar exposes, then scrapes them. Inputs: `mode` (`basic_only` | `verified_detail` | `both` | `threshold_slots` | `basic_plus_threshold`), `wait`, optional `dryRun`, `minThreshold` / `maxThreshold` (entries-left filter, default 1–20), and optional `maxHorizonDays` (safety guardrail, default 120). Basic rows are always upserted even when detail verification fails. `POST /api/admin/backfill-date-range` remains available for explicit start/end ranges (clamped to `maxHorizonDays`).
+
+**Experimental entries-left threshold scanner** (infers slot counts without opening modals):
+
+```bash
+curl -X POST https://YOUR-APP/api/admin/scan-entries-left-thresholds \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-28","weekMode":true,"minThreshold":1,"maxThreshold":20,"wait":true,"dryRun":true}'
+```
+
+Set `"dryRun": false` to write threshold-inferred slots to `current_sessions` (stored in session `raw`) and insert `availability_snapshots` with `snapshot_type = entries_left_threshold`. The basic scraper and verified modal detail queue remain unchanged.
+
+**Slot display trust hierarchy:** (1) threshold scan when `thresholdScanVerified` and confidence `exact`/`at_least` — shows *X spots left* or *20+ spots left*; (2) verified modal detail; (3) *Open · details unavailable* (never fake 10/12/2 defaults).
 
 **Railway:** Disable **Serverless / App Sleep** — otherwise Tier 2/3 scrapes pause until someone opens the app. Long-term: separate web API service + scraper worker.
 
@@ -103,7 +115,7 @@ Two scrape levels run in parallel:
 - `POST /api/admin/enrich-detail-queue` with `{ "isoDate": "2026-06-29", "limit": 20, "wait": true }` drains the verified detail queue for one date (sequential modal checks, retry backoff).
 - `POST /api/admin/enrich-all-available-details` with `{ "limitPerDate": 20, "wait": true }` processes the queue across all discovered booking dates.
 
-Basic scrapes upsert schedule rows only; a **background verified detail queue** enriches open sessions separately. Slot counts appear only when `detailVerified: true`. Failed attempts retry with exponential backoff (`detailAttemptCount`, `nextDetailRetryAt` in session raw).
+Basic scrapes upsert schedule rows only; a **background verified detail queue** enriches open sessions separately. Slot counts appear when threshold scan is verified (`thresholdScanVerified` + `exact`/`at_least`) or when `detailVerified: true` from modal enrichment. Failed attempts retry with exponential backoff (`detailAttemptCount`, `nextDetailRetryAt` in session raw).
 
 **Schedule:**
 

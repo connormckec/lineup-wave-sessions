@@ -76,7 +76,50 @@ done
 4. Arrow through those dates in the UI — sessions should render (or *Showing saved snapshot* for fallback data).
 5. After Tier 1 runs, confirm future dates **do not disappear**.
 6. Wait for or trigger Tier 2 — confirm all site-available dates populate in `currentSessionsByDate`.
-7. **Acceptance:** If the site exposes sessions through July 10 or beyond, those dates appear in `discoveredAvailableDates` and `/api/sessions?date=YYYY-MM-DD` returns basic rows. Dates not on the booking site are not app failures. Tomorrow shows slot counts only when modal association is verified; otherwise UI shows *Open · details unavailable* (no default 10/12/2 values). `POST /api/admin/backfill-available-dates` with `mode: both` must not wipe existing good today/tomorrow basic rows.
+7. **Acceptance:** If the site exposes sessions through July 10 or beyond, those dates appear in `discoveredAvailableDates` and `/api/sessions?date=YYYY-MM-DD` returns basic rows. Dates not on the booking site are not app failures. Tomorrow shows slot counts when threshold scan is verified or modal association is verified; otherwise UI shows *Open · details unavailable* (no default 10/12/2 values). `POST /api/admin/backfill-available-dates` with `mode: both` must not wipe existing good today/tomorrow basic rows.
+
+---
+
+### Entries-left threshold slot scanner (experimental)
+
+Dry-run a week scan (does not write):
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/scan-entries-left-thresholds \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-28","weekMode":true,"minThreshold":1,"maxThreshold":20,"wait":true,"dryRun":true}' | jq
+```
+
+Write inferred slots + snapshots:
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/scan-entries-left-thresholds \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-28","weekMode":true,"wait":true,"dryRun":false}' | jq '.write, .inferred | length'
+```
+
+Backfill all discovered dates with threshold inference:
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/backfill-available-dates \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"threshold_slots","wait":true}' | jq '.thresholdWeeksScanned, .thresholdSessionsMatched'
+```
+
+Debug coverage:
+
+```bash
+curl -s http://localhost:3000/api/debug/coverage | jq '{datesWithThresholdScans,thresholdCountsByDate,lastThresholdScanResult}'
+curl -s http://localhost:3000/api/debug/date/2026-06-28 | jq '{thresholdScanVerifiedCount,thresholdExactCount,thresholdAtLeastCount,thresholdAmbiguousCount,thresholdNoMatchCount,disagreementSample}'
+```
+
+**Acceptance:**
+
+- Week threshold scan infers slots for many sessions without opening modals.
+- If a tile disappears after threshold N, inferred slots = N (`thresholdConfidence: exact`).
+- If visible through max threshold (20), API/UI show *20+ spots left* (`at_least`), not fake exact 20.
+- Basic rows remain intact; verified modal values are not overwritten unless modal is unverified.
+- No fake/default 10/12/2 slot values.
 
 **Railway:** App Sleep must be disabled for continuous background collection.
 

@@ -1319,12 +1319,42 @@ function sessionDetailVerified(s) {
   return s?.detailVerified === true;
 }
 
+function sessionThresholdSlotsTrusted(s) {
+  return s?.thresholdScanVerified === true
+    && (s?.thresholdConfidence === 'exact' || s?.thresholdConfidence === 'at_least');
+}
+
+function trustedSlotsForSession(s, hist) {
+  if (sessionThresholdSlotsTrusted(s)) {
+    return {
+      slots: s.thresholdInferredSlots ?? s.slots ?? null,
+      atLeast: s.thresholdConfidence === 'at_least' || s.slotsAtLeast === true,
+      maxTested: s.thresholdScanMaxTested ?? null,
+      source: 'threshold',
+    };
+  }
+  if (sessionDetailVerified(s)) {
+    return {
+      slots: s.slots ?? hist?.slots ?? null,
+      atLeast: false,
+      maxTested: null,
+      source: 'modal',
+    };
+  }
+  return { slots: null, atLeast: false, maxTested: null, source: null };
+}
+
 function formatBookedLine(s, hist) {
-  if (!sessionDetailVerified(s)) return '';
-  if (!s.available || s.slots === 0) return '';
-  const slots = s.slots ?? hist?.slots;
-  if (slots == null) return '';
-  if (s.capacity != null && s.estimatedBooked != null) {
+  const trusted = trustedSlotsForSession(s, hist);
+  if (!trusted.slots && trusted.slots !== 0) return '';
+  if (!sessionDetailVerified(s) && !sessionThresholdSlotsTrusted(s)) return '';
+  if (!s.available || trusted.slots === 0) return '';
+  const slots = trusted.slots;
+  if (trusted.atLeast) {
+    const max = trusted.maxTested || slots;
+    return `${max}+ spots left`;
+  }
+  if (sessionDetailVerified(s) && s.capacity != null && s.estimatedBooked != null) {
     return `${s.estimatedBooked}/${s.capacity} booked · ${slots} spot${slots === 1 ? '' : 's'} left`;
   }
   return `${slots} spot${slots === 1 ? '' : 's'} left`;
@@ -1337,6 +1367,7 @@ function isDetailFailedStatus(status) {
 function formatDetailStatusLine(s) {
   const status = s.detailStatus || s.detail_status;
   if (!s.available && s.slots !== 0) return '';
+  if (sessionThresholdSlotsTrusted(s)) return '';
   if (sessionDetailVerified(s) && (s.slots != null || s.capacity != null || s.priceText || s.priceMin != null)) return '';
   if (status === 'checking') return 'details pending';
   if (isDetailFailedStatus(status)) return 'details unavailable';
@@ -1794,16 +1825,20 @@ function hexAlpha(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
-function formatSpotCountShort(slots) {
+function formatSpotCountShort(slots, s) {
   if (slots == null) return null;
+  if (s?.thresholdConfidence === 'at_least' || s?.slotsAtLeast) {
+    const max = s?.thresholdScanMaxTested || slots;
+    return `${max}+ spots left`;
+  }
   if (slots === 1) return '1 spot left';
   return `${slots} spots left`;
 }
 
 function sessionConditionDisplay(s, hist) {
-  const verified = sessionDetailVerified(s);
-  const slots = verified ? (s.slots ?? hist?.slots) : null;
-  if (!s.available || (verified && s.slots === 0)) {
+  const trusted = trustedSlotsForSession(s, hist);
+  const slots = trusted.slots;
+  if (!s.available || slots === 0) {
     return { primary: 'Packed', sub: null, desktop: 'Packed', color: '#5d8aa8', slots: 0 };
   }
   if (slots == null) {
@@ -1817,7 +1852,7 @@ function sessionConditionDisplay(s, hist) {
       slots: null,
     };
   }
-  const primary = formatSpotCountShort(slots);
+  const primary = formatSpotCountShort(slots, s);
   let sub = null;
   let desktop = primary;
   let color = '#00c9a7';
@@ -2214,7 +2249,7 @@ function sessionCardHtml(s) {
   const cfg     = LEVELS[s.level] || { s:'?', c:'#5d8aa8' };
   const watched = isWatched(s.key);
   const hist    = data.history[s.key] || {};
-  const slots   = sessionDetailVerified(s) ? (s.slots ?? hist.slots) : null;
+  const slots   = trustedSlotsForSession(s, hist).slots;
   const display = sessionConditionDisplay(s, hist);
   const dimmed  = !s.available;
   const tint    = hexAlpha(cfg.c, dimmed ? .04 : .12);
