@@ -271,6 +271,16 @@ curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin
 
 **Acceptance:** Excludes X cells, day headers, time labels, filter chips, hidden/stale DOM; dedupes parent/child; visible tile text wins over title metadata; `countsByWaveSide` includes both `left` and `right`; `parsedCount > 0`. Failures still return full `gridSnapshot`, `tileParserResult`, and `tileParserValidation` diagnostics. No inference, no writes.
 
+### Gate 5A — Frozen fixture capture (local)
+
+Stop live Railway parser debugging; capture repeatable evidence locally:
+
+```bash
+node scripts/capture-calendar-fixtures.js --isoDate=2026-06-30 --weekMode=true --thresholds=1,2,3
+```
+
+Writes `fixtures/atlantic/<isoDate>/threshold-N.{html,png,dom.json,network.json}` plus `capture-summary.json`. Inspect screenshots, DOM fixture structure, and network responses before continuing parser work.
+
 ---
 
 ## Gate 6 — Threshold inference contract

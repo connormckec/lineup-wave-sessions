@@ -16377,7 +16377,24 @@ async function startServer() {
   });
 }
 
-startServer().catch((e) => {
-  console.error('Server startup failed:', e.message);
-  process.exit(1);
-});
+const calendarFixtureHelpers = {
+  launchBrowser,
+  openBookingPageForThreshold,
+  waitForThresholdCalendarShell,
+  navigateCalendarToShowDate,
+  normalizeBookingFiltersOnPage,
+  setEntriesLeftThreshold,
+  dismissEntriesLeftPopup,
+  getMondayWeekStartIso,
+  safeCloseBrowser,
+  THRESHOLD_FILTER_SETTLE_MS,
+};
+
+if (require.main === module) {
+  startServer().catch((e) => {
+    console.error('Server startup failed:', e.message);
+    process.exit(1);
+  });
+} else {
+  module.exports = calendarFixtureHelpers;
+}
