@@ -195,6 +195,7 @@ async function main() {
     const networkAnalysis = analyzeNetworkForSummary(allNetworkEntries);
     captureSummary.networkDataCandidateFound = networkAnalysis.networkDataCandidateFound;
     captureSummary.candidateResponses = networkAnalysis.candidateResponses;
+    captureSummary.thresholdsSummary = captureSummary.thresholdCaptures;
     captureSummary.finishedAt = new Date().toISOString();
     captureSummary.ok = captureSummary.thresholdCaptures.every(
       (item) => item.selection?.filterSetOk && item.domSummary?.hasLeftWaveHeader && item.domSummary?.hasRightWaveHeader,

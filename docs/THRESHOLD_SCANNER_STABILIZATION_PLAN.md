@@ -279,7 +279,15 @@ Stop live Railway parser debugging; capture repeatable evidence locally:
 node scripts/capture-calendar-fixtures.js --isoDate=2026-06-30 --weekMode=true --thresholds=1,2,3
 ```
 
-Writes `fixtures/atlantic/<isoDate>/threshold-N.{html,png,dom.json,network.json}` plus `capture-summary.json`. Inspect screenshots, DOM fixture structure, and network responses before continuing parser work.
+Writes `fixtures/atlantic/<isoDate>/threshold-N.{html,png,dom.json,network.json}` plus `capture-summary.json` (`thresholdCaptures` and `thresholdsSummary`). Inspect screenshots, DOM fixture structure, and network responses before continuing parser work.
+
+### Gate 5B — Local fixture parser harness
+
+```bash
+node scripts/test-calendar-tile-parser-fixture.js fixtures/atlantic/2026-06-30/threshold-1-dom.json | jq
+```
+
+Parses frozen DOM JSON only (no Playwright). Use to debug tile identity extraction before touching the live Gate 5 route.
 
 ---
 
