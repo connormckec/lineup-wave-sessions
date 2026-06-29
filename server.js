@@ -7861,6 +7861,11 @@ function scrapeCalendarHeaderDates() {
   const DAY_HEADER_RE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.?\s+(\d{1,2})$/i;
   const MONTH_YEAR_RE = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})$/i;
   const MONTH_YEAR_LOOSE_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b/i;
+  const WEEKDAY_BODY_RE = /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/i;
+
+  function normalizeText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
 
   function isoFromParts(year, monthIndex, day) {
     if (!year || monthIndex == null || !day) return null;
@@ -7872,7 +7877,7 @@ function scrapeCalendarHeaderDates() {
   }
 
   function parseMonthYearLabel(text) {
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const t = normalizeText(text);
     const exact = t.match(MONTH_YEAR_RE);
     if (exact) {
       const month = MONTH_NAMES[exact[1].toLowerCase()];
@@ -7887,7 +7892,7 @@ function scrapeCalendarHeaderDates() {
   }
 
   function parseDayHeaderText(text) {
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const t = normalizeText(text);
     const m = t.match(DAY_HEADER_RE);
     if (!m) return null;
     return {
@@ -7897,15 +7902,26 @@ function scrapeCalendarHeaderDates() {
     };
   }
 
+  function isElementVisible(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) {
+      return false;
+    }
+    return true;
+  }
+
   function findRawMonthLabel() {
     const selectors = 'button, .btn, a[role="button"], [class*="month"], .dropdown-toggle, span, div, label';
     for (const el of document.querySelectorAll(selectors)) {
-      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      const t = normalizeText(el.textContent);
       if (!t || t.length > 40) continue;
       if (MONTH_YEAR_RE.test(t)) return t;
     }
     for (const el of document.querySelectorAll(selectors)) {
-      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      const t = normalizeText(el.textContent);
       if (!t || t.length > 40) continue;
       const m = t.match(MONTH_YEAR_LOOSE_RE);
       if (m) return `${m[1]} ${m[2]}`;
@@ -7913,44 +7929,170 @@ function scrapeCalendarHeaderDates() {
     return null;
   }
 
-  function collectRawDayHeaderTexts() {
-    const texts = [];
+  function findLayoutAnchors() {
+    let waveHeadingBottom = 0;
+    let firstTimeRowTop = Infinity;
+    for (const el of document.querySelectorAll('*')) {
+      if (!isElementVisible(el)) continue;
+      const t = normalizeText(el.textContent);
+      if (/left wave sessions|right wave sessions/i.test(t) && t.length < 50) {
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom > waveHeadingBottom) waveHeadingBottom = rect.bottom;
+      }
+      if (/^\d{1,2}(:\d{2})?\s*(am|pm)$/i.test(t) || /^0?6\s*am$/i.test(t) || /^06\s*am$/i.test(t)) {
+        const rect = el.getBoundingClientRect();
+        if (rect.top > 0 && rect.top < firstTimeRowTop) firstTimeRowTop = rect.top;
+      }
+    }
+    return { waveHeadingBottom, firstTimeRowTop };
+  }
+
+  function passesLayoutFilter(rect, anchors, { strict = false } = {}) {
+    if (anchors.waveHeadingBottom > 0 && rect.top < anchors.waveHeadingBottom - 12) {
+      if (strict) return false;
+    }
+    if (Number.isFinite(anchors.firstTimeRowTop) && anchors.firstTimeRowTop < Infinity
+      && rect.top > anchors.firstTimeRowTop + 8) {
+      if (strict) return false;
+    }
+    return true;
+  }
+
+  function makeCandidate(el, source, anchors, { strictLayout = false } = {}) {
+    if (!isElementVisible(el)) return null;
+    const rect = el.getBoundingClientRect();
+    if (!passesLayoutFilter(rect, anchors, { strict: strictLayout })) return null;
+    const norm = normalizeText(el.innerText || el.textContent || '');
+    if (!norm || norm.length > 40) return null;
+    const parsed = parseDayHeaderText(norm);
+    if (!parsed) return null;
+    return {
+      ...parsed,
+      source,
+      top: Math.round(rect.top),
+      left: Math.round(rect.left),
+    };
+  }
+
+  function collectBodyWeekdayTextSample() {
+    const samples = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll('body *')) {
+      if (!isElementVisible(el)) continue;
+      const t = normalizeText(el.innerText || el.textContent || '');
+      if (!t || t.length > 100) continue;
+      const hasWeekday = WEEKDAY_BODY_RE.test(t);
+      const hasDayNum = /\b\d{1,2}\b/.test(t);
+      if (!hasWeekday && !hasDayNum) continue;
+      if (!hasWeekday && hasDayNum) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      samples.push(t);
+      if (samples.length >= 30) break;
+    }
+    return samples;
+  }
+
+  function collectDayHeaderCandidates(anchors) {
+    const candidates = [];
+    const pushUnique = (c) => {
+      if (!c) return;
+      const posKey = `${c.weekday.toLowerCase()}-${c.day}-${Math.round(c.left / 12)}-${Math.round(c.top / 12)}`;
+      if (candidates.some(x => `${x.weekday.toLowerCase()}-${x.day}-${Math.round(x.left / 12)}-${Math.round(x.top / 12)}` === posKey)) {
+        return;
+      }
+      candidates.push(c);
+    };
+
     for (const table of document.querySelectorAll('table')) {
       const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
       if (!headerRow) continue;
       for (let i = 1; i < headerRow.cells.length; i++) {
-        const t = (headerRow.cells[i].textContent || '').replace(/\s+/g, ' ').trim();
-        if (DAY_HEADER_RE.test(t)) texts.push(t);
+        pushUnique(makeCandidate(headerRow.cells[i], 'table_headers', anchors));
       }
     }
-    if (!texts.length) {
-      for (const el of document.querySelectorAll('th, [class*="day-header"], [class*="calendar-day"]')) {
-        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (DAY_HEADER_RE.test(t)) texts.push(t);
-      }
+
+    const domSelector = 'th, td, div, span, label, li, p, h1, h2, h3, h4, h5, h6, a, b, strong';
+    for (const el of document.querySelectorAll(domSelector)) {
+      const norm = normalizeText(el.innerText || el.textContent || '');
+      if (!DAY_HEADER_RE.test(norm)) continue;
+      pushUnique(makeCandidate(el, 'visible_dom_text', anchors));
     }
-    return texts;
+
+    for (const el of document.querySelectorAll('*')) {
+      if (!isElementVisible(el)) continue;
+      if (el.children.length < 2) continue;
+      const combined = normalizeText(el.innerText || el.textContent || '');
+      if (!DAY_HEADER_RE.test(combined) || combined.length > 24) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      if (!passesLayoutFilter(rect, anchors)) continue;
+      const parsed = parseDayHeaderText(combined);
+      if (!parsed) continue;
+      pushUnique({
+        ...parsed,
+        source: 'parent_combined_text',
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+      });
+    }
+
+    candidates.sort((a, b) => a.top - b.top || a.left - b.left);
+    return candidates;
   }
 
-  function firstCompleteWeekSequence(rawTexts) {
-    const parsed = rawTexts.map(parseDayHeaderText).filter(Boolean);
-    if (!parsed.length) return [];
+  function filterCandidatesByLayout(candidates, anchors) {
+    const strict = candidates.filter(c => {
+      const rect = { top: c.top, left: c.left };
+      return passesLayoutFilter(rect, anchors, { strict: true });
+    });
+    return strict.length >= 7 ? strict : candidates;
+  }
 
-    const monIdx = parsed.findIndex(p => p.weekday.toLowerCase().startsWith('mon'));
-    if (monIdx >= 0 && parsed.length >= monIdx + 7) {
-      return parsed.slice(monIdx, monIdx + 7);
+  function firstCompleteWeekSequence(candidates) {
+    const sorted = filterCandidatesByLayout([...candidates].sort((a, b) => a.top - b.top || a.left - b.left));
+    if (!sorted.length) return { parsed: [], rawTexts: [], parseSource: null };
+
+    const monIdx = sorted.findIndex(c => c.weekday.toLowerCase().startsWith('mon'));
+    if (monIdx >= 0) {
+      const rowTop = sorted[monIdx].top;
+      const sameRow = sorted.filter(c => Math.abs(c.top - rowTop) <= 10);
+      const rowMonIdx = sameRow.findIndex(c => c.weekday.toLowerCase().startsWith('mon'));
+      if (rowMonIdx >= 0 && sameRow.length >= rowMonIdx + 7) {
+        const week = sameRow.slice(rowMonIdx, rowMonIdx + 7);
+        const parseSource = week[0]?.source || 'visible_dom_text';
+        return {
+          parsed: week.map(c => ({ weekday: c.weekday, day: c.day, rawText: c.rawText })),
+          rawTexts: week.map(c => c.rawText),
+          parseSource,
+        };
+      }
+      if (sorted.length >= monIdx + 7) {
+        const week = sorted.slice(monIdx, monIdx + 7);
+        const parseSource = week[0]?.source || 'visible_dom_text';
+        return {
+          parsed: week.map(c => ({ weekday: c.weekday, day: c.day, rawText: c.rawText })),
+          rawTexts: week.map(c => c.rawText),
+          parseSource,
+        };
+      }
     }
 
     const seen = new Set();
     const unique = [];
-    for (const p of parsed) {
-      const key = `${p.weekday.toLowerCase()}-${p.day}`;
+    for (const c of sorted) {
+      const key = `${c.weekday.toLowerCase()}-${c.day}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      unique.push(p);
+      unique.push(c);
       if (unique.length >= 7) break;
     }
-    return unique;
+    const parseSource = unique[0]?.source || null;
+    return {
+      parsed: unique.map(c => ({ weekday: c.weekday, day: c.day, rawText: c.rawText })),
+      rawTexts: unique.map(c => c.rawText),
+      parseSource,
+    };
   }
 
   function parseVisibleWeekFromMonthAndDayHeaders(monthLabel, dayHeaders) {
@@ -7979,8 +8121,15 @@ function scrapeCalendarHeaderDates() {
   }
 
   const rawMonthLabel = findRawMonthLabel();
-  const rawDayHeaderTexts = collectRawDayHeaderTexts();
-  const parsedDayHeaders = firstCompleteWeekSequence(rawDayHeaderTexts);
+  const layoutAnchors = findLayoutAnchors();
+  const dayHeaderCandidates = collectDayHeaderCandidates(layoutAnchors);
+  const dayHeaderCandidateTexts = dayHeaderCandidates.map(c => c.rawText);
+  const dayHeaderCandidateCount = dayHeaderCandidates.length;
+  const bodyWeekdayTextSample = collectBodyWeekdayTextSample();
+  const weekSequence = firstCompleteWeekSequence(dayHeaderCandidates);
+  const rawDayHeaderTexts = weekSequence.rawTexts;
+  const parsedDayHeaders = weekSequence.parsed;
+  const dayHeaderParseSource = weekSequence.parseSource;
   const visibleIsoDatesFromHeaders = parseVisibleWeekFromMonthAndDayHeaders(rawMonthLabel, parsedDayHeaders);
 
   return {
@@ -7989,6 +8138,10 @@ function scrapeCalendarHeaderDates() {
     rawMonthLabel,
     rawDayHeaderTexts,
     parsedDayHeaders,
+    dayHeaderCandidateTexts,
+    dayHeaderCandidateCount,
+    dayHeaderParseSource,
+    bodyWeekdayTextSample,
     headerParseStrategy: 'month_selector_plus_day_columns',
   };
 }
@@ -8493,6 +8646,10 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     rawMonthLabel: null,
     rawDayHeaderTexts: [],
     parsedDayHeaders: [],
+    dayHeaderCandidateTexts: [],
+    dayHeaderCandidateCount: 0,
+    dayHeaderParseSource: null,
+    bodyWeekdayTextSample: [],
     headerParseStrategy: null,
     targetDateVisibleFromHeaders: false,
     targetDateVisible: false,
@@ -8532,6 +8689,10 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     report.rawMonthLabel = nav.rawMonthLabel ?? null;
     report.rawDayHeaderTexts = nav.rawDayHeaderTexts || [];
     report.parsedDayHeaders = nav.parsedDayHeaders || [];
+    report.dayHeaderCandidateTexts = nav.dayHeaderCandidateTexts || [];
+    report.dayHeaderCandidateCount = nav.dayHeaderCandidateCount ?? 0;
+    report.dayHeaderParseSource = nav.dayHeaderParseSource ?? null;
+    report.bodyWeekdayTextSample = nav.bodyWeekdayTextSample || [];
     report.headerParseStrategy = nav.headerParseStrategy ?? null;
     report.visibleWeekStart = nav.visibleWeekStart;
     report.visibleWeekEnd = nav.visibleWeekEnd;
@@ -8866,6 +9027,10 @@ async function runThresholdScansChunked(dates, options = {}) {
           visibleIsoDatesFromHeaders: result.visibleIsoDatesFromHeaders,
           rawMonthLabel: result.rawMonthLabel,
           rawDayHeaderTexts: result.rawDayHeaderTexts,
+          dayHeaderCandidateTexts: result.dayHeaderCandidateTexts,
+          dayHeaderCandidateCount: result.dayHeaderCandidateCount,
+          dayHeaderParseSource: result.dayHeaderParseSource,
+          bodyWeekdayTextSample: result.bodyWeekdayTextSample,
           parsedDayHeaders: result.parsedDayHeaders,
           headerParseStrategy: result.headerParseStrategy,
           targetDateVisibleFromHeaders: result.targetDateVisibleFromHeaders,
@@ -9594,6 +9759,10 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
     rawMonthLabel: null,
     rawDayHeaderTexts: [],
     parsedDayHeaders: [],
+    dayHeaderCandidateTexts: [],
+    dayHeaderCandidateCount: 0,
+    dayHeaderParseSource: null,
+    bodyWeekdayTextSample: [],
     headerParseStrategy: null,
     targetDateVisibleFromHeaders: false,
     clickedNextWeekCount: 0,
@@ -9613,6 +9782,10 @@ async function navigateCalendarToShowDate(page, targetIsoDate, { headerOnly = fa
     diag.rawMonthLabel = headerParse?.rawMonthLabel ?? null;
     diag.rawDayHeaderTexts = headerParse?.rawDayHeaderTexts || [];
     diag.parsedDayHeaders = headerParse?.parsedDayHeaders || [];
+    diag.dayHeaderCandidateTexts = headerParse?.dayHeaderCandidateTexts || [];
+    diag.dayHeaderCandidateCount = headerParse?.dayHeaderCandidateCount ?? 0;
+    diag.dayHeaderParseSource = headerParse?.dayHeaderParseSource ?? null;
+    diag.bodyWeekdayTextSample = headerParse?.bodyWeekdayTextSample || [];
     diag.headerParseStrategy = headerParse?.headerParseStrategy ?? null;
     if (headers.length) {
       diag.visibleWeekStart = headers[0];
