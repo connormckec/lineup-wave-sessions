@@ -3870,7 +3870,84 @@ function inferSlotsFromThresholdPresence(thresholdsSeen, maxTested, {
   return inference;
 }
 
+function entriesLeftLabelMatchesThreshold(label, threshold) {
+  if (!label) return false;
+  const n = Number(threshold);
+  if (!Number.isFinite(n)) return false;
+  const text = String(label).replace(/\s+/g, ' ').trim();
+  const patterns = [
+    new RegExp(`entries?\\s*left\\s*:?\\s*${n}\\b`, 'i'),
+    new RegExp(`at\\s*least\\s*${n}\\s*entries?\\s*left`, 'i'),
+    new RegExp(`\\b${n}\\s*entries?\\s*left`, 'i'),
+  ];
+  return patterns.some((re) => re.test(text));
+}
+
+function evaluateThresholdWriteSafety(report) {
+  const scanned = (report.thresholdsScanned || Object.keys(report.visibleTileCountsByThreshold || {})
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b));
+  if (!scanned.length) {
+    return {
+      thresholdWriteSafe: false,
+      thresholdWriteBlockReason: 'no_thresholds_scanned',
+      statusReason: null,
+    };
+  }
+
+  const presence = report.thresholdPresenceBySession || {};
+  const identityKeys = Object.keys(presence);
+  const maxScanned = Math.max(...scanned);
+  let visibleAtAllCount = 0;
+  for (const identityKey of identityKeys) {
+    const seen = presence[identityKey] || [];
+    const hasAll = scanned.every((t) => seen.includes(t));
+    if (hasAll && seen.includes(1) && seen.includes(maxScanned)) visibleAtAllCount++;
+  }
+  const pctAtAll = identityKeys.length ? visibleAtAllCount / identityKeys.length : 0;
+
+  const counts = scanned.map((t) => {
+    const n = report.visibleTileCountsByThreshold?.[t];
+    if (n != null) return n;
+    const fromMap = report.visibleByThreshold?.[t];
+    return typeof fromMap === 'number' ? fromMap : (fromMap?.size ?? 0);
+  });
+  let hasDecrease = false;
+  for (let i = 1; i < counts.length; i++) {
+    if (counts[i] < counts[i - 1]) hasDecrease = true;
+  }
+  const flatCounts = counts.length > 1 && counts.every((c) => c === counts[0] && c > 0);
+
+  if (pctAtAll > 0.8 || (flatCounts && !hasDecrease)) {
+    return {
+      thresholdWriteSafe: false,
+      thresholdWriteBlockReason: 'sessions_visible_at_all_thresholds',
+      statusReason: 'threshold_filter_not_effective',
+      pctVisibleAtAllThresholds: pctAtAll,
+      hasTileCountDecrease: hasDecrease,
+    };
+  }
+
+  return {
+    thresholdWriteSafe: true,
+    thresholdWriteBlockReason: null,
+    statusReason: null,
+    pctVisibleAtAllThresholds: pctAtAll,
+    hasTileCountDecrease: hasDecrease,
+  };
+}
+
+function sampleThresholdPresenceBySession(presenceBySession, limit = 12) {
+  return Object.fromEntries(
+    Object.entries(presenceBySession || {}).slice(0, limit),
+  );
+}
+
 function classifyThresholdScanStatus(report) {
+  if (report.statusReason === 'threshold_filter_not_effective') {
+    return 'threshold_filter_not_effective';
+  }
   if (report.statusReason === 'calendar_day_headers_not_parsed') {
     return 'calendar_day_headers_not_parsed';
   }
@@ -3882,6 +3959,9 @@ function classifyThresholdScanStatus(report) {
   }
   if (report.thresholdScanStarted !== true) {
     return 'calendar_headers_not_ready';
+  }
+  if (report.thresholdWriteSafe === false) {
+    return 'threshold_filter_not_effective';
   }
   if ((report.exactCount || 0) + (report.atLeastCount || 0) > 0) return 'scan_success_with_matches';
   if (report.emptyWeekButVisible || report.visibleTileCountAtThreshold1 === 0) {
@@ -3985,6 +4065,15 @@ function flattenThresholdScanApiResponse({
     tracePath: week.tracePath ?? scanResult.tracePath ?? null,
     pageAvailable: week.pageAvailable ?? null,
     pageUnavailableReason: week.pageUnavailableReason ?? null,
+    thresholdWriteSafe: week.thresholdWriteSafe ?? null,
+    thresholdWriteBlockReason: week.thresholdWriteBlockReason ?? null,
+    thresholdStopReason: week.thresholdStopReason ?? null,
+    thresholdScanMaxReached: week.thresholdScanMaxReached ?? null,
+    filterDiagnosticsByThreshold: week.filterDiagnosticsByThreshold ?? [],
+    selectedEntriesLeftLabelByThreshold: week.selectedEntriesLeftLabelByThreshold ?? {},
+    visibleTileCountsByThreshold: week.visibleTileCountsByThreshold ?? {},
+    tileIdentitySamplesByThreshold: week.tileIdentitySamplesByThreshold ?? {},
+    thresholdPresenceBySessionSample: week.thresholdPresenceBySessionSample ?? {},
     statusReason: week.statusReason ?? scanResult.statusReason ?? null,
     error: week.error ?? scanResult.error ?? null,
     crashed: week.crashed ?? scanResult.crashed ?? false,
@@ -8897,6 +8986,175 @@ async function scrapeVisibleSessionsFromPage(page, options = {}) {
   return page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, ...options });
 }
 
+function scrapeVisibleThresholdTilesStrict({ excludedLevels = [], excludedWaves = [], weekOffset = 0 } = {}) {
+  const WAVE_INDEX_FALLBACK = {
+    1: 'Left Wave', 2: 'Right Wave', 3: 'Left Lesson', 4: 'Right Lesson',
+  };
+
+  function isLessonLevel(level) {
+    return /progressive|lesson|cruiser/i.test(level || '');
+  }
+
+  function normalizeSideLabel(raw, level) {
+    const text = (raw || '').replace(/\s+/g, ' ').trim();
+    const low = text.toLowerCase();
+    if (!text) return null;
+    const lesson = /lesson/.test(low) || isLessonLevel(level);
+    const left = /\bleft\b/.test(low);
+    const right = /\bright\b/.test(low);
+    if (left) return lesson ? 'Left Lesson' : 'Left Wave';
+    if (right) return lesson ? 'Right Lesson' : 'Right Wave';
+    return null;
+  }
+
+  function parseSideFromTitle(html, level) {
+    if (!html) return null;
+    const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const fieldPatterns = [
+      /(?:wave\s*side|session\s*side|side|wave)\s*:?\s*(?:<\/b>)?\s*([^|<]+)/i,
+    ];
+    for (const re of fieldPatterns) {
+      const m = html.match(re) || text.match(re);
+      if (m) {
+        const side = normalizeSideLabel(m[1], level);
+        if (side) return { side, source: 'title_field', raw: m[1].trim() };
+      }
+    }
+    const labelMatch = text.match(/\b(Left|Right)\s+(Wave|Lesson)\b/i)
+      || text.match(/\b(Wave|Lesson)\s+(Left|Right)\b/i);
+    if (labelMatch) {
+      const side = normalizeSideLabel(labelMatch[0], level);
+      if (side) return { side, source: 'title_text', raw: labelMatch[0] };
+    }
+    return null;
+  }
+
+  function parseSideFromColumn(el, level) {
+    const td = el.closest('td');
+    if (td) {
+      const table = td.closest('table');
+      if (table) {
+        const colIdx = td.cellIndex;
+        const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+        const headerCell = headerRow?.cells?.[colIdx];
+        const headerText = headerCell?.textContent?.replace(/\s+/g, ' ').trim();
+        if (headerText) {
+          const side = normalizeSideLabel(headerText, level);
+          if (side) return { side, source: 'column_header', raw: headerText };
+        }
+      }
+    }
+    return null;
+  }
+
+  function resolveWaveSide(el, wave, level, titleHtml) {
+    const fromTitle = parseSideFromTitle(titleHtml, level);
+    const fromColumn = parseSideFromColumn(el, level);
+    const tileText = titleHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (fromTitle) {
+      return {
+        waveSide: fromTitle.side,
+        waveSideSource: fromTitle.source,
+        sideParseRaw: fromTitle.raw,
+        tileText,
+        waveSideAmbiguous: false,
+      };
+    }
+    if (fromColumn) {
+      return {
+        waveSide: fromColumn.side,
+        waveSideSource: fromColumn.source,
+        sideParseRaw: fromColumn.raw,
+        tileText,
+        waveSideAmbiguous: false,
+      };
+    }
+    const fallback = WAVE_INDEX_FALLBACK[wave] || `Wave ${wave}`;
+    return {
+      waveSide: fallback,
+      waveSideSource: 'wave_index_fallback',
+      sideParseRaw: `wave_index_${wave}`,
+      tileText,
+      waveSideAmbiguous: true,
+    };
+  }
+
+  function isThresholdTileDomVisible(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    let node = el;
+    while (node && node !== document.body) {
+      const st = window.getComputedStyle(node);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      node = node.parentElement;
+    }
+    return true;
+  }
+
+  function isThresholdTileInCalendarGrid(el) {
+    return !!el.closest('table, td, .agenda, .calendar, .dynamic-cal, [class*="booking"]');
+  }
+
+  const seen = new Set();
+  const out = [];
+  const allEls = document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
+  const rawCount = allEls.length;
+  allEls.forEach((el) => {
+    if (!isThresholdTileDomVisible(el)) return;
+    if (!isThresholdTileInCalendarGrid(el)) return;
+    if (el.querySelector('div.dynamic-cal-booking-ts[data-original-title]')) return;
+
+    const cls = el.className;
+    const t = el.dataset.originalTitle || '';
+    const lm = t.match(/Session level\s*:<\/b>\s*([^<]+)/i);
+    const wm = cls.match(/booking-agenda-clickable_(\d+)_(\d+)/);
+    if (!lm || !wm) return;
+    const level = lm[1].trim();
+    const wave = +wm[2];
+    if (excludedLevels.includes(level)) return;
+    if (excludedWaves.includes(wave)) return;
+    const ts = +wm[1];
+    const key = `${ts}_${wave}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const fm = t.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
+    const d = new Date(ts * 1000);
+    const isoDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
+    const displayDate = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+    const weekday = d.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+    const sideInfo = resolveWaveSide(el, wave, level, t);
+    const td = el.closest('td');
+    out.push({
+      key,
+      ts,
+      wave,
+      level,
+      available: !cls.includes('expired_timeslot'),
+      time: fm ? fm[1].trim() : '?',
+      date: displayDate,
+      dayLabel: displayDate,
+      dateKey: isoDate,
+      isoDate,
+      displayDate,
+      weekday,
+      waveSide: sideInfo.waveSide,
+      waveSideSource: sideInfo.waveSideSource,
+      sideParseRaw: sideInfo.sideParseRaw,
+      tileText: sideInfo.tileText,
+      tileClassName: cls,
+      tileColumnIndex: td ? td.cellIndex : null,
+      waveSideAmbiguous: sideInfo.waveSideAmbiguous,
+      sideKey: `${ts}_${sideInfo.waveSide.toLowerCase().replace(/\s+/g, '-')}`,
+      sessionType: level,
+      weekOffset,
+    });
+  });
+  return { sessions: out, rawCount, duplicateSkips: rawCount - out.length, visibleCount: out.length };
+}
+
 function isThresholdPlaceholderTile(tile) {
   const cls = tile.tileClassName || '';
   if (cls.includes('expired_timeslot')) return true;
@@ -8927,7 +9185,7 @@ function enrichThresholdTile(tile) {
 }
 
 async function scrapeThresholdSessionTilesFromPage(page, options = {}) {
-  const scrape = await scrapeVisibleSessionsFromPage(page, options);
+  const scrape = await page.evaluate(scrapeVisibleThresholdTilesStrict, { ...SCRAPE_OPTS, ...options });
   const sessions = (scrape.sessions || [])
     .filter(s => s.available && !isThresholdPlaceholderTile(s))
     .map(enrichThresholdTile);
@@ -8935,6 +9193,104 @@ async function scrapeThresholdSessionTilesFromPage(page, options = {}) {
     ...scrape,
     sessions,
     availableCount: sessions.length,
+    visibleTileCount: sessions.length,
+  };
+}
+
+async function getThresholdGridSnapshot(page) {
+  return page.evaluate(() => {
+    function readEntriesLeftFilterLabel() {
+      for (const sel of document.querySelectorAll('select')) {
+        const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''} ${sel.previousElementSibling?.textContent || ''}`.replace(/\s+/g, ' ');
+        if (!/entries?\s*left/i.test(context)) continue;
+        const opt = sel.options[sel.selectedIndex];
+        if (opt) return (opt.textContent || opt.label || '').replace(/\s+/g, ' ').trim();
+      }
+      for (const el of document.querySelectorAll('button, span, label, div, a, th')) {
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/entries?\s*left\s*:/i.test(t) && t.length < 80) return t;
+      }
+      return null;
+    }
+    function hashBodyText(text) {
+      let hash = 5381;
+      const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+      for (let i = 0; i < normalized.length; i++) hash = ((hash << 5) + hash) + normalized.charCodeAt(i);
+      return String(hash >>> 0);
+    }
+    function isVisible(el) {
+      if (!el?.getBoundingClientRect) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+      return true;
+    }
+    let visibleTileCount = 0;
+    for (const el of document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
+      if (!isVisible(el)) continue;
+      if (!el.closest('table, td, .agenda, .calendar, .dynamic-cal, [class*="booking"]')) continue;
+      visibleTileCount += 1;
+    }
+    const bodyText = document.body?.innerText || '';
+    return {
+      bodyTextHash: hashBodyText(bodyText),
+      visibleTileCount,
+      entriesLeftLabel: readEntriesLeftFilterLabel(),
+    };
+  });
+}
+
+async function waitForThresholdGridChange(page, before, { timeoutMs = 8000, pollMs = 250 } = {}) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const after = await getThresholdGridSnapshot(page);
+    const gridChanged = after.bodyTextHash !== before.bodyTextHash
+      || after.visibleTileCount !== before.visibleTileCount;
+    if (gridChanged) {
+      return { ...after, gridChanged: true, waitedMs: Date.now() - started };
+    }
+    await page.waitForTimeout(pollMs);
+  }
+  const after = await getThresholdGridSnapshot(page);
+  return {
+    ...after,
+    gridChanged: after.bodyTextHash !== before.bodyTextHash
+      || after.visibleTileCount !== before.visibleTileCount,
+    waitedMs: Date.now() - started,
+  };
+}
+
+async function applyEntriesLeftFilterWithVerification(page, threshold) {
+  const requestedThreshold = Number(threshold);
+  const before = await getThresholdGridSnapshot(page);
+  const changed = await setEntriesLeftFilter(page, requestedThreshold);
+  let afterLabelSnap = await getThresholdGridSnapshot(page);
+  const settle = await waitForThresholdGridChange(before, {
+    timeoutMs: Math.max(THRESHOLD_FILTER_SETTLE_MS * 2, 6000),
+  });
+  afterLabelSnap = await getThresholdGridSnapshot(page);
+  const afterEntriesLeftLabel = afterLabelSnap.entriesLeftLabel;
+  const filterSetOk = entriesLeftLabelMatchesThreshold(afterEntriesLeftLabel, requestedThreshold);
+
+  return {
+    requestedThreshold,
+    beforeEntriesLeftLabel: before.entriesLeftLabel,
+    afterEntriesLeftLabel,
+    filterSetOk,
+    filterSetError: filterSetOk ? null : 'entries_left_label_mismatch',
+    bodyTextHashBefore: before.bodyTextHash,
+    bodyTextHashAfter: settle.bodyTextHash,
+    visibleTileCountBefore: before.visibleTileCount,
+    visibleTileCountAfter: settle.visibleTileCount,
+    gridChanged: settle.gridChanged,
+    filterApplyOk: changed?.ok === true,
+    filterApplyMethod: changed?.method || null,
+    filterApplyReason: changed?.reason || null,
+    ok: filterSetOk,
+    reason: filterSetOk ? null : (changed?.reason || 'entries_left_option_unavailable_or_not_selected'),
+    threshold: requestedThreshold,
+    waitedMs: settle.waitedMs,
   };
 }
 
@@ -9261,6 +9617,15 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     weekMarkedComplete: false,
     thresholdScanStarted: false,
     filterResults: [],
+    filterDiagnosticsByThreshold: [],
+    selectedEntriesLeftLabelByThreshold: {},
+    visibleTileCountsByThreshold: {},
+    tileIdentitySamplesByThreshold: {},
+    thresholdStopReason: null,
+    thresholdScanMaxReached: null,
+    thresholdWriteSafe: null,
+    thresholdWriteBlockReason: null,
+    thresholdPresenceBySessionSample: {},
     filterNormalization: null,
     visibleByThreshold: {},
     thresholdPresenceBySession: {},
@@ -9419,6 +9784,13 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     const visibleByThreshold = new Map();
     const tileByIdentity = new Map();
     const filterResults = [];
+    const filterDiagnosticsByThreshold = [];
+    const selectedEntriesLeftLabelByThreshold = {};
+    const visibleTileCountsByThreshold = {};
+    const tileIdentitySamplesByThreshold = {};
+    const thresholdsActuallyScanned = [];
+    let thresholdStopReason = null;
+    let thresholdScanMaxReached = null;
 
     for (const batch of thresholdBatches) {
       collectorState.thresholdScanBatchProgress = {
@@ -9430,14 +9802,24 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       };
 
       for (const threshold of batch.thresholds) {
-        const filterSet = await withPlaywrightGuard(
-          () => setEntriesLeftFilter(page, threshold),
-          { stage: 'threshold_filter_set', timeout: THRESHOLD_FILTER_TIMEOUT_MS, weekKey: report.weekKey },
+        if (thresholdStopReason) break;
+
+        const filterDiag = await withPlaywrightGuard(
+          () => applyEntriesLeftFilterWithVerification(page, threshold),
+          { stage: 'threshold_filter_set', timeout: THRESHOLD_FILTER_TIMEOUT_MS, weekKey: report.weekKey, page, auditContext },
         );
-        filterResults.push({ threshold, batchIndex: batch.batchIndex, ...filterSet });
-        if (!filterSet?.ok) {
-          report.errors.push({ threshold, error: filterSet?.reason || 'filter_set_failed' });
-          continue;
+        filterDiagnosticsByThreshold.push(filterDiag);
+        filterResults.push({ threshold, batchIndex: batch.batchIndex, ...filterDiag });
+        selectedEntriesLeftLabelByThreshold[threshold] = filterDiag.afterEntriesLeftLabel ?? null;
+
+        if (!filterDiag.filterSetOk) {
+          thresholdScanMaxReached = threshold > minT ? threshold - 1 : null;
+          thresholdStopReason = 'entries_left_option_unavailable_or_not_selected';
+          report.errors.push({
+            threshold,
+            error: filterDiag.filterSetError || filterDiag.reason || 'filter_set_failed',
+          });
+          break;
         }
 
         const scrape = await withPlaywrightGuard(
@@ -9445,12 +9827,25 @@ async function scanEntriesLeftThresholdsForWeek(page, {
           { stage: 'threshold_tile_scrape', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
         );
         const identityKeys = new Set();
+        const samples = [];
         for (const tile of scrape.sessions || []) {
           identityKeys.add(tile.identityKey);
           if (!tileByIdentity.has(tile.identityKey)) tileByIdentity.set(tile.identityKey, tile);
+          if (samples.length < 5) {
+            samples.push({
+              identityKey: tile.identityKey,
+              isoDate: tile.isoDate,
+              time: tile.time,
+              level: tile.level,
+              waveSide: tile.waveSide,
+            });
+          }
         }
         visibleByThreshold.set(threshold, identityKeys);
         report.visibleByThreshold[threshold] = identityKeys.size;
+        visibleTileCountsByThreshold[threshold] = identityKeys.size;
+        tileIdentitySamplesByThreshold[threshold] = samples;
+        thresholdsActuallyScanned.push(threshold);
         if (threshold === 1) report.visibleTileCountAtThreshold1 = identityKeys.size;
       }
 
@@ -9459,11 +9854,24 @@ async function scanEntriesLeftThresholdsForWeek(page, {
         thresholdsTested: batch.thresholds.length,
         completedAt: new Date().toISOString(),
       });
+      if (thresholdStopReason) break;
     }
 
     report.filterResults = filterResults;
+    report.filterDiagnosticsByThreshold = filterDiagnosticsByThreshold;
+    report.selectedEntriesLeftLabelByThreshold = selectedEntriesLeftLabelByThreshold;
+    report.visibleTileCountsByThreshold = visibleTileCountsByThreshold;
+    report.tileIdentitySamplesByThreshold = tileIdentitySamplesByThreshold;
+    report.thresholdStopReason = thresholdStopReason;
+    report.thresholdScanMaxReached = thresholdScanMaxReached
+      ?? (thresholdsActuallyScanned.length ? Math.max(...thresholdsActuallyScanned) : null);
+    report.thresholdsScanned = thresholdsActuallyScanned.length
+      ? thresholdsActuallyScanned
+      : thresholdList;
 
-    if (report.visibleTileCountAtThreshold1 === 0) {
+    const effectiveMaxTested = report.thresholdScanMaxReached || maxT;
+
+    if (report.visibleTileCountAtThreshold1 === 0 && !thresholdStopReason) {
       report.emptyWeekButVisible = true;
       report.weekMarkedComplete = true;
       report.statusReason = 'visible_week_no_threshold_tiles';
@@ -9477,7 +9885,7 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       return report;
     }
 
-    const presenceByIdentity = buildThresholdPresenceMap(visibleByThreshold, maxT);
+    const presenceByIdentity = buildThresholdPresenceMap(visibleByThreshold, effectiveMaxTested);
     report.survivalMap = Object.fromEntries(
       [...presenceByIdentity.entries()].map(([k, v]) => [k, Math.max(...v, 0)]),
     );
@@ -9495,10 +9903,50 @@ async function scanEntriesLeftThresholdsForWeek(page, {
       presenceByIdentity,
       tileByIdentity,
       basicSessions: uniqueBasic,
-      maxTested: maxT,
+      maxTested: effectiveMaxTested,
     });
 
     report.thresholdPresenceBySession = thresholdPresenceBySession;
+    report.thresholdPresenceBySessionSample = sampleThresholdPresenceBySession(thresholdPresenceBySession);
+
+    const writeSafety = evaluateThresholdWriteSafety(report);
+    report.thresholdWriteSafe = writeSafety.thresholdWriteSafe;
+    report.thresholdWriteBlockReason = writeSafety.thresholdWriteBlockReason;
+    if (writeSafety.statusReason) {
+      report.statusReason = writeSafety.statusReason;
+      report.error = writeSafety.statusReason;
+      report.earlyExitStage = 'threshold_parse';
+      report.earlyExitReason = writeSafety.thresholdWriteBlockReason;
+      report.exactCount = 0;
+      report.atLeastCount = 0;
+      report.ambiguousCount = results.filter(r => r.inference?.thresholdConfidence === 'ambiguous').length;
+      report.noMatchCount = results.filter(r => r.inference?.thresholdConfidence === 'no_match' && r.session).length;
+      report.sessionsMatched = 0;
+      report.inferred = results.map(r => ({
+        key: r.session?.key || null,
+        identityKey: r.identityKey,
+        isoDate: r.session ? sessionDateKey(r.session) : r.tile?.isoDate,
+        time: r.session?.time || r.tile?.time,
+        thresholdsSeen: r.thresholdsSeen || [],
+        thresholdConfidence: r.inference?.thresholdConfidence,
+        thresholdScanVerified: false,
+      }));
+      report.thresholdDiagnostics = {
+        visibleByThreshold: report.visibleByThreshold,
+        filterResults: report.filterResults,
+        filterDiagnosticsByThreshold: report.filterDiagnosticsByThreshold,
+        filterNormalization: report.filterNormalization,
+        visibleTileCountAtThreshold1: report.visibleTileCountAtThreshold1,
+        thresholdPresenceBySession: report.thresholdPresenceBySession,
+        inferredCount: report.inferred.length,
+        thresholdWriteSafe: false,
+        thresholdWriteBlockReason: writeSafety.thresholdWriteBlockReason,
+      };
+      report.weekMarkedComplete = false;
+      report.durationMs = Date.now() - started;
+      return report;
+    }
+
     report.inferred = results.map(r => ({
       key: r.session?.key || null,
       identityKey: r.identityKey,
@@ -9524,13 +9972,17 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     report.noMatchCount = results.filter(r => r.inference?.thresholdConfidence === 'no_match' && r.session).length;
     report.sessionsMatched = results.filter(r => r.session && r.inference?.thresholdScanVerified).length;
     report.weekMarkedComplete = true;
+    report.thresholdWriteSafe = writeSafety.thresholdWriteSafe;
     report.thresholdDiagnostics = {
       visibleByThreshold: report.visibleByThreshold,
       filterResults: report.filterResults,
+      filterDiagnosticsByThreshold: report.filterDiagnosticsByThreshold,
       filterNormalization: report.filterNormalization,
       visibleTileCountAtThreshold1: report.visibleTileCountAtThreshold1,
       thresholdPresenceBySession: report.thresholdPresenceBySession,
       inferredCount: report.inferred.length,
+      thresholdWriteSafe: report.thresholdWriteSafe,
+      thresholdWriteBlockReason: report.thresholdWriteBlockReason,
     };
     report.statusReason = classifyThresholdScanStatus(report);
     collectorState.lastThresholdScanWeek = report.weekKey;
@@ -9584,8 +10036,14 @@ async function applyThresholdScanReport(report, { dryRun = true, sourceTier = 2 
     skippedAmbiguous: 0,
     skippedNoMatch: 0,
     skippedNoSession: 0,
+    skippedWriteUnsafe: 0,
     errors: [],
   };
+
+  if (report.thresholdWriteSafe === false || report.statusReason === 'threshold_filter_not_effective') {
+    writeReport.skippedWriteUnsafe = (report.inferred || []).length;
+    return writeReport;
+  }
 
   const toWrite = [];
   for (const item of report.inferred || []) {
@@ -9827,6 +10285,15 @@ async function runThresholdScansChunked(dates, options = {}) {
           pageAvailable: result.pageAvailable,
           pageUnavailableReason: result.pageUnavailableReason,
           headerParseError: result.headerParseError ?? null,
+          thresholdWriteSafe: result.thresholdWriteSafe,
+          thresholdWriteBlockReason: result.thresholdWriteBlockReason,
+          thresholdStopReason: result.thresholdStopReason,
+          thresholdScanMaxReached: result.thresholdScanMaxReached,
+          filterDiagnosticsByThreshold: result.filterDiagnosticsByThreshold,
+          selectedEntriesLeftLabelByThreshold: result.selectedEntriesLeftLabelByThreshold,
+          visibleTileCountsByThreshold: result.visibleTileCountsByThreshold,
+          tileIdentitySamplesByThreshold: result.tileIdentitySamplesByThreshold,
+          thresholdPresenceBySessionSample: result.thresholdPresenceBySessionSample,
           exactCount: result.exactCount,
           atLeastCount: result.atLeastCount,
           ambiguousCount: result.ambiguousCount,
