@@ -11171,6 +11171,52 @@ function extractGate8SessionWaveSide(session) {
   return normalizeWaveSideShort(side);
 }
 
+const GATE8_LEVEL_CODE_PATTERNS = [
+  ['advanced barrels', 'AB'],
+  ['expert barrels', 'EB'],
+  ['pro barrels', 'PB'],
+  ['progressive beginner', 'PB'],
+  ['advanced beginner', 'AB'],
+  ['expert beginner', 'EB'],
+  ['advanced turns', 'AT'],
+  ['advanced turn', 'AT'],
+  ['advanced tricks', 'AT'],
+  ['advanced trick', 'AT'],
+  ['expert turns', 'ET'],
+  ['expert turn', 'ET'],
+  ['expert tricks', 'ET'],
+  ['expert trick', 'ET'],
+  ['pro turns', 'PT'],
+  ['pro turn', 'PT'],
+  ['progressive', 'PRG'],
+  ['intermediate', 'INT'],
+  ['beginner', 'BGN'],
+  ['cruiser', 'CRU'],
+  ['lesson only', 'LO'],
+];
+
+function canonicalSessionCodeFromRawLevel(level) {
+  const norm = String(level || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!norm) return null;
+  for (const [phrase, code] of GATE8_LEVEL_CODE_PATTERNS) {
+    if (norm === phrase || norm.includes(phrase)) return code;
+  }
+  return levelToSessionCode(level);
+}
+
+function extractGate8SessionLevelTexts(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  return [
+    raw.level,
+    raw.sessionLevel,
+    raw.session_type,
+    raw.titleText,
+    raw.sourceText,
+    session.level,
+    session.session_type,
+  ].filter(Boolean);
+}
+
 function extractGate8SessionCode(session) {
   const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
   const direct = session.sessionCode
@@ -11180,8 +11226,11 @@ function extractGate8SessionCode(session) {
     ?? raw.code
     ?? null;
   if (direct) return String(direct).replace(/\*+$/, '').toUpperCase();
-  const level = session.level ?? session.session_type ?? raw.session_type ?? raw.level ?? null;
-  return levelToSessionCode(level);
+  for (const levelText of extractGate8SessionLevelTexts(session)) {
+    const code = canonicalSessionCodeFromRawLevel(levelText);
+    if (code) return code;
+  }
+  return null;
 }
 
 function buildGate8SessionIdentityKey(session) {
