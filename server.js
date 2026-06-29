@@ -11131,6 +11131,156 @@ function buildGate8ThresholdTileFromInferenceRow(row, isoDate) {
   };
 }
 
+function normalizeGate8TimeLabelForIdentity(time) {
+  if (!time || time === '?') return '?';
+  let t = String(time).replace(/\s+/g, '').trim().toLowerCase();
+  t = t.replace(/^(\d{1,2}):00(am|pm)$/, '$1$2');
+  return t;
+}
+
+function extractGate8SessionIsoDate(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  return sessionDateKey(session)
+    ?? session.isoDate
+    ?? session.iso_date
+    ?? raw.isoDate
+    ?? raw.date
+    ?? raw.dateKey
+    ?? null;
+}
+
+function extractGate8SessionTimeLabel(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  return raw.timeLabel
+    ?? raw.time_label
+    ?? session.start_time
+    ?? session.time
+    ?? raw.startTime
+    ?? raw.start_time
+    ?? raw.time
+    ?? null;
+}
+
+function extractGate8SessionWaveSide(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  const side = session.waveSide
+    ?? session.wave_side
+    ?? raw.waveSide
+    ?? raw.wave_side
+    ?? null;
+  return normalizeWaveSideShort(side);
+}
+
+function extractGate8SessionCode(session) {
+  const raw = session?.raw && typeof session.raw === 'object' ? session.raw : {};
+  const direct = session.sessionCode
+    ?? session.session_code
+    ?? raw.sessionCode
+    ?? raw.session_code
+    ?? raw.code
+    ?? null;
+  if (direct) return String(direct).replace(/\*+$/, '').toUpperCase();
+  const level = session.level ?? session.session_type ?? raw.session_type ?? raw.level ?? null;
+  return levelToSessionCode(level);
+}
+
+function buildGate8SessionIdentityKey(session) {
+  const isoDate = extractGate8SessionIsoDate(session);
+  const timeLabel = extractGate8SessionTimeLabel(session);
+  const waveSide = extractGate8SessionWaveSide(session);
+  const sessionCode = extractGate8SessionCode(session);
+  if (!isoDate) return null;
+  return `${isoDate}|${normalizeGate8TimeLabelForIdentity(timeLabel)}|${waveSide || '?'}|${sessionCode || '?'}`;
+}
+
+function canonicalizeGate8IdentityKey(identityKey) {
+  const parts = parseIdentityKeyFields(identityKey);
+  if (!parts.isoDate) return identityKey;
+  return `${parts.isoDate}|${normalizeGate8TimeLabelForIdentity(parts.timeLabel)}|${parts.waveSide || '?'}|${parts.sessionCode || '?'}`;
+}
+
+function isGate8WritableInferenceRow(row) {
+  const confidence = row?.inference?.thresholdConfidence;
+  return (confidence === 'exact' || confidence === 'at_least')
+    && row.inference?.thresholdScanVerified === true;
+}
+
+function filterGate8InferencesForIsoDate(inferences, isoDate) {
+  return (inferences || []).filter((row) => {
+    if (!isGate8WritableInferenceRow(row)) return false;
+    const parts = parseIdentityKeyFields(row.identityKey);
+    return parts.isoDate === isoDate;
+  });
+}
+
+async function fetchGate8CurrentSessionsForIsoDate(isoDate) {
+  const loaded = await loadSessionsForDateFromSupabase(isoDate);
+  const byKey = new Map();
+  for (const session of [...loaded.sessions, ...sessionsForDate(isoDate)]) {
+    const normalized = normalizeSessionFromSource(session);
+    if (normalized?.key) byKey.set(normalized.key, normalized);
+  }
+  return {
+    currentSessions: [...byKey.values()],
+    dataSource: loaded.dataSource || null,
+  };
+}
+
+function buildGate8SessionLookup(currentSessions) {
+  const sessionByIdentityKey = new Map();
+  for (const session of currentSessions) {
+    const identityKey = buildGate8SessionIdentityKey(session);
+    if (!identityKey) continue;
+    const canonicalKey = canonicalizeGate8IdentityKey(identityKey);
+    if (!sessionByIdentityKey.has(canonicalKey)) {
+      sessionByIdentityKey.set(canonicalKey, session);
+    }
+  }
+  return sessionByIdentityKey;
+}
+
+function buildGate8MatchDiagnostics(inferences, isoDate, currentSessions, sessionByIdentityKey, rowsPrepared) {
+  const inferenceForIsoDate = filterGate8InferencesForIsoDate(inferences, isoDate);
+  const currentSessionMatchKeys = currentSessions
+    .map((session) => buildGate8SessionIdentityKey(session))
+    .filter(Boolean);
+  const matchedKeys = new Set(
+    rowsPrepared.map((row) => row.thresholdDiagnostics?.identityKey).filter(Boolean),
+  );
+  const unmatchedInference = inferenceForIsoDate.filter(
+    (row) => !matchedKeys.has(row.identityKey),
+  );
+  const inferenceKeySet = new Set(
+    inferenceForIsoDate.map((row) => canonicalizeGate8IdentityKey(row.identityKey)),
+  );
+  const unmatchedSessions = currentSessions.filter((session) => {
+    const key = buildGate8SessionIdentityKey(session);
+    if (!key) return false;
+    return !inferenceKeySet.has(canonicalizeGate8IdentityKey(key));
+  });
+
+  return {
+    inferredForIsoDateCount: inferenceForIsoDate.length,
+    currentSessionsFetchedForIsoDateCount: currentSessions.length,
+    currentSessionMatchKeysSample: currentSessionMatchKeys.slice(0, 12),
+    inferenceKeysForIsoDateSample: inferenceForIsoDate.slice(0, 12).map((row) => row.identityKey),
+    unmatchedInferenceSample: unmatchedInference.slice(0, 12).map((row) => ({
+      identityKey: row.identityKey,
+      canonicalIdentityKey: canonicalizeGate8IdentityKey(row.identityKey),
+      thresholdsSeen: row.thresholdsSeen,
+      thresholdConfidence: row.inference?.thresholdConfidence,
+    })),
+    unmatchedCurrentSessionSample: unmatchedSessions.slice(0, 12).map((session) => ({
+      session_key: session.key,
+      identityKey: buildGate8SessionIdentityKey(session),
+      isoDate: extractGate8SessionIsoDate(session),
+      timeLabel: extractGate8SessionTimeLabel(session),
+      waveSide: extractGate8SessionWaveSide(session),
+      sessionCode: extractGate8SessionCode(session),
+    })),
+  };
+}
+
 function buildGate8SessionWriteEntry(existingSession, inferenceRow, scannedAt, maxTested) {
   const inference = inferenceRow.inference || {};
   const confidence = inference.thresholdConfidence;
@@ -11175,51 +11325,47 @@ function buildGate8SessionWriteEntry(existingSession, inferenceRow, scannedAt, m
   return entry;
 }
 
-function prepareGate8ThresholdWriteRows(inferences, isoDate, maxTested) {
-  const basicSessions = sessionsForDate(isoDate);
+async function prepareGate8ThresholdWriteRows(inferences, isoDate, maxTested) {
+  const { currentSessions } = await fetchGate8CurrentSessionsForIsoDate(isoDate);
+  const sessionByIdentityKey = buildGate8SessionLookup(currentSessions);
+  const inferenceForIsoDate = filterGate8InferencesForIsoDate(inferences, isoDate);
   const scannedAt = new Date().toISOString();
   const rowsPrepared = [];
+  const preparedSessionKeys = new Set();
   const skipped = {
     unmatched: 0,
-    ambiguous: 0,
-    wrongDate: 0,
-    untrusted: 0,
+    duplicateSession: 0,
   };
 
-  for (const row of inferences || []) {
-    const confidence = row.inference?.thresholdConfidence;
-    if (confidence !== 'exact' && confidence !== 'at_least') {
-      skipped.untrusted += 1;
-      continue;
-    }
-    if (row.inference?.thresholdScanVerified !== true) {
-      skipped.untrusted += 1;
-      continue;
-    }
-
-    const tile = buildGate8ThresholdTileFromInferenceRow(row, isoDate);
-    if (tile.isoDate && tile.isoDate !== isoDate) {
-      skipped.wrongDate += 1;
-      continue;
-    }
-
-    const match = matchThresholdTileToSessions(tile, basicSessions);
-    if (match.confidence === 'ambiguous') {
-      skipped.ambiguous += 1;
-      continue;
-    }
-    if (!match.session) {
+  for (const row of inferenceForIsoDate) {
+    const lookupKey = canonicalizeGate8IdentityKey(row.identityKey);
+    const session = sessionByIdentityKey.get(lookupKey);
+    if (!session) {
       skipped.unmatched += 1;
       continue;
     }
+    if (preparedSessionKeys.has(session.key)) {
+      skipped.duplicateSession += 1;
+      continue;
+    }
 
-    rowsPrepared.push(buildGate8SessionWriteEntry(match.session, row, scannedAt, maxTested));
+    preparedSessionKeys.add(session.key);
+    rowsPrepared.push(buildGate8SessionWriteEntry(session, row, scannedAt, maxTested));
   }
+
+  const diagnostics = buildGate8MatchDiagnostics(
+    inferences,
+    isoDate,
+    currentSessions,
+    sessionByIdentityKey,
+    rowsPrepared,
+  );
 
   return {
     rowsPrepared,
     scannedAt,
     skipped,
+    diagnostics,
   };
 }
 
@@ -11272,14 +11418,16 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
   let rowsWritten = 0;
   let writesPerformed = false;
   let writeError = null;
+  let matchDiagnostics = null;
 
   if (thresholdWriteSafe) {
-    const prep = prepareGate8ThresholdWriteRows(
+    const prep = await prepareGate8ThresholdWriteRows(
       fullScanRun.inferences,
       isoDate,
       fullScanRun.thresholdScanMaxReached || fullScanRun.maxTested || 0,
     );
     rowsPrepared = prep.rowsPrepared;
+    matchDiagnostics = prep.diagnostics;
 
     if (writeMode === 'write') {
       try {
@@ -11316,6 +11464,12 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
     writeMode,
     writesPerformed,
     thresholdWriteSafe,
+    inferredForIsoDateCount: matchDiagnostics?.inferredForIsoDateCount ?? null,
+    currentSessionsFetchedForIsoDateCount: matchDiagnostics?.currentSessionsFetchedForIsoDateCount ?? null,
+    currentSessionMatchKeysSample: matchDiagnostics?.currentSessionMatchKeysSample ?? [],
+    inferenceKeysForIsoDateSample: matchDiagnostics?.inferenceKeysForIsoDateSample ?? [],
+    unmatchedInferenceSample: matchDiagnostics?.unmatchedInferenceSample ?? [],
+    unmatchedCurrentSessionSample: matchDiagnostics?.unmatchedCurrentSessionSample ?? [],
     error,
   };
 }
@@ -11635,6 +11789,12 @@ async function runDebugEntriesLeftControl({
         writeMode: writeRun.writeMode,
         writesPerformed: writeRun.writesPerformed,
         thresholdWriteSafe: writeRun.thresholdWriteSafe,
+        inferredForIsoDateCount: writeRun.inferredForIsoDateCount,
+        currentSessionsFetchedForIsoDateCount: writeRun.currentSessionsFetchedForIsoDateCount,
+        currentSessionMatchKeysSample: writeRun.currentSessionMatchKeysSample,
+        inferenceKeysForIsoDateSample: writeRun.inferenceKeysForIsoDateSample,
+        unmatchedInferenceSample: writeRun.unmatchedInferenceSample,
+        unmatchedCurrentSessionSample: writeRun.unmatchedCurrentSessionSample,
         durationMs: Date.now() - started,
         crashed: false,
         error: writeRun.error,
