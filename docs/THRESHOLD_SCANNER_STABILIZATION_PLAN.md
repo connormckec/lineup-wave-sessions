@@ -289,6 +289,10 @@ node scripts/test-calendar-tile-parser-fixture.js fixtures/atlantic/2026-06-30/t
 
 Parses frozen DOM JSON only (no Playwright). Use to debug tile identity extraction before touching the live Gate 5 route.
 
+### Gate 5C — Live route uses pure fixture parser
+
+The live `mode=tile_parser_contract` route collects DOM into the same fixture shape as Gate 5A, then calls `lib/calendar-fixture-tile-parser.js` — no separate live parser rules.
+
 ---
 
 ## Gate 6 — Threshold inference contract
