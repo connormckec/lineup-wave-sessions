@@ -2013,8 +2013,12 @@ function currentRowToSession(row) {
     thresholdSlots: raw.thresholdSlots ?? null,
     slotsAgree: raw.slotsAgree ?? null,
     available_entries: raw.available_entries ?? null,
+    available_entries_at_least: raw.available_entries_at_least ?? null,
     slot_status: raw.slot_status ?? null,
     slot_source: raw.slot_source ?? null,
+    threshold_confidence: raw.threshold_confidence ?? raw.thresholdConfidence ?? null,
+    threshold_max_visible: raw.threshold_max_visible ?? raw.thresholdMaxVisible ?? null,
+    threshold_scanned_at: raw.threshold_scanned_at ?? raw.threshold_scan_at ?? raw.thresholdScanAt ?? null,
     threshold_scan_verified: raw.threshold_scan_verified ?? false,
     threshold_scan_at: raw.threshold_scan_at ?? null,
     expectedCapacity: raw.expectedCapacity ?? null,
@@ -2088,8 +2092,12 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       thresholdSlots: s.thresholdSlots ?? null,
       slotsAgree: s.slotsAgree ?? null,
       available_entries: s.available_entries ?? null,
+      available_entries_at_least: s.available_entries_at_least ?? null,
       slot_status: s.slot_status ?? null,
       slot_source: s.slot_source ?? null,
+      threshold_confidence: s.threshold_confidence ?? s.thresholdConfidence ?? null,
+      threshold_max_visible: s.threshold_max_visible ?? s.thresholdMaxVisible ?? null,
+      threshold_scanned_at: s.threshold_scanned_at ?? s.threshold_scan_at ?? s.thresholdScanAt ?? null,
       threshold_scan_verified: s.threshold_scan_verified ?? false,
       threshold_scan_at: s.threshold_scan_at ?? null,
       expectedCapacity: s.expectedCapacity ?? null,
@@ -2991,8 +2999,12 @@ const THRESHOLD_SESSION_FIELDS = [
   'thresholdSlots',
   'slotsAgree',
   'available_entries',
+  'available_entries_at_least',
   'slot_status',
   'slot_source',
+  'threshold_confidence',
+  'threshold_max_visible',
+  'threshold_scanned_at',
   'threshold_scan_verified',
   'threshold_scan_at',
   'expectedCapacity',
@@ -11071,8 +11083,8 @@ async function runDebugEntriesLeftFullScanContract(page, {
   const maxTested = thresholdScanMaxReached || 0;
   const inferenceSummary = maxTested > 0
     ? runThresholdPresenceInference(visibleByThreshold, maxTested, tileByIdentity)
-    : { exactCount: 0, atLeastCount: 0, noMatchCount: 0 };
-  const { exactCount, atLeastCount, noMatchCount } = inferenceSummary;
+    : { inferences: [], exactCount: 0, atLeastCount: 0, noMatchCount: 0 };
+  const { inferences, exactCount, atLeastCount, noMatchCount } = inferenceSummary;
 
   const countsNonIncreasing = thresholdCountsNonIncreasing(visibleTileCountsByThreshold, thresholdsScanned);
   const fullScanContractOk = !scanFailed
@@ -11102,11 +11114,214 @@ async function runDebugEntriesLeftFullScanContract(page, {
     zeroTilesAtThreshold,
     thresholdParseDiagnostics,
     fullScanContractOk,
+    inferences,
+    maxTested,
+    error,
+  };
+}
+
+function buildGate8ThresholdTileFromInferenceRow(row, isoDate) {
+  const tileMeta = enrichTileMetadataFromIdentityKey(row.identityKey, row.tile);
+  return {
+    isoDate: tileMeta.isoDate || isoDate,
+    timeLabel: tileMeta.timeLabel,
+    time: tileMeta.timeLabel,
+    waveSide: tileMeta.waveSide,
+    sessionCode: tileMeta.sessionCode,
+  };
+}
+
+function buildGate8SessionWriteEntry(existingSession, inferenceRow, scannedAt, maxTested) {
+  const inference = inferenceRow.inference || {};
+  const confidence = inference.thresholdConfidence;
+  const slots = inference.thresholdInferredSlots ?? null;
+  const maxVisible = inference.thresholdMaxVisible ?? null;
+  const entry = { ...existingSession };
+
+  entry.thresholdInferredSlots = slots;
+  entry.thresholdMaxVisible = maxVisible;
+  entry.thresholdConfidence = confidence;
+  entry.thresholdScanVerified = inference.thresholdScanVerified === true;
+  entry.thresholdScanAt = scannedAt;
+  entry.thresholdScanMaxTested = maxTested;
+  entry.thresholdScanMethod = 'entries_left_filter';
+  entry.thresholdDiagnostics = {
+    identityKey: inferenceRow.identityKey,
+    thresholdsSeen: inferenceRow.thresholdsSeen || [],
+    gate: 8,
+  };
+
+  entry.threshold_confidence = confidence;
+  entry.threshold_max_visible = maxVisible;
+  entry.threshold_scanned_at = scannedAt;
+  entry.threshold_scan_at = scannedAt;
+  entry.threshold_scan_verified = entry.thresholdScanVerified;
+  entry.slot_source = 'entries_left_threshold_scan';
+
+  if (confidence === 'exact') {
+    entry.available_entries = slots;
+    entry.available_entries_at_least = null;
+    entry.slot_status = 'exact';
+  } else if (confidence === 'at_least') {
+    entry.available_entries = null;
+    entry.available_entries_at_least = slots;
+    entry.slot_status = 'at_least';
+  } else {
+    entry.available_entries = null;
+    entry.available_entries_at_least = null;
+    entry.slot_status = null;
+  }
+
+  return entry;
+}
+
+function prepareGate8ThresholdWriteRows(inferences, isoDate, maxTested) {
+  const basicSessions = sessionsForDate(isoDate);
+  const scannedAt = new Date().toISOString();
+  const rowsPrepared = [];
+  const skipped = {
+    unmatched: 0,
+    ambiguous: 0,
+    wrongDate: 0,
+    untrusted: 0,
+  };
+
+  for (const row of inferences || []) {
+    const confidence = row.inference?.thresholdConfidence;
+    if (confidence !== 'exact' && confidence !== 'at_least') {
+      skipped.untrusted += 1;
+      continue;
+    }
+    if (row.inference?.thresholdScanVerified !== true) {
+      skipped.untrusted += 1;
+      continue;
+    }
+
+    const tile = buildGate8ThresholdTileFromInferenceRow(row, isoDate);
+    if (tile.isoDate && tile.isoDate !== isoDate) {
+      skipped.wrongDate += 1;
+      continue;
+    }
+
+    const match = matchThresholdTileToSessions(tile, basicSessions);
+    if (match.confidence === 'ambiguous') {
+      skipped.ambiguous += 1;
+      continue;
+    }
+    if (!match.session) {
+      skipped.unmatched += 1;
+      continue;
+    }
+
+    rowsPrepared.push(buildGate8SessionWriteEntry(match.session, row, scannedAt, maxTested));
+  }
+
+  return {
+    rowsPrepared,
+    scannedAt,
+    skipped,
+  };
+}
+
+function resolveGate8WriteMode({ thresholdWriteSafe, writeEnabled, dryRun }) {
+  if (!thresholdWriteSafe) return 'blocked';
+  if (!writeEnabled) return 'disabled';
+  if (dryRun) return 'dry_run';
+  return 'write';
+}
+
+async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun } = {}) {
+  if (!writeEnabled || dryRun || !rowsPrepared.length) {
+    return {
+      rowsWritten: 0,
+      writesPerformed: false,
+      upsert: null,
+    };
+  }
+
+  mergeBatchIntoStore(rowsPrepared, 2, { preserveSlots: true, scrapeKind: 'basic' });
+  const upsert = await upsertCurrentSessionsToSupabase(rowsPrepared, 2, { scrapeKind: 'basic' });
+  const rowsWritten = upsert.rowsUpserted || 0;
+  return {
+    rowsWritten,
+    writesPerformed: rowsWritten > 0,
+    upsert,
+  };
+}
+
+async function runDebugEntriesLeftThresholdWriteContract(page, {
+  isoDate,
+  navigation,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  dryRun = true,
+  write = false,
+} = {}) {
+  const fullScanRun = await runDebugEntriesLeftFullScanContract(page, {
+    isoDate,
+    navigation,
+    minThreshold,
+    maxThreshold,
+  });
+
+  const thresholdWriteSafe = fullScanRun.fullScanContractOk === true && fullScanRun.exactCount > 0;
+  const writeEnabled = write === true;
+  const writeMode = resolveGate8WriteMode({ thresholdWriteSafe, writeEnabled, dryRun });
+
+  let rowsPrepared = [];
+  let rowsWritten = 0;
+  let writesPerformed = false;
+  let writeError = null;
+
+  if (thresholdWriteSafe) {
+    const prep = prepareGate8ThresholdWriteRows(
+      fullScanRun.inferences,
+      isoDate,
+      fullScanRun.thresholdScanMaxReached || fullScanRun.maxTested || 0,
+    );
+    rowsPrepared = prep.rowsPrepared;
+
+    if (writeMode === 'write') {
+      try {
+        const writeResult = await applyGate8ThresholdWriteRows(rowsPrepared, {
+          writeEnabled: true,
+          dryRun: false,
+        });
+        rowsWritten = writeResult.rowsWritten;
+        writesPerformed = writeResult.writesPerformed;
+        if (writeResult.upsert?.error) {
+          writeError = writeResult.upsert.error;
+        }
+      } catch (err) {
+        writeError = err.message || String(err);
+      }
+    }
+  }
+
+  let error = fullScanRun.error || writeError || null;
+  if (!error && thresholdWriteSafe && rowsPrepared.length === 0) {
+    error = 'no_rows_prepared_for_write';
+  }
+
+  return {
+    fullScanContractOk: fullScanRun.fullScanContractOk,
+    exactCount: fullScanRun.exactCount,
+    atLeastCount: fullScanRun.atLeastCount,
+    noMatchCount: fullScanRun.noMatchCount,
+    thresholdsScanned: fullScanRun.thresholdsScanned,
+    thresholdScanMaxReached: fullScanRun.thresholdScanMaxReached,
+    thresholdStopReason: fullScanRun.thresholdStopReason,
+    rowsPrepared: rowsPrepared.length,
+    rowsWritten,
+    writeMode,
+    writesPerformed,
+    thresholdWriteSafe,
     error,
   };
 }
 
 function entriesLeftDebugGateForMode(mode) {
+  if (mode === 'threshold_write_contract') return 8;
   if (mode === 'full_scan_contract') return 7;
   if (mode === 'threshold_inference_contract') return 6;
   if (mode === 'tile_parser_contract') return 5;
@@ -11124,6 +11339,7 @@ async function runDebugEntriesLeftControl({
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
   dryRun = true,
   debug = true,
+  write = false,
   mode = 'recon',
 } = {}) {
   const gateNum = entriesLeftDebugGateForMode(mode);
@@ -11379,6 +11595,49 @@ async function runDebugEntriesLeftControl({
         thresholdWriteSafe: false,
         crashed: false,
         error: fullScanRun.error,
+      };
+    }
+
+    if (mode === 'threshold_write_contract') {
+      const writeRun = await runDebugEntriesLeftThresholdWriteContract(launched.page, {
+        isoDate: requestedIsoDate,
+        navigation: nav,
+        minThreshold,
+        maxThreshold,
+        dryRun,
+        write,
+      });
+      return {
+        gate: 8,
+        mode,
+        dryRun,
+        debug,
+        write,
+        isoDate: requestedIsoDate,
+        computedWeekStart,
+        navigationIsoDate,
+        weekMode,
+        minThreshold: Math.max(1, Number(minThreshold) || 1),
+        maxThreshold: Math.max(
+          1,
+          Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+        ),
+        currentUrl: pageDiag.currentUrl,
+        targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+        fullScanContractOk: writeRun.fullScanContractOk,
+        exactCount: writeRun.exactCount,
+        atLeastCount: writeRun.atLeastCount,
+        thresholdsScanned: writeRun.thresholdsScanned,
+        thresholdScanMaxReached: writeRun.thresholdScanMaxReached,
+        thresholdStopReason: writeRun.thresholdStopReason,
+        rowsPrepared: writeRun.rowsPrepared,
+        rowsWritten: writeRun.rowsWritten,
+        writeMode: writeRun.writeMode,
+        writesPerformed: writeRun.writesPerformed,
+        thresholdWriteSafe: writeRun.thresholdWriteSafe,
+        durationMs: Date.now() - started,
+        crashed: false,
+        error: writeRun.error,
       };
     }
 
@@ -15117,12 +15376,14 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
   const wait = req.body?.wait === true || req.query?.wait === 'true';
   const dryRun = req.body?.dryRun !== false;
   const debug = req.body?.debug !== false;
+  const write = req.body?.write === true;
   const modeRaw = req.body?.mode;
   const mode = modeRaw === 'selection_contract'
     || modeRaw === 'grid_change_contract'
     || modeRaw === 'tile_parser_contract'
     || modeRaw === 'threshold_inference_contract'
     || modeRaw === 'full_scan_contract'
+    || modeRaw === 'threshold_write_contract'
     ? modeRaw
     : 'recon';
   const gate = entriesLeftDebugGateForMode(mode);
@@ -15154,6 +15415,7 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         maxThreshold,
         dryRun,
         debug,
+        write,
         mode,
       });
     } finally {
@@ -15199,7 +15461,9 @@ app.post('/api/admin/debug-entries-left-control', async (req, res) => {
         weekMode,
         thresholds,
         dryRun,
-        message: mode === 'full_scan_contract'
+        message: mode === 'threshold_write_contract'
+          ? 'Entries-left threshold write contract queued — retry with wait=true'
+          : mode === 'full_scan_contract'
           ? 'Entries-left full scan contract queued — retry with wait=true'
           : mode === 'threshold_inference_contract'
           ? 'Entries-left threshold inference contract queued — retry with wait=true'
