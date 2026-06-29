@@ -67,22 +67,22 @@ On startup the server loads saved sessions from `current_sessions` before accept
 The app serves sessions across the full `SCRAPE_WEEKS_AHEAD` window (default 4 weeks), not just today/tomorrow.
 
 - **Tier 1** (every 5 min): today/tomorrow — upserts only those dates; never wipes future rows.
-- **Tier 2** (every 30 min): park-local today through **`BOOKING_WINDOW_END`** (default `2026-07-10`) — basic session tiles only; per-date calendar navigation with diagnostics.
+- **Tier 2** (every 30 min): dynamically discovers all dates exposed on the Atlantic Park booking calendar (from park-local today forward) and upserts basic session tiles with per-date diagnostics.
 - **Tier 3** (every 6 hours): weeks 2–4.
 - **`scrape_snapshots`** merges with existing snapshot data so Tier 1 cannot shrink saved future dates.
 - On startup, if `current_sessions` is sparse, the server **auto-backfills** from `scrape_snapshots` / `availability_snapshots` or schedules Tier 2.
 
-**Manual backfill** (after schema reset or to fill the booking window):
+**Manual backfill** (after schema reset or to refresh all site-available dates):
 
 ```bash
 curl -X POST https://YOUR-APP/api/admin/backfill-current-sessions
-curl -X POST https://YOUR-APP/api/admin/backfill-date-range \
+curl -X POST https://YOUR-APP/api/admin/backfill-available-dates \
   -H 'Content-Type: application/json' \
-  -d '{"startDate":"2026-06-28","endDate":"2026-07-10","mode":"both","wait":true}'
+  -d '{"mode":"both","wait":true}'
 curl https://YOUR-APP/api/debug/coverage
 ```
 
-`POST /api/admin/backfill-date-range` accepts `startDate`, `endDate`, `mode` (`basic_only` | `verified_detail` | `both`), and `wait` (`true` runs synchronously; `false` queues in background). Basic rows are always upserted even when detail verification fails. Use `mode: basic_only` for schedule tiles only; `verified_detail` for modal slot counts where association is proven; `both` runs basic first, then verified detail.
+`POST /api/admin/backfill-available-dates` discovers every date the booking calendar exposes, then scrapes them. Inputs: `mode` (`basic_only` | `verified_detail` | `both`), `wait`, and optional `maxHorizonDays` (safety guardrail, default 120). Basic rows are always upserted even when detail verification fails. `POST /api/admin/backfill-date-range` remains available for explicit start/end ranges (clamped to `maxHorizonDays`).
 
 **Railway:** Disable **Serverless / App Sleep** — otherwise Tier 2/3 scrapes pause until someone opens the app. Long-term: separate web API service + scraper worker.
 
@@ -111,7 +111,7 @@ Two scrape levels run in parallel:
 
 **Optimizations:** persistent enrichment browser (reused Chromium context), week-grouped navigation, network JSON preferred over modals, images/fonts/media blocked during enrichment, per-session upsert + `availability_snapshots` insert.
 
-**Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors. `GET /api/debug/coverage` — per-date `dateStatuses` from park-local today through `BOOKING_WINDOW_END` (`hasBasicRows`, `verifiedDetailCount`, `suppressedDetailCount`, `failureReason`, navigation diagnostics). `GET /api/debug/date/:isoDate` — `dateNavigationDiagnostics`, `modalMismatchCount`, `staleModalCount`, `tileMismatchCount`, `checkedWithSlotsCount`, `checkedAvailableNoSlotCount`, `rowsWithDetailsUnavailable`, plus `failedDetailsSample`, `detailStatusSummary`, and association samples. `GET /api/debug/session/:sessionKey` — parse result and latest captured modal/tile text. `GET /api/sessions?date=YYYY-MM-DD&debug=1` — per-row identity, verification fields, and association diagnostics.
+**Debug:** `GET /api/debug/enrichment` — queue size, stale/missing counts, average run duration, recent errors. `GET /api/debug/coverage` — `discoveredAvailableDates`, `datesWithBasicRows`, `datesWithVerifiedDetails`, `missingDiscoveredDates`, `datesAttempted`/`datesSucceeded`/`datesFailed`, `failureReasonCounts`, per-date `dateStatuses`, and `lastBackfillAvailableDatesResult`. `GET /api/debug/date/:isoDate` — `dateNavigationDiagnostics`, modal/tile mismatch counts, `checkedWithSlotsCount`, `checkedAvailableNoSlotCount`, `rowsWithDetailsUnavailable`. `GET /api/debug/session/:sessionKey` — parse result and latest captured modal/tile text. `GET /api/sessions?date=YYYY-MM-DD&debug=1` — per-row identity, verification fields, and association diagnostics.
 
 **Detail verification:** Slots, capacity, booked counts, and price are only exposed when `detailVerified: true` (modal identity matched expected row: date, time, session type, wave side). Plus-click counts and level-based capacity defaults are never shown as real data. Mismatched modals get `failed_modal_mismatch`; unchanged modal text after a new tile click gets `failed_modal_stale`; wrong tile clicks get `failed_tile_mismatch`. Unverified modal text is stored in `modalDiagnosticRawText`, not trusted `detailRawText`. Repair bad rows: `POST /api/admin/repair-detail-data` with optional `{ "isoDate": "2026-06-29", "dryRun": true }`.
 
@@ -168,8 +168,8 @@ localStorage caches the watchlist as a fallback. On startup the app loads Lineup
 | `INTERNAL_BETA_NOTIFICATIONS` | — | Set `true` for founder demo only — shows **Demo Alerts** in Settings and enables ntfy testing |
 | `NTFY_TOPIC` | — | Optional server fallback when internal beta is on |
 | `LOW_SLOTS_THRESHOLD` | `2` | Notify when watched sessions drop to this many slots or fewer |
-| `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead |
-| `BOOKING_WINDOW_END` | `2026-07-10` | Last ISO date for Tier 2 basic coverage and date-range backfill |
+| `SCRAPE_WEEKS_AHEAD` | `4` | Calendar weeks to scrape ahead (tiers 1/3/4 pagination) |
+| `MAX_BOOKING_HORIZON_DAYS` | `120` | Safety guardrail when discovering/scraping available booking dates (not the product window) |
 | `DEBUG_WAVE_SIDE` | — | Set `1` to log every parsed wave side during scrapes |
 | `APP_VERSION` | `package.json` version | Exposed in `/api/status` for cross-device build checks |
 | `BUILD_TIME` | server boot ISO time | Exposed in `/api/status` |

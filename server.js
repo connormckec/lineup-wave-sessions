@@ -57,7 +57,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
-const BOOKING_WINDOW_END = process.env.BOOKING_WINDOW_END || '2026-07-10';
+const MAX_BOOKING_HORIZON_DAYS = parseInt(process.env.MAX_BOOKING_HORIZON_DAYS || '120', 10);
 
 let lastTier1DurationMs = null;
 let lastTier2DurationMs = null;
@@ -311,6 +311,10 @@ const collectorState = {
   dateNavigationByDate: {},
   dateCoverageAttempts: {},
   lastDateRangeBackfill: null,
+  discoveredAvailableDates: [],
+  lastDiscoveryAt: null,
+  discoveryDiagnostics: null,
+  lastBackfillAvailableDatesResult: null,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -1009,8 +1013,8 @@ async function fetchScrapeSnapshotMeta() {
   }
 }
 
-async function buildBookingWindowDateStatuses() {
-  const dates = expectedDatesInBookingWindow();
+async function buildAvailableDatesCoverageStatuses() {
+  const dates = expectedAvailableBookingDates();
   const dbStats = await queryCurrentSessionsByDateFromDb();
   const rowsByDate = {};
 
@@ -1036,7 +1040,7 @@ async function buildBookingWindowDateStatuses() {
         }
       }
     } catch (e) {
-      console.warn('  buildBookingWindowDateStatuses db query failed:', e.message);
+      console.warn('  buildAvailableDatesCoverageStatuses db query failed:', e.message);
     }
   }
 
@@ -1102,7 +1106,8 @@ async function buildBookingWindowDateStatuses() {
 }
 
 async function buildCoverageDebugPayload() {
-  const expected = expectedDatesInBookingWindow();
+  const discovered = getDiscoveredAvailableDates();
+  const expected = expectedAvailableBookingDates();
   const scrapeWindowExpected = expectedDatesInScrapeWindow();
   const dbStats = await queryCurrentSessionsByDateFromDb();
   const currentMap = dbStats.byDate;
@@ -1111,21 +1116,81 @@ async function buildCoverageDebugPayload() {
   const snapDates = Object.keys(snapMeta.scrapeSnapshotsByDate || {});
 
   const datesInCurrentSessions = expected.filter(d => (currentMap[d] || 0) > 0).sort();
-  const missingDatesFromCurrentSessions = expected.filter(d => !(currentMap[d] > 0));
+  const missingDatesFromCurrentSessions = discovered.length
+    ? discovered.filter(d => !(currentMap[d] > 0))
+    : expected.filter(d => !(currentMap[d] > 0));
+  const datesWithBasicRows = (discovered.length ? discovered : expected)
+    .filter(d => (currentMap[d] || 0) > 0)
+    .sort();
+
+  let datesWithVerifiedDetails = [];
+  if (discovered.length || expected.length) {
+    const checkDates = discovered.length ? discovered : expected;
+    const rowsByDate = {};
+    for (const s of allStoredSessions()) {
+      const dk = sessionDateKey(s);
+      if (!checkDates.includes(dk)) continue;
+      if (!rowsByDate[dk]) rowsByDate[dk] = [];
+      rowsByDate[dk].push(s);
+    }
+    datesWithVerifiedDetails = checkDates.filter(d =>
+      (rowsByDate[d] || []).some(s => sessionDetailVerified(s)),
+    ).sort();
+  }
+
+  const missingDiscoveredDates = discovered.filter(d => !(currentMap[d] > 0));
+  const datesAttempted = (discovered.length ? discovered : expected).filter(d =>
+    persistedDatesChecked.has(d) || !!collectorState.dateCoverageAttempts[d],
+  );
+  const datesSucceeded = (discovered.length ? discovered : expected).filter(d =>
+    (currentMap[d] > 0) || (datesCheckedEmpty.has(d) && persistedDatesChecked.has(d)),
+  );
+  const datesFailed = datesAttempted.filter(d => {
+    const reason = collectorState.dateCoverageAttempts[d]?.failureReason;
+    return !(currentMap[d] > 0)
+      && !datesCheckedEmpty.has(d)
+      && reason
+      && reason !== 'checked_empty_no_sessions_on_site';
+  });
+
+  const failureReasonCounts = {};
+  for (const d of datesAttempted) {
+    const reason = collectorState.dateCoverageAttempts[d]?.failureReason
+      || collectorState.dateCoverageAttempts[d]?.navigationError;
+    if (reason) failureReasonCounts[reason] = (failureReasonCounts[reason] || 0) + 1;
+  }
+
   const coverage = computeDateCoverage();
   const detailStats = detailCoverageStats();
   const sparse = isCurrentSessionsSparse();
   const fallback = await checkFallbackAvailable();
 
   let recommendedAction = 'none';
-  if (sparse && fallback) recommendedAction = 'POST /api/admin/backfill-current-sessions';
-  else if (sparse) recommendedAction = 'wait for Tier 2/3 scrape or run tier scrape manually';
-  else if (missingDatesFromCurrentSessions.length) recommendedAction = 'background Tier 2/3 will fill missing dates';
+  if (!discovered.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
+  else if (sparse && fallback) recommendedAction = 'POST /api/admin/backfill-current-sessions';
+  else if (sparse) recommendedAction = 'POST /api/admin/backfill-available-dates or wait for Tier 2 scrape';
+  else if (missingDiscoveredDates.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
 
   return {
-    bookingWindowEnd: bookingWindowEndDate(),
     parkTodayIso: getParkTodayIso(),
-    dateStatuses: await buildBookingWindowDateStatuses(),
+    maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
+    maxHorizonDate: maxHorizonDateKey(),
+    discoveredAvailableDates: discovered,
+    discoveredAvailableDatesCount: discovered.length,
+    lastDiscoveryAt: collectorState.lastDiscoveryAt,
+    discoveryDiagnostics: collectorState.discoveryDiagnostics,
+    datesWithBasicRows,
+    datesWithVerifiedDetails,
+    missingDiscoveredDates,
+    datesAttempted,
+    datesAttemptedCount: datesAttempted.length,
+    datesSucceeded,
+    datesSucceededCount: datesSucceeded.length,
+    datesFailed,
+    datesFailedCount: datesFailed.length,
+    failureReasonCounts,
+    lastBackfillAvailableDatesResult: collectorState.lastBackfillAvailableDatesResult,
+    dateStatuses: await buildAvailableDatesCoverageStatuses(),
     scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
     effectiveWeeksAhead,
     expectedDates: expected,
@@ -7157,24 +7222,40 @@ function enumerateDateKeys(fromKey, toKey) {
   return out;
 }
 
-function bookingWindowEndDate() {
-  return BOOKING_WINDOW_END;
+function maxHorizonDateKey(maxHorizonDays = MAX_BOOKING_HORIZON_DAYS) {
+  const today = getParkTodayIso();
+  const d = parseDateKey(today);
+  d.setDate(d.getDate() + maxHorizonDays);
+  return dateKeyFromDate(d);
 }
 
-function expectedDatesInBookingWindow() {
+function getDiscoveredAvailableDates() {
+  return collectorState.discoveredAvailableDates || [];
+}
+
+function expectedAvailableBookingDates() {
+  const discovered = getDiscoveredAvailableDates();
+  if (discovered.length) return discovered;
   const today = getParkTodayIso();
-  const end = bookingWindowEndDate();
-  if (today > end) return [];
-  return enumerateDateKeys(today, end);
+  const maxDate = maxHorizonDateKey();
+  return [...new Set(
+    allStoredSessions()
+      .map(sessionDateKey)
+      .filter(d => d && d >= today && d <= maxDate),
+  )].sort();
+}
+
+function clampDateRangeToHorizon(startDate, endDate, maxHorizonDays = MAX_BOOKING_HORIZON_DAYS) {
+  const today = getParkTodayIso();
+  const maxDate = maxHorizonDateKey(maxHorizonDays);
+  const start = startDate < today ? today : startDate;
+  const finish = endDate > maxDate ? maxDate : endDate;
+  if (start > finish) return { start: null, end: null, dates: [] };
+  return { start, end: finish, dates: enumerateDateKeys(start, finish) };
 }
 
 function clampDateRangeToBookingWindow(startDate, endDate) {
-  const today = getParkTodayIso();
-  const end = bookingWindowEndDate();
-  const start = startDate < today ? today : startDate;
-  const finish = endDate > end ? end : endDate;
-  if (start > finish) return { start: null, end: null, dates: [] };
-  return { start, end: finish, dates: enumerateDateKeys(start, finish) };
+  return clampDateRangeToHorizon(startDate, endDate);
 }
 
 function sessionInDateRange(s, startDate, endDate) {
@@ -7440,6 +7521,335 @@ async function scrapeBasicSessionsForDates(page, dates, { tier = 0, sourceLabel 
   return { batch, dateResults, datesSeen, sessionsFound: batch.length };
 }
 
+async function discoverAvailableBookingDates(page, { maxHorizonDays = MAX_BOOKING_HORIZON_DAYS } = {}) {
+  const today = getParkTodayIso();
+  const maxDate = maxHorizonDateKey(maxHorizonDays);
+  const calendarDatesDiscovered = new Set();
+  const discoveryDiagnostics = {
+    parkTodayIso: today,
+    maxHorizonDays,
+    maxHorizonDate: maxDate,
+    weeksScanned: 0,
+    stoppedReason: null,
+    lastVisibleWeekStart: null,
+    lastVisibleWeekEnd: null,
+  };
+
+  const nav = await navigateCalendarToShowDate(page, today);
+  if (!nav.targetDateVisible) {
+    console.log(`  [discover] warning: today not visible (${nav.navigationError || 'unknown'}) — scanning from current week`);
+  }
+  await dismissCookieBanner(page).catch(() => {});
+
+  const seenSigs = new Set();
+  for (let guard = 0; guard < 52; guard++) {
+    const visible = await getVisibleDateKeysFromPage(page);
+    const fp = await getCalendarFingerprint(page);
+
+    if (seenSigs.has(fp.sig) && fp.count > 0) {
+      discoveryDiagnostics.stoppedReason = 'repeated_calendar_fingerprint';
+      break;
+    }
+    seenSigs.add(fp.sig);
+    discoveryDiagnostics.weeksScanned++;
+    if (visible.length) {
+      discoveryDiagnostics.lastVisibleWeekStart = visible[0];
+      discoveryDiagnostics.lastVisibleWeekEnd = visible[visible.length - 1];
+    }
+
+    for (const d of visible) {
+      if (d >= today && d <= maxDate) calendarDatesDiscovered.add(d);
+    }
+
+    if (visible.length && visible[visible.length - 1] >= maxDate) {
+      discoveryDiagnostics.stoppedReason = 'max_horizon_reached';
+      break;
+    }
+
+    if (!await canAdvanceCalendar(page)) {
+      discoveryDiagnostics.stoppedReason = 'calendar_end_no_next_arrow';
+      break;
+    }
+    if (!await advanceCalendarWeek(page)) {
+      discoveryDiagnostics.stoppedReason = 'advance_failed';
+      break;
+    }
+    await dismissCookieBanner(page).catch(() => {});
+  }
+
+  const dates = [...calendarDatesDiscovered].sort();
+  collectorState.discoveredAvailableDates = dates;
+  collectorState.lastDiscoveryAt = new Date().toISOString();
+  collectorState.discoveryDiagnostics = discoveryDiagnostics;
+
+  console.log(`  [discover] ${dates.length} calendar date(s) from ${today} through ${dates[dates.length - 1] || 'none'} (${discoveryDiagnostics.stoppedReason || 'done'})`);
+  return { dates, diagnostics: discoveryDiagnostics };
+}
+
+async function scrapeAllAvailableBookingDates(page, {
+  maxHorizonDays = MAX_BOOKING_HORIZON_DAYS,
+  tier = 2,
+  sourceLabel = 'available_dates_scrape',
+  minDay = 0,
+} = {}) {
+  const today = getParkTodayIso();
+  const maxDate = maxHorizonDateKey(maxHorizonDays);
+  const allByKey = new Map();
+  const datesSeen = new Set();
+  const calendarDatesDiscovered = new Set();
+  const discoveryDiagnostics = {
+    parkTodayIso: today,
+    maxHorizonDays,
+    maxHorizonDate: maxDate,
+    weeksScanned: 0,
+    stoppedReason: null,
+    lastVisibleWeekStart: null,
+    lastVisibleWeekEnd: null,
+  };
+
+  const nav = await navigateCalendarToShowDate(page, today);
+  if (!nav.targetDateVisible) {
+    console.log(`  [${sourceLabel}] warning: today not visible (${nav.navigationError || 'unknown'}) — scraping from current week`);
+  }
+  await dismissCookieBanner(page).catch(() => {});
+
+  const seenSigs = new Set();
+  for (let guard = 0; guard < 52; guard++) {
+    const { visible } = await absorbVisibleSessions(page, allByKey, datesSeen, discoveryDiagnostics.weeksScanned);
+    const fp = await getCalendarFingerprint(page);
+
+    if (seenSigs.has(fp.sig) && fp.count > 0) {
+      discoveryDiagnostics.stoppedReason = 'repeated_calendar_fingerprint';
+      break;
+    }
+    seenSigs.add(fp.sig);
+    discoveryDiagnostics.weeksScanned++;
+    if (visible.length) {
+      discoveryDiagnostics.lastVisibleWeekStart = visible[0];
+      discoveryDiagnostics.lastVisibleWeekEnd = visible[visible.length - 1];
+    }
+
+    for (const d of visible) {
+      if (d >= today && d <= maxDate) calendarDatesDiscovered.add(d);
+    }
+
+    if (visible.length && visible[visible.length - 1] >= maxDate) {
+      discoveryDiagnostics.stoppedReason = 'max_horizon_reached';
+      break;
+    }
+
+    if (!await canAdvanceCalendar(page)) {
+      discoveryDiagnostics.stoppedReason = 'calendar_end_no_next_arrow';
+      break;
+    }
+    if (!await advanceCalendarWeek(page)) {
+      discoveryDiagnostics.stoppedReason = 'advance_failed';
+      break;
+    }
+    await dismissCookieBanner(page).catch(() => {});
+  }
+
+  const discoveredDates = [...calendarDatesDiscovered].sort();
+  collectorState.discoveredAvailableDates = discoveredDates;
+  collectorState.lastDiscoveryAt = new Date().toISOString();
+  collectorState.discoveryDiagnostics = discoveryDiagnostics;
+
+  const batch = [...allByKey.values()]
+    .filter(s => {
+      const dk = sessionDateKey(s);
+      return dk && dk >= today && dk <= maxDate && daysFromToday(dk) >= minDay;
+    })
+    .map(s => ({
+      ...s,
+      tier: tier || s.tier || 2,
+      detailStatus: s.detailStatus || 'pending',
+    }));
+
+  const dateResults = discoveredDates
+    .filter(d => daysFromToday(d) >= minDay)
+    .map((isoDate) => {
+      const onDate = batch.filter(s => sessionDateKey(s) === isoDate);
+      const result = {
+        isoDate,
+        targetDateVisible: true,
+        sessionsFound: onDate.length,
+        rowsUpserted: 0,
+        snapshotsInserted: 0,
+        verifiedDetailsWritten: 0,
+        detailValuesSuppressed: 0,
+        failureReason: onDate.length === 0 ? 'checked_empty_no_sessions_on_site' : null,
+      };
+      persistedDatesChecked.add(isoDate);
+      if (onDate.length === 0) datesCheckedEmpty.add(isoDate);
+      else datesCheckedEmpty.delete(isoDate);
+      recordDateCoverageAttempt(isoDate, result);
+      return result;
+    });
+
+  console.log(
+    `  [${sourceLabel}] discovered ${discoveredDates.length} date(s), ${batch.length} session row(s) (${discoveryDiagnostics.stoppedReason || 'done'})`,
+  );
+
+  return {
+    batch,
+    dateResults,
+    discoveredDates,
+    datesSeen,
+    discoveryDiagnostics,
+    sessionsFound: batch.length,
+  };
+}
+
+async function runBackfillAvailableDates({
+  mode = 'both',
+  maxHorizonDays,
+  reason = 'admin_backfill_available_dates',
+} = {}) {
+  const horizon = Number.isFinite(Number(maxHorizonDays)) && Number(maxHorizonDays) > 0
+    ? Math.min(Number(maxHorizonDays), MAX_BOOKING_HORIZON_DAYS * 2)
+    : MAX_BOOKING_HORIZON_DAYS;
+
+  const report = {
+    mode,
+    maxHorizonDays: horizon,
+    discoveredAvailableDates: [],
+    dateResults: [],
+    sessionsFound: 0,
+    rowsUpserted: 0,
+    snapshotsInserted: 0,
+    verifiedDetailsWritten: 0,
+    detailValuesSuppressed: 0,
+    discoveryDiagnostics: null,
+    detail: null,
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+    errors: [],
+  };
+
+  const started = Date.now();
+  let launched = null;
+
+  try {
+    if (!tryAcquireScrapeLock(`available dates backfill (${reason})`, 0)) {
+      report.skipped = true;
+      report.skipReason = 'scrape_in_progress';
+      return report;
+    }
+
+    if (mode === 'basic_only' || mode === 'both') {
+      launched = await launchBrowser();
+      const { page } = launched;
+      await openBookingPage(page);
+
+      const scrape = await scrapeAllAvailableBookingDates(page, {
+        maxHorizonDays: horizon,
+        tier: 2,
+        sourceLabel: reason,
+        minDay: 0,
+      });
+
+      report.discoveredAvailableDates = scrape.discoveredDates;
+      report.discoveryDiagnostics = scrape.discoveryDiagnostics;
+      report.sessionsFound = scrape.sessionsFound;
+      report.dateResults = scrape.dateResults;
+
+      if (scrape.batch.length) {
+        mergeBatchIntoStore(scrape.batch, 2, { preserveSlots: true, scrapeKind: 'basic' });
+        recordTierDateCoverage(new Set(scrape.discoveredDates));
+        const writeDiag = await persistTierScrapeResults(scrape.batch, 2, { slotCountsAttempted: false });
+        report.rowsUpserted = writeDiag.rowsUpserted;
+        report.snapshotsInserted = writeDiag.snapshotsInserted;
+        if (writeDiag.upsertError) report.errors.push({ error: writeDiag.upsertError, phase: 'upsert' });
+
+        for (const dr of report.dateResults) {
+          dr.rowsUpserted = scrape.batch.filter(s => sessionDateKey(s) === dr.isoDate).length;
+          dr.snapshotsInserted = dr.rowsUpserted;
+          recordDateCoverageAttempt(dr.isoDate, dr);
+        }
+      }
+
+      await saveLatestSnapshotToSupabase();
+    }
+
+    if (mode === 'verified_detail' || mode === 'both') {
+      await ensureSessionsForStatus();
+      if (!report.discoveredAvailableDates.length) {
+        report.discoveredAvailableDates = getDiscoveredAvailableDates();
+      }
+      if (!report.discoveredAvailableDates.length) {
+        const today = getParkTodayIso();
+        report.discoveredAvailableDates = [...new Set(
+          allStoredSessions()
+            .map(sessionDateKey)
+            .filter(d => d && d >= today),
+        )].sort();
+      }
+
+      const targets = report.discoveredAvailableDates.flatMap(d =>
+        sessionsForDate(d).filter(s => s.available !== false),
+      );
+
+      if (!targets.length) {
+        if (mode === 'verified_detail') {
+          report.skipped = true;
+          report.skipReason = 'no_open_sessions_discovered';
+        }
+      } else {
+        const enrichStats = await runDetailEnrichment({
+          sessions: targets,
+          reason: `${reason}_detail`,
+        });
+        report.verifiedDetailsWritten = enrichStats.detailRowsVerified ?? 0;
+        report.detailValuesSuppressed = enrichStats.detailRowsSuppressed ?? 0;
+        report.detail = enrichStats;
+        if (enrichStats.errors?.length) report.errors.push(...enrichStats.errors.slice(0, 5));
+
+        if (!report.dateResults.length) {
+          report.dateResults = report.discoveredAvailableDates.map((isoDate) => {
+            const rows = sessionsForDate(isoDate);
+            return {
+              isoDate,
+              targetDateVisible: true,
+              sessionsFound: rows.length,
+              rowsUpserted: rows.length,
+              snapshotsInserted: 0,
+              verifiedDetailsWritten: rows.filter(s => sessionDetailVerified(s)).length,
+              detailValuesSuppressed: rows.filter(s => {
+                const st = effectiveDetailStatus(s);
+                return isDetailFailureStatus(st) || isInvalidCheckedWithSlotsStatus(s);
+              }).length,
+              failureReason: rows.length === 0 ? 'checked_empty_no_sessions_on_site' : null,
+            };
+          });
+        } else {
+          for (const dr of report.dateResults) {
+            const rows = sessionsForDate(dr.isoDate);
+            dr.verifiedDetailsWritten = rows.filter(s => sessionDetailVerified(s)).length;
+            dr.detailValuesSuppressed = rows.filter(s => {
+              const st = effectiveDetailStatus(s);
+              return isDetailFailureStatus(st) || isInvalidCheckedWithSlotsStatus(s);
+            }).length;
+            recordDateCoverageAttempt(dr.isoDate, dr);
+          }
+        }
+      }
+    }
+
+    await refreshCoverageFlags();
+    report.durationMs = Date.now() - started;
+    collectorState.lastBackfillAvailableDatesResult = { ...report, completedAt: new Date().toISOString() };
+    return report;
+  } catch (e) {
+    report.errors.push({ error: e.message });
+    report.durationMs = Date.now() - started;
+    throw e;
+  } finally {
+    releaseScrapeLock();
+    if (launched?.browser) await launched.browser.close().catch(() => {});
+  }
+}
+
 async function runDateRangeBackfillBasic(startDate, endDate, { tier = 0, reason = 'backfill_date_range' } = {}) {
   const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
   const report = {
@@ -7667,8 +8077,13 @@ function tierMaxDay(tier) {
   const cfg = TIER_CONFIG[tier];
   if (cfg.maxDay != null) return cfg.maxDay;
   if (tier === 2) {
-    const endDays = daysFromToday(bookingWindowEndDate());
-    return Math.max(6, endDays >= 0 ? endDays : 0);
+    const discovered = getDiscoveredAvailableDates();
+    if (discovered.length) {
+      const last = discovered[discovered.length - 1];
+      const endDays = daysFromToday(last);
+      return Math.max(6, endDays >= 0 ? endDays : 0);
+    }
+    return Math.max(6, Math.min(MAX_BOOKING_HORIZON_DAYS, effectiveWeeksAhead * 7 - 1));
   }
   return effectiveWeeksAhead * 7 - 1;
 }
@@ -8020,26 +8435,48 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     await openBookingPage(page);
 
     const tierRequiredDates = targetDates.length ? targetDates : expectedDatesForTier(tier);
-    let { sessions: rawBatch, rawTilesTotal, weeksScraped, datesSeen } =
-      await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
+    let rawBatch;
+    let rawTilesTotal = 0;
+    let weeksScraped = 0;
+    let datesSeen = new Set();
 
-    if (tier >= 2) {
-      const requiredInWindow = tier === 2
-        ? expectedDatesInBookingWindow().filter(d => daysFromToday(d) >= cfg.minDay)
-        : tierRequiredDates;
-      const missingDates = requiredInWindow.filter(d => {
-        const hasSessions = rawBatch.some(s => sessionDateKey(s) === d);
-        return !hasSessions && (!datesSeen.has(d) || !hasSessions);
+    if (tier === 2) {
+      const avail = await scrapeAllAvailableBookingDates(page, {
+        maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
+        tier: 2,
+        sourceLabel: `tier${tier}`,
+        minDay: cfg.minDay,
       });
-      if (missingDates.length) {
-        console.log(`  tier ${tier} targeted fill for ${missingDates.length} date(s): ${missingDates.join(', ')}`);
-        const fill = await scrapeBasicSessionsForDates(page, missingDates, { tier, sourceLabel: `tier${tier}_fill` });
-        report.dateRangeFill = fill.dateResults;
-        for (const s of fill.batch) {
-          if (!rawBatch.find(x => x.key === s.key)) rawBatch.push(s);
-        }
-        for (const d of fill.dateResults.filter(r => r.targetDateVisible).map(r => r.targetIsoDate)) {
-          datesSeen.add(d);
+      rawBatch = avail.batch;
+      datesSeen = avail.datesSeen;
+      weeksScraped = avail.discoveryDiagnostics.weeksScraped;
+      rawTilesTotal = rawBatch.length;
+      report.dateRangeFill = avail.dateResults;
+      report.availableDatesDiscovery = avail.discoveryDiagnostics;
+      report.discoveredAvailableDates = avail.discoveredDates;
+    } else {
+      const paginated = await scrapePaginatedWeeks(page, startWeek, endWeek, { requiredDates: tierRequiredDates });
+      rawBatch = paginated.sessions;
+      rawTilesTotal = paginated.rawTilesTotal;
+      weeksScraped = paginated.weeksScraped;
+      datesSeen = paginated.datesSeen;
+
+      if (tier >= 3) {
+        const requiredInWindow = tierRequiredDates;
+        const missingDates = requiredInWindow.filter(d => {
+          const hasSessions = rawBatch.some(s => sessionDateKey(s) === d);
+          return !hasSessions && (!datesSeen.has(d) || !hasSessions);
+        });
+        if (missingDates.length) {
+          console.log(`  tier ${tier} targeted fill for ${missingDates.length} date(s): ${missingDates.join(', ')}`);
+          const fill = await scrapeBasicSessionsForDates(page, missingDates, { tier, sourceLabel: `tier${tier}_fill` });
+          report.dateRangeFill = fill.dateResults;
+          for (const s of fill.batch) {
+            if (!rawBatch.find(x => x.key === s.key)) rawBatch.push(s);
+          }
+          for (const d of fill.dateResults.filter(r => r.targetDateVisible).map(r => r.targetIsoDate)) {
+            datesSeen.add(d);
+          }
         }
       }
     }
@@ -8587,7 +9024,7 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
         startDate,
         endDate,
         mode,
-        bookingWindowEnd: bookingWindowEndDate(),
+        maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
         message: 'Backfill queued — poll GET /api/debug/coverage or GET /api/debug/collector (lastDateRangeBackfill)',
       });
     }
@@ -8600,7 +9037,7 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
       startDate,
       endDate,
       mode,
-      bookingWindowEnd: bookingWindowEndDate(),
+      maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
       ...result,
     });
   } catch (e) {
@@ -8609,6 +9046,83 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
       errors: [{ error: e.message }],
       startDate,
       endDate,
+      mode,
+    });
+  }
+});
+
+app.post('/api/admin/backfill-available-dates', async (req, res) => {
+  const mode = req.body?.mode || 'both';
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+  const maxHorizonDays = req.body?.maxHorizonDays != null
+    ? parseInt(req.body.maxHorizonDays, 10)
+    : undefined;
+
+  if (!['basic_only', 'verified_detail', 'both'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be basic_only, verified_detail, or both' });
+  }
+
+  try {
+    await ensureSessionsForStatus();
+
+    if (scrapeInProgress && !wait) {
+      return res.json({
+        started: false,
+        queued: false,
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        mode,
+        wait: false,
+        maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
+        message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
+      });
+    }
+
+    if (wait && scrapeInProgress) {
+      await new Promise((resolve) => {
+        const poll = setInterval(() => {
+          if (!scrapeInProgress) { clearInterval(poll); resolve(); }
+        }, 1000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 300_000);
+      });
+    }
+
+    const runBackfill = () => runBackfillAvailableDates({
+      mode,
+      maxHorizonDays,
+      reason: 'admin_backfill_available_dates',
+    }).then(async (result) => {
+      await refreshCoverageFlags().catch(() => {});
+      return result;
+    });
+
+    if (!wait) {
+      setImmediate(() => {
+        runBackfill().catch((err) => console.error('backfill-available-dates error:', err));
+      });
+      return res.json({
+        started: true,
+        queued: true,
+        wait: false,
+        mode,
+        maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
+        message: 'Backfill queued — poll GET /api/debug/coverage (discoveredAvailableDates, lastBackfillAvailableDatesResult)',
+      });
+    }
+
+    const result = await runBackfill();
+    res.json({
+      started: true,
+      queued: false,
+      wait: true,
+      mode,
+      maxHorizonDays: maxHorizonDays ?? MAX_BOOKING_HORIZON_DAYS,
+      ...result,
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: e.message,
+      errors: [{ error: e.message }],
       mode,
     });
   }

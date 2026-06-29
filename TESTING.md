@@ -43,19 +43,21 @@ After schema reset or sparse `current_sessions` (only today/tomorrow):
 1. **Check coverage:**
 
 ```bash
-curl -s http://localhost:3000/api/debug/coverage | jq '{bookingWindowEnd,parkTodayIso,expectedDatesCount,dateStatuses,datesInCurrentSessions,missingDates,coveragePercent,recommendedAction}'
+curl -s http://localhost:3000/api/debug/coverage | jq '{discoveredAvailableDates,discoveredAvailableDatesCount,datesWithBasicRows,datesWithVerifiedDetails,missingDiscoveredDates,datesAttempted,datesSucceeded,datesFailed,failureReasonCounts,recommendedAction,lastBackfillAvailableDatesResult}'
 curl -s http://localhost:3000/api/status | jq '{currentSessionsByDate, earliestSessionDate, latestSessionDate, uniqueDatesCount, missingDatesInScrapeWindow, backfillRecommended, fallbackAvailable}'
 ```
 
-Every date from park-local today through `bookingWindowEnd` should appear in `dateStatuses` with `attempted` / `hasBasicRows` / `failureReason`.
+After discovery/backfill, every date exposed on the booking calendar should appear in `discoveredAvailableDates`. Dates not on the site are not failures.
 
-2. **Backfill booking window** (recommended after deploy or sparse data):
+2. **Backfill all site-available dates** (recommended after deploy or sparse data):
 
 ```bash
-curl -s -X POST http://localhost:3000/api/admin/backfill-date-range \
+curl -s -X POST http://localhost:3000/api/admin/backfill-available-dates \
   -H 'Content-Type: application/json' \
-  -d '{"startDate":"2026-06-28","endDate":"2026-07-10","mode":"both","wait":true}' | jq
+  -d '{"mode":"both","wait":true}' | jq
 ```
+
+Optional guardrail: `"maxHorizonDays": 120` (default). Dates beyond what the site exposes are never treated as missing.
 
 3. **Backfill from snapshots** (after schema reset):
 
@@ -73,8 +75,8 @@ done
 
 4. Arrow through those dates in the UI — sessions should render (or *Showing saved snapshot* for fallback data).
 5. After Tier 1 runs, confirm future dates **do not disappear**.
-6. Wait for or trigger Tier 2 — confirm dates through `2026-07-10` populate in `currentSessionsByDate`.
-7. **Acceptance:** `/api/debug/coverage` lists every date today→`bookingWindowEnd`. Tomorrow shows slot counts only when `checkedWithSlotsCount` > 0 and rows have `detailVerified`; otherwise UI shows *Open · details unavailable* (no default 10/12/2 values). `POST /api/admin/backfill-date-range` with `mode: both` must not wipe existing good today/tomorrow basic rows.
+6. Wait for or trigger Tier 2 — confirm all site-available dates populate in `currentSessionsByDate`.
+7. **Acceptance:** If the site exposes sessions through July 10 or beyond, those dates appear in `discoveredAvailableDates` and `/api/sessions?date=YYYY-MM-DD` returns basic rows. Dates not on the booking site are not app failures. Tomorrow shows slot counts only when modal association is verified; otherwise UI shows *Open · details unavailable* (no default 10/12/2 values). `POST /api/admin/backfill-available-dates` with `mode: both` must not wipe existing good today/tomorrow basic rows.
 
 **Railway:** App Sleep must be disabled for continuous background collection.
 
