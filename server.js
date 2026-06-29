@@ -42,6 +42,17 @@ const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const THRESHOLD_SCAN_MAX_DEFAULT = parseInt(process.env.THRESHOLD_SCAN_MAX || '20', 10);
 const THRESHOLD_SCAN_MIN_DEFAULT = 1;
 const THRESHOLD_FILTER_SETTLE_MS = parseInt(process.env.THRESHOLD_FILTER_SETTLE_MS || '1200', 10);
+const THRESHOLD_SCAN_MAX_WEEKS_PER_RUN = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_MAX_WEEKS_PER_RUN || '1', 10));
+const THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE || '20', 10));
+const THRESHOLD_SCAN_PAGE_TIMEOUT_MS = parseInt(process.env.THRESHOLD_SCAN_PAGE_TIMEOUT_MS || '45000', 10);
+const THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK = process.env.THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK !== 'false';
+const THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE = Math.max(1, parseInt(process.env.THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE || '5', 10));
+const THRESHOLD_FILTER_TIMEOUT_MS = parseInt(process.env.THRESHOLD_FILTER_TIMEOUT_MS || '20000', 10);
+const THRESHOLD_TILE_SCRAPE_TIMEOUT_MS = parseInt(process.env.THRESHOLD_TILE_SCRAPE_TIMEOUT_MS || '15000', 10);
+const BOOKING_PAGE_TIMEOUT_MS = parseInt(process.env.BOOKING_PAGE_TIMEOUT_MS || '45000', 10);
+const SCRAPE_LOCK_MAX_MS = parseInt(process.env.SCRAPE_LOCK_MAX_MS || '900000', 10);
+const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
+const BACKGROUND_THRESHOLD_SCAN_EVERY_MINS = Math.max(15, parseInt(process.env.BACKGROUND_THRESHOLD_SCAN_EVERY_MINS || '60', 10));
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
 const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5', 10) || 5);
@@ -325,6 +336,15 @@ const collectorState = {
   detailQueueDrainScheduled: false,
   lastDetailQueueBatch: null,
   lastThresholdScanResult: null,
+  lastPageCrashAt: null,
+  lastPageCrashStage: null,
+  lastThresholdScanWeek: null,
+  thresholdScanBatchProgress: null,
+  thresholdScanWeeksRemaining: [],
+  thresholdScanPendingWeeks: [],
+  thresholdScanCompletedWeeks: [],
+  thresholdScanLastError: null,
+  thresholdScanRecovered: false,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -1267,6 +1287,7 @@ async function buildCoverageDebugPayload() {
     inMemoryDatesCount: Object.keys(currentSessionsByDateMap()).length,
     ...thresholdCoverage,
     lastThresholdScanResult: collectorState.lastThresholdScanResult,
+    ...thresholdStabilityDebugPayload(),
   };
 }
 
@@ -3228,6 +3249,126 @@ function computeThresholdCoverageByDate(dates) {
   return { datesWithThresholdScans: datesWithThresholdScans.sort(), thresholdCountsByDate };
 }
 
+function thresholdStabilityDebugPayload() {
+  return {
+    lastPageCrashAt: collectorState.lastPageCrashAt,
+    lastPageCrashStage: collectorState.lastPageCrashStage,
+    lastThresholdScanWeek: collectorState.lastThresholdScanWeek,
+    thresholdScanBatchProgress: collectorState.thresholdScanBatchProgress,
+    thresholdScanWeeksRemaining: collectorState.thresholdScanWeeksRemaining,
+    thresholdScanPendingWeeks: collectorState.thresholdScanPendingWeeks,
+    thresholdScanCompletedWeeks: collectorState.thresholdScanCompletedWeeks,
+    thresholdScanLastError: collectorState.thresholdScanLastError,
+    thresholdScanRecovered: collectorState.thresholdScanRecovered,
+    thresholdScanMaxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
+    thresholdScanRecycleBrowserEachWeek: THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK,
+    backgroundThresholdScanEnabled: BACKGROUND_THRESHOLD_SCAN_ENABLED,
+  };
+}
+
+function isPlaywrightCrashError(err) {
+  const msg = (err?.message || String(err || '')).toLowerCase();
+  return msg.includes('page crashed')
+    || msg.includes('target closed')
+    || msg.includes('target page, context or browser has been closed')
+    || msg.includes('browser has been closed')
+    || msg.includes('browser disconnected')
+    || msg.includes('navigation timeout')
+    || msg.includes('timeout')
+    || msg.includes('context disposed')
+    || msg.includes('net::err');
+}
+
+function recordPageCrash(stage, err, { weekKey = null, failureReason = 'failed_page_crash' } = {}) {
+  const now = new Date().toISOString();
+  collectorState.lastPageCrashAt = now;
+  collectorState.lastPageCrashStage = stage;
+  collectorState.thresholdScanLastError = err?.message || String(err);
+  collectorState.thresholdScanRecovered = false;
+  if (weekKey) collectorState.lastThresholdScanWeek = weekKey;
+  lastScrapeError = collectorState.thresholdScanLastError;
+  console.error(`  [playwright crash] stage=${stage} week=${weekKey || 'n/a'} reason=${failureReason}: ${collectorState.thresholdScanLastError}`);
+  return failureReason;
+}
+
+function markThresholdScanRecovered() {
+  if (collectorState.lastPageCrashAt) {
+    collectorState.thresholdScanRecovered = true;
+  }
+}
+
+async function safeCloseBrowser(launched) {
+  if (!launched) return;
+  try {
+    if (launched.page) await launched.page.close().catch(() => {});
+    if (launched.context) await launched.context.close().catch(() => {});
+    if (launched.browser) await launched.browser.close().catch(() => {});
+  } catch {}
+}
+
+async function withTimeout(promise, ms, label = 'operation') {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}_timeout_after_${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withPlaywrightGuard(fn, { stage = 'playwright', timeout = THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey = null } = {}) {
+  try {
+    return await withTimeout(Promise.resolve().then(fn), timeout, stage);
+  } catch (e) {
+    if (isPlaywrightCrashError(e)) {
+      recordPageCrash(stage, e, { weekKey });
+    }
+    throw e;
+  }
+}
+
+function buildThresholdBatches(minThreshold, maxThreshold, batchSize = THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE) {
+  const minT = Math.max(1, Number(minThreshold) || THRESHOLD_SCAN_MIN_DEFAULT);
+  const maxT = Math.max(minT, Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE));
+  const batches = [];
+  for (let start = minT; start <= maxT; start += batchSize) {
+    const end = Math.min(start + batchSize - 1, maxT);
+    batches.push({
+      batchIndex: batches.length,
+      minThreshold: start,
+      maxThreshold: end,
+      thresholds: Array.from({ length: end - start + 1 }, (_, i) => start + i),
+    });
+  }
+  return batches;
+}
+
+function buildWeekAnchorsFromDates(dates) {
+  const sorted = asSessionArray(dates).filter(Boolean).sort();
+  const anchors = [];
+  let lastBucket = null;
+  for (const isoDate of sorted) {
+    const bucket = Math.floor(daysFromToday(isoDate) / 7);
+    if (bucket === lastBucket) continue;
+    lastBucket = bucket;
+    anchors.push({ weekKey: isoDate, anchorIsoDate: isoDate });
+  }
+  return anchors;
+}
+
+function buildThresholdScanResumeQueue(dates, { resumeQueue = null } = {}) {
+  if (resumeQueue?.length) return resumeQueue;
+  const pendingKeys = collectorState.thresholdScanPendingWeeks || [];
+  if (pendingKeys.length) {
+    return pendingKeys.map(weekKey => ({ weekKey, anchorIsoDate: weekKey }));
+  }
+  return buildWeekAnchorsFromDates(dates);
+}
+
 function applyDetailSourceFields(entry, session, validation) {
   const src = validation?.parsedFromModal || {};
   entry.detailSourceSessionKey = session?.key || null;
@@ -4935,8 +5076,19 @@ async function runDetailEnrichmentByPriority(priority) {
 
 function tryAcquireScrapeLock(context = 'scrape', tier = null) {
   if (scrapeInProgress) {
-    console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
-    return false;
+    if (currentScrapeStartedAt) {
+      const ageMs = Date.now() - new Date(currentScrapeStartedAt).getTime();
+      if (ageMs > SCRAPE_LOCK_MAX_MS) {
+        console.warn(`  scrape lock stale (${Math.round(ageMs / 60_000)}m, context=${context}) — force releasing`);
+        releaseScrapeLock();
+      } else {
+        console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
+        return false;
+      }
+    } else {
+      console.log(`  ${context} skipped — scrape already running (tier ${currentScrapeTier} since ${currentScrapeStartedAt})`);
+      return false;
+    }
   }
   scrapeInProgress = true;
   currentScrapeTier = tier;
@@ -7727,18 +7879,22 @@ async function scanEntriesLeftThresholdsForWeek(page, {
   thresholds,
   minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  weekKey = null,
 } = {}) {
   const minT = Math.max(1, Number(minThreshold) || THRESHOLD_SCAN_MIN_DEFAULT);
-  const maxT = Math.max(minT, Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT);
+  const maxT = Math.max(minT, Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE));
+  const thresholdBatches = buildThresholdBatches(minT, maxT, THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE);
   const thresholdList = Array.isArray(thresholds) && thresholds.length
     ? thresholds.map(t => Number(t)).filter(t => Number.isFinite(t) && t >= minT && t <= maxT).sort((a, b) => a - b)
-    : Array.from({ length: maxT - minT + 1 }, (_, i) => minT + i);
+    : thresholdBatches.flatMap(b => b.thresholds);
 
   const report = {
     targetIsoDate,
+    weekKey: weekKey || targetIsoDate,
     minThreshold: minT,
     maxThreshold: maxT,
     thresholds: thresholdList,
+    thresholdBatches: thresholdBatches.length,
     navigation: null,
     visibleWeekStart: null,
     visibleWeekEnd: null,
@@ -7753,18 +7909,26 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     errors: [],
     durationMs: 0,
     method: 'entries_left_filter',
+    batchProgress: [],
   };
 
   const started = Date.now();
   try {
-    const nav = await navigateCalendarToShowDate(page, targetIsoDate);
+    const nav = await withPlaywrightGuard(
+      () => navigateCalendarToShowDate(page, targetIsoDate),
+      { stage: 'threshold_week_navigation', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS, weekKey: weekKey || targetIsoDate },
+    );
     report.navigation = nav;
     report.visibleWeekStart = nav.visibleWeekStart;
     report.visibleWeekEnd = nav.visibleWeekEnd;
     report.targetDateVisible = nav.targetDateVisible;
+    report.weekKey = nav.visibleWeekStart || weekKey || targetIsoDate;
 
     if (!nav.targetDateVisible) {
-      report.errors.push({ error: nav.navigationError || 'target_date_not_visible' });
+      report.errors.push({
+        error: nav.navigationError || 'target_date_not_visible',
+        failureReason: 'failed_navigation',
+      });
       report.durationMs = Date.now() - started;
       return report;
     }
@@ -7773,29 +7937,54 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     const tileByKey = new Map();
     const filterResults = [];
 
-    for (const threshold of thresholdList) {
-      const filterSet = await setEntriesLeftFilter(page, threshold);
-      filterResults.push({ threshold, ...filterSet });
-      if (!filterSet?.ok) {
-        report.errors.push({ threshold, error: filterSet?.reason || 'filter_set_failed' });
-        continue;
+    for (const batch of thresholdBatches) {
+      collectorState.thresholdScanBatchProgress = {
+        weekKey: report.weekKey,
+        batchIndex: batch.batchIndex + 1,
+        totalBatches: thresholdBatches.length,
+        thresholdRange: `${batch.minThreshold}-${batch.maxThreshold}`,
+        targetIsoDate,
+      };
+
+      for (const threshold of batch.thresholds) {
+        const filterSet = await withPlaywrightGuard(
+          () => setEntriesLeftFilter(page, threshold),
+          { stage: 'threshold_filter_set', timeout: THRESHOLD_FILTER_TIMEOUT_MS, weekKey: report.weekKey },
+        );
+        filterResults.push({ threshold, batchIndex: batch.batchIndex, ...filterSet });
+        if (!filterSet?.ok) {
+          report.errors.push({ threshold, error: filterSet?.reason || 'filter_set_failed' });
+          continue;
+        }
+
+        const scrape = await withPlaywrightGuard(
+          () => scrapeVisibleSessionsFromPage(page, { weekOffset: 0 }),
+          { stage: 'threshold_tile_scrape', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
+        );
+        const keys = new Set();
+        for (const tile of scrape.sessions || []) {
+          keys.add(tile.key);
+          if (!tileByKey.has(tile.key)) tileByKey.set(tile.key, tile);
+        }
+        visibleByThreshold.set(threshold, keys);
+        report.visibleByThreshold[threshold] = keys.size;
       }
 
-      const scrape = await scrapeVisibleSessionsFromPage(page, { weekOffset: 0 });
-      const keys = new Set();
-      for (const tile of scrape.sessions || []) {
-        keys.add(tile.key);
-        if (!tileByKey.has(tile.key)) tileByKey.set(tile.key, tile);
-      }
-      visibleByThreshold.set(threshold, keys);
-      report.visibleByThreshold[threshold] = keys.size;
+      report.batchProgress.push({
+        ...collectorState.thresholdScanBatchProgress,
+        thresholdsTested: batch.thresholds.length,
+        completedAt: new Date().toISOString(),
+      });
     }
 
     report.filterResults = filterResults;
     const survivalMap = buildThresholdSurvivalMap(visibleByThreshold, maxT);
     report.survivalMap = Object.fromEntries(survivalMap.entries());
 
-    const weekDates = await getVisibleDateKeysFromPage(page);
+    const weekDates = await withPlaywrightGuard(
+      () => getVisibleDateKeysFromPage(page),
+      { stage: 'threshold_week_dates', timeout: THRESHOLD_TILE_SCRAPE_TIMEOUT_MS, weekKey: report.weekKey },
+    );
     const basicSessions = weekDates.flatMap(d => sessionsForDate(d));
     const uniqueBasic = [...new Map(basicSessions.map(s => [s.key, s])).values()];
 
@@ -7822,8 +8011,15 @@ async function scanEntriesLeftThresholdsForWeek(page, {
     }));
     report.ambiguousSamples = ambiguousSamples;
     report.sessionsMatched = results.filter(r => r.session && r.inference?.thresholdScanVerified).length;
+    collectorState.lastThresholdScanWeek = report.weekKey;
   } catch (e) {
-    report.errors.push({ error: e.message });
+    const failureReason = isPlaywrightCrashError(e)
+      ? recordPageCrash('threshold_week_scan', e, { weekKey: weekKey || targetIsoDate })
+      : 'failed_threshold_scan';
+    report.errors.push({ error: e.message, failureReason });
+    if (!isPlaywrightCrashError(e)) {
+      collectorState.thresholdScanLastError = e.message;
+    }
   }
 
   report.durationMs = Date.now() - started;
@@ -7949,47 +8145,167 @@ async function runThresholdScanForWeek(page, options = {}) {
     completedAt: new Date().toISOString(),
   };
   collectorState.lastThresholdScanResult = combined;
+  if (!report.errors.some(e => e.failureReason === 'failed_page_crash')) {
+    markThresholdScanRecovered();
+  }
   return combined;
 }
 
-async function runThresholdScansForDates(page, dates, options = {}) {
-  const scannedWeeks = new Set();
+async function runThresholdScansChunked(dates, options = {}) {
+  const {
+    dryRun = true,
+    minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
+    maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+    sourceTier = 2,
+    maxWeeksPerRun = THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
+    recycleBrowserEachWeek = THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK,
+    resumeQueue = null,
+  } = options;
+
+  const pendingWeeks = buildThresholdScanResumeQueue(dates, { resumeQueue });
+  collectorState.thresholdScanWeeksRemaining = pendingWeeks.map(w => w.weekKey);
+  const weeksToProcess = pendingWeeks.slice(0, maxWeeksPerRun);
+  const remainingAfter = pendingWeeks.slice(maxWeeksPerRun);
+
   const dateResults = [];
   const errors = [];
+  let launched = null;
+  let crashed = false;
 
-  for (const isoDate of asSessionArray(dates).sort()) {
-    const nav = await navigateCalendarToShowDate(page, isoDate);
-    const weekKey = nav.visibleWeekStart || isoDate;
-    if (scannedWeeks.has(weekKey)) {
-      dateResults.push({ isoDate, weekKey, skipped: true, skipReason: 'week_already_scanned' });
-      continue;
+  try {
+    for (const week of weeksToProcess) {
+      collectorState.lastThresholdScanWeek = week.weekKey;
+      collectorState.thresholdScanBatchProgress = {
+        weekKey: week.weekKey,
+        batchIndex: 0,
+        totalBatches: buildThresholdBatches(minThreshold, maxThreshold).length,
+        targetIsoDate: week.anchorIsoDate,
+      };
+
+      try {
+        if (recycleBrowserEachWeek || !launched) {
+          await safeCloseBrowser(launched);
+          launched = await launchBrowser();
+          await openBookingPageForThreshold(launched.page);
+        }
+
+        const result = await runThresholdScanForWeek(launched.page, {
+          targetIsoDate: week.anchorIsoDate,
+          weekKey: week.weekKey,
+          minThreshold,
+          maxThreshold,
+          dryRun,
+          sourceTier,
+        });
+
+        const weekFailed = result.errors?.some(e =>
+          e.failureReason === 'failed_page_crash' || e.failureReason === 'failed_navigation',
+        );
+
+        dateResults.push({
+          isoDate: week.anchorIsoDate,
+          weekKey: result.weekKey || week.weekKey,
+          targetDateVisible: result.targetDateVisible,
+          sessionsMatched: result.sessionsMatched,
+          write: result.write,
+          errors: result.errors,
+          crashed: weekFailed,
+          failureReason: weekFailed ? (result.errors.find(e => e.failureReason)?.failureReason || 'failed_page_crash') : null,
+        });
+
+        if (weekFailed) {
+          crashed = true;
+          if (result.errors?.length) errors.push(...result.errors);
+          remainingAfter.unshift(week, ...weeksToProcess.slice(weeksToProcess.indexOf(week) + 1));
+          break;
+        }
+
+        if (!collectorState.thresholdScanCompletedWeeks.includes(result.weekKey || week.weekKey)) {
+          collectorState.thresholdScanCompletedWeeks.push(result.weekKey || week.weekKey);
+        }
+        markThresholdScanRecovered();
+      } catch (e) {
+        const failureReason = isPlaywrightCrashError(e)
+          ? recordPageCrash('threshold_week_chunk', e, { weekKey: week.weekKey })
+          : 'failed_threshold_scan';
+        crashed = true;
+        dateResults.push({
+          isoDate: week.anchorIsoDate,
+          weekKey: week.weekKey,
+          crashed: true,
+          failureReason,
+          errors: [{ error: e.message, failureReason }],
+        });
+        errors.push({ weekKey: week.weekKey, error: e.message, failureReason });
+        remainingAfter.unshift(week, ...weeksToProcess.slice(weeksToProcess.indexOf(week) + 1));
+        await safeCloseBrowser(launched);
+        launched = null;
+        break;
+      } finally {
+        if (recycleBrowserEachWeek) {
+          await safeCloseBrowser(launched);
+          launched = null;
+        }
+      }
     }
-    scannedWeeks.add(weekKey);
-
-    const result = await runThresholdScanForWeek(page, {
-      ...options,
-      targetIsoDate: isoDate,
-    });
-    dateResults.push({
-      isoDate,
-      weekKey,
-      targetDateVisible: result.targetDateVisible,
-      sessionsMatched: result.sessionsMatched,
-      write: result.write,
-      errors: result.errors,
-    });
-    if (result.errors?.length) errors.push(...result.errors);
+  } finally {
+    await safeCloseBrowser(launched);
+    collectorState.thresholdScanPendingWeeks = remainingAfter.map(w => w.weekKey);
+    collectorState.thresholdScanWeeksRemaining = remainingAfter.map(w => w.weekKey);
+    if (!remainingAfter.length) {
+      collectorState.thresholdScanBatchProgress = null;
+    }
   }
 
   const summary = {
-    weeksScanned: scannedWeeks.size,
+    weeksScanned: dateResults.filter(r => !r.skipped && !r.crashed).length,
+    weeksRemaining: remainingAfter.length,
+    weeksRequested: pendingWeeks.length,
+    maxWeeksPerRun,
+    resumable: remainingAfter.length > 0,
+    crashed,
     dateResults,
     errors,
-    lastThresholdScanResult: collectorState.lastThresholdScanResult,
+    pendingWeeks: remainingAfter,
     completedAt: new Date().toISOString(),
   };
   collectorState.lastThresholdScanResult = summary;
   return summary;
+}
+
+async function runThresholdScansForDates(page, dates, options = {}) {
+  if (page) {
+    const week = buildWeekAnchorsFromDates(dates)[0];
+    if (!week) {
+      return {
+        weeksScanned: 0,
+        weeksRemaining: 0,
+        dateResults: [],
+        errors: [{ error: 'no_dates_for_threshold_scan' }],
+        completedAt: new Date().toISOString(),
+      };
+    }
+    const result = await runThresholdScanForWeek(page, {
+      ...options,
+      targetIsoDate: week.anchorIsoDate,
+      weekKey: week.weekKey,
+    });
+    return {
+      weeksScanned: 1,
+      weeksRemaining: 0,
+      dateResults: [{
+        isoDate: week.anchorIsoDate,
+        weekKey: result.weekKey || week.weekKey,
+        targetDateVisible: result.targetDateVisible,
+        sessionsMatched: result.sessionsMatched,
+        write: result.write,
+        errors: result.errors,
+      }],
+      errors: result.errors || [],
+      completedAt: new Date().toISOString(),
+    };
+  }
+  return runThresholdScansChunked(dates, options);
 }
 
 async function getCalendarFingerprint(page) {
@@ -8980,10 +9296,9 @@ async function runBackfillAvailableDates({
     }
 
     if (mode === 'threshold_slots' || mode === 'basic_plus_threshold') {
-      if (!launched) {
-        launched = await launchBrowser();
-        const { page } = launched;
-        await openBookingPage(page);
+      if (launched?.browser) {
+        await safeCloseBrowser(launched);
+        launched = null;
       }
       await ensureSessionsForStatus();
       if (!report.discoveredAvailableDates.length) {
@@ -9004,14 +9319,17 @@ async function runBackfillAvailableDates({
           report.skipReason = 'no_dates_for_threshold_scan';
         }
       } else {
-        const thresholdSummary = await runThresholdScansForDates(launched.page, report.discoveredAvailableDates, {
+        const thresholdSummary = await runThresholdScansChunked(report.discoveredAvailableDates, {
           dryRun,
           minThreshold,
           maxThreshold,
           sourceTier: 2,
+          maxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
         });
         report.threshold = thresholdSummary;
         report.thresholdWeeksScanned = thresholdSummary.weeksScanned || 0;
+        report.thresholdWeeksRemaining = thresholdSummary.weeksRemaining || 0;
+        report.thresholdResumable = thresholdSummary.resumable === true;
         report.thresholdSessionsMatched = (thresholdSummary.dateResults || [])
           .reduce((sum, dr) => sum + (dr.sessionsMatched || 0), 0);
         report.thresholdRowsUpserted = (thresholdSummary.dateResults || [])
@@ -9093,13 +9411,87 @@ async function runBackfillAvailableDates({
     collectorState.lastBackfillAvailableDatesResult = { ...report, completedAt: new Date().toISOString() };
     return report;
   } catch (e) {
+    if (isPlaywrightCrashError(e)) recordPageCrash('backfill_available_dates', e);
     report.errors.push({ error: e.message });
     report.durationMs = Date.now() - started;
     throw e;
   } finally {
     releaseScrapeLock();
-    if (launched?.browser) await launched.browser.close().catch(() => {});
+    await safeCloseBrowser(launched);
   }
+}
+
+async function runDateRangeBackfill({
+  startDate,
+  endDate,
+  mode = 'both',
+  dryRun = false,
+  minThreshold = THRESHOLD_SCAN_MIN_DEFAULT,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  reason = 'admin_backfill_date_range',
+} = {}) {
+  const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
+  const combined = {
+    mode,
+    startDate: start,
+    endDate: end,
+    datesRequested: dates?.length || 0,
+    basic: null,
+    detail: null,
+    threshold: null,
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+  };
+
+  if (!dates?.length) {
+    combined.skipped = true;
+    combined.skipReason = 'empty_or_invalid_date_range';
+    return combined;
+  }
+
+  const started = Date.now();
+  if (mode === 'basic_only' || mode === 'both' || mode === 'basic_plus_threshold') {
+    combined.basic = await runDateRangeBackfillBasic(start, end, { reason: `${reason}_basic` });
+    if (combined.basic.skipped && mode === 'basic_only') {
+      combined.skipped = combined.basic.skipped;
+      combined.skipReason = combined.basic.skipReason;
+    }
+  }
+
+  if (mode === 'threshold_slots' || mode === 'basic_plus_threshold') {
+    if (!tryAcquireScrapeLock(`date range threshold backfill (${reason})`, 0)) {
+      combined.skipped = true;
+      combined.skipReason = 'scrape_in_progress';
+      combined.durationMs = Date.now() - started;
+      return combined;
+    }
+    try {
+      await ensureSessionsForStatus();
+      combined.threshold = await runThresholdScansChunked(dates, {
+        dryRun,
+        minThreshold,
+        maxThreshold,
+        sourceTier: 2,
+        maxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
+      });
+    } catch (e) {
+      if (isPlaywrightCrashError(e)) recordPageCrash('date_range_threshold_backfill', e);
+      combined.threshold = { error: e.message, crashed: isPlaywrightCrashError(e) };
+    } finally {
+      releaseScrapeLock();
+    }
+  }
+
+  if (mode === 'verified_detail' || mode === 'both') {
+    combined.detail = await runDateRangeBackfillVerifiedDetail(start, end, {
+      reason: `${reason}_detail`,
+    });
+  }
+
+  combined.durationMs = Date.now() - started;
+  collectorState.lastDateRangeBackfill = { ...combined, completedAt: new Date().toISOString() };
+  return combined;
 }
 
 async function runDateRangeBackfillBasic(startDate, endDate, { tier = 0, reason = 'backfill_date_range' } = {}) {
@@ -9167,12 +9559,13 @@ async function runDateRangeBackfillBasic(startDate, endDate, { tier = 0, reason 
     collectorState.lastDateRangeBackfill = { ...report, completedAt: new Date().toISOString() };
     return report;
   } catch (e) {
+    if (isPlaywrightCrashError(e)) recordPageCrash('date_range_backfill_basic', e);
     report.errors.push({ error: e.message });
     report.durationMs = Date.now() - started;
     throw e;
   } finally {
     releaseScrapeLock();
-    if (launched?.browser) await launched.browser.close().catch(() => {});
+    await safeCloseBrowser(launched);
   }
 }
 
@@ -9224,89 +9617,6 @@ async function runDateRangeBackfillVerifiedDetail(startDate, endDate, { reason =
   report.durationMs = Date.now() - started;
   report.enrichmentStats = enrichStats;
   return report;
-}
-
-async function runDateRangeBackfill({ startDate, endDate, mode = 'both', reason = 'admin_backfill_date_range' } = {}) {
-  const { start, end, dates } = clampDateRangeToBookingWindow(startDate, endDate);
-  const combined = {
-    mode,
-    startDate: start,
-    endDate: end,
-    datesRequested: dates?.length || 0,
-    basic: null,
-    detail: null,
-    durationMs: 0,
-    skipped: false,
-    skipReason: null,
-  };
-
-  if (!dates?.length) {
-    combined.skipped = true;
-    combined.skipReason = 'empty_or_invalid_date_range';
-    return combined;
-  }
-
-  const started = Date.now();
-  if (mode === 'basic_only' || mode === 'both') {
-    combined.basic = await runDateRangeBackfillBasic(start, end, { reason: `${reason}_basic` });
-    if (combined.basic.skipped && mode === 'basic_only') {
-      combined.skipped = combined.basic.skipped;
-      combined.skipReason = combined.basic.skipReason;
-      }
-    }
-
-    if (mode === 'threshold_slots' || mode === 'basic_plus_threshold') {
-      if (!launched) {
-        launched = await launchBrowser();
-        const { page } = launched;
-        await openBookingPage(page);
-      }
-      await ensureSessionsForStatus();
-      if (!report.discoveredAvailableDates.length) {
-        report.discoveredAvailableDates = getDiscoveredAvailableDates();
-      }
-      if (!report.discoveredAvailableDates.length) {
-        const today = getParkTodayIso();
-        report.discoveredAvailableDates = [...new Set(
-          allStoredSessions()
-            .map(sessionDateKey)
-            .filter(d => d && d >= today),
-        )].sort();
-      }
-
-      if (!report.discoveredAvailableDates.length) {
-        report.skipped = mode === 'threshold_slots';
-        if (mode === 'threshold_slots') report.skipReason = 'no_dates_for_threshold_scan';
-      } else {
-        const thresholdSummary = await runThresholdScansForDates(launched.page, report.discoveredAvailableDates, {
-          dryRun,
-          minThreshold,
-          maxThreshold,
-          sourceTier: 2,
-        });
-        report.threshold = thresholdSummary;
-        report.thresholdWeeksScanned = thresholdSummary.weeksScanned || 0;
-        report.thresholdSessionsMatched = (thresholdSummary.dateResults || [])
-          .reduce((sum, dr) => sum + (dr.sessionsMatched || 0), 0);
-        report.thresholdRowsUpserted = (thresholdSummary.dateResults || [])
-          .reduce((sum, dr) => sum + (dr.write?.rowsUpserted || 0), 0);
-        report.thresholdSnapshotsInserted = (thresholdSummary.dateResults || [])
-          .reduce((sum, dr) => sum + (dr.write?.snapshotsInserted || 0), 0);
-        if (thresholdSummary.errors?.length) {
-          report.errors.push(...thresholdSummary.errors.slice(0, 5));
-        }
-      }
-    }
-
-    if (mode === 'verified_detail' || mode === 'both') {
-    combined.detail = await runDateRangeBackfillVerifiedDetail(start, end, {
-      reason: `${reason}_detail`,
-    });
-  }
-
-  combined.durationMs = Date.now() - started;
-  collectorState.lastDateRangeBackfill = { ...combined, completedAt: new Date().toISOString() };
-  return combined;
 }
 
 async function navigateToWeekOffset(page, weekOffset) {
@@ -9594,12 +9904,22 @@ async function buildEnrichmentDebugPayload() {
   };
 }
 
-async function openBookingPage(page) {
+async function openBookingPage(page, { timeout = BOOKING_PAGE_TIMEOUT_MS, waitUntil = 'networkidle' } = {}) {
   await dismissCookieBanner(page).catch(() => {});
-  await page.goto(BOOKING, { waitUntil: 'networkidle', timeout: 30_000 });
-  await page.waitForSelector('.dynamic-cal-booking-ts', { timeout: 15_000 });
+  await withPlaywrightGuard(
+    () => page.goto(BOOKING, { waitUntil, timeout }),
+    { stage: 'open_booking_page_goto', timeout: timeout + 5000 },
+  );
+  await page.waitForSelector('.dynamic-cal-booking-ts', { timeout: Math.min(timeout, 20_000) });
   await dismissCookieBanner(page);
   await waitForCookieBannerGone(page, 6000);
+}
+
+async function openBookingPageForThreshold(page) {
+  return openBookingPage(page, {
+    timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS,
+    waitUntil: 'domcontentloaded',
+  });
 }
 
 async function detectAvailableWeeks(page) {
@@ -9894,6 +10214,7 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
 
   } catch (e) {
     recordScrapeError(e, `tier ${tier} scrape`);
+    if (isPlaywrightCrashError(e)) recordPageCrash(`tier_${tier}_scrape`, e);
     lastTierError[tier] = lastScrapeError;
     report.errors.push({ error: lastScrapeError });
     report.error = lastScrapeError;
@@ -9911,7 +10232,7 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     recordTierRunState(tier, report, { reason });
   } finally {
     releaseScrapeLock();
-    if (launched?.browser) await launched.browser.close().catch(() => {});
+    await safeCloseBrowser(launched);
   }
 
   return report;
@@ -10272,9 +10593,19 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
   if (!startDate || !endDate) {
     return res.status(400).json({ error: 'startDate and endDate required (YYYY-MM-DD)' });
   }
-  if (!['basic_only', 'verified_detail', 'both'].includes(mode)) {
-    return res.status(400).json({ error: 'mode must be basic_only, verified_detail, or both' });
+  if (!['basic_only', 'verified_detail', 'both', 'threshold_slots', 'basic_plus_threshold'].includes(mode)) {
+    return res.status(400).json({
+      error: 'mode must be basic_only, verified_detail, both, threshold_slots, or basic_plus_threshold',
+    });
   }
+
+  const dryRun = req.body?.dryRun === true;
+  const minThreshold = req.body?.minThreshold != null
+    ? parseInt(req.body.minThreshold, 10)
+    : THRESHOLD_SCAN_MIN_DEFAULT;
+  const maxThreshold = req.body?.maxThreshold != null
+    ? parseInt(req.body.maxThreshold, 10)
+    : THRESHOLD_SCAN_MAX_DEFAULT;
 
   try {
     await ensureSessionsForStatus();
@@ -10289,6 +10620,7 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
         endDate,
         mode,
         wait: false,
+        dryRun,
         message: 'Another scrape is running — retry with wait=true or check /api/debug/collector',
       });
     }
@@ -10306,6 +10638,9 @@ app.post('/api/admin/backfill-date-range', async (req, res) => {
       startDate,
       endDate,
       mode,
+      dryRun,
+      minThreshold,
+      maxThreshold,
       reason: 'admin_backfill_date_range',
     }).then(async (result) => {
       await refreshCoverageFlags().catch(() => {});
@@ -10475,27 +10810,15 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
       };
     }
 
-    let launched = null;
     try {
       await ensureSessionsForStatus();
-      launched = await launchBrowser();
-      const { page } = launched;
-      await openBookingPage(page);
-
-      const result = weekMode
-        ? await runThresholdScanForWeek(page, {
-          targetIsoDate: isoDate,
-          minThreshold,
-          maxThreshold,
-          dryRun,
-          sourceTier: 2,
-        })
-        : await runThresholdScansForDates(page, [isoDate], {
-          minThreshold,
-          maxThreshold,
-          dryRun,
-          sourceTier: 2,
-        });
+      const result = await runThresholdScansChunked([isoDate], {
+        dryRun,
+        minThreshold,
+        maxThreshold,
+        sourceTier: 2,
+        maxWeeksPerRun: 1,
+      });
 
       await refreshCoverageFlags().catch(() => {});
       return {
@@ -10507,9 +10830,21 @@ app.post('/api/admin/scan-entries-left-thresholds', async (req, res) => {
         maxThreshold,
         ...result,
       };
+    } catch (e) {
+      const failureReason = isPlaywrightCrashError(e)
+        ? recordPageCrash('admin_threshold_scan', e, { weekKey: isoDate })
+        : 'failed_threshold_scan';
+      return {
+        skipped: false,
+        crashed: true,
+        failureReason,
+        error: e.message,
+        isoDate,
+        weekMode,
+        dryRun,
+      };
     } finally {
       releaseScrapeLock();
-      if (launched?.browser) await launched.browser.close().catch(() => {});
     }
   };
 
@@ -11497,7 +11832,47 @@ async function buildCollectorDebugPayload() {
     recommendedAction,
     lastApiSessionsDurationMs,
     lastSupabaseDateQueryMs,
+    ...thresholdStabilityDebugPayload(),
   };
+}
+
+async function runBackgroundThresholdBatch() {
+  if (!BACKGROUND_THRESHOLD_SCAN_ENABLED) return { skipped: true, skipReason: 'background_threshold_disabled' };
+  if (scrapeInProgress || detailEnrichmentInProgress) {
+    return { skipped: true, skipReason: 'scrape_or_enrichment_busy' };
+  }
+  if (!tryAcquireScrapeLock('background threshold batch', 0)) {
+    return { skipped: true, skipReason: 'scrape_in_progress' };
+  }
+
+  try {
+    await ensureSessionsForStatus();
+    const discovery = resolveDiscoveredAvailableDates();
+    const dates = discovery.dates?.length
+      ? discovery.dates
+      : [...new Set(allStoredSessions().map(sessionDateKey).filter(Boolean))].sort();
+
+    if (!dates.length && !(collectorState.thresholdScanPendingWeeks || []).length) {
+      return { skipped: true, skipReason: 'no_dates_for_threshold_scan' };
+    }
+
+    const result = await runThresholdScansChunked(dates, {
+      dryRun: false,
+      sourceTier: 2,
+      maxWeeksPerRun: THRESHOLD_SCAN_MAX_WEEKS_PER_RUN,
+    });
+    collectorState.lastThresholdScanResult = { ...result, source: 'background_scheduler' };
+    return { skipped: false, ...result };
+  } catch (e) {
+    if (isPlaywrightCrashError(e)) recordPageCrash('background_threshold_batch', e);
+    return { skipped: false, crashed: true, error: e.message };
+  } finally {
+    releaseScrapeLock();
+  }
+}
+
+function runBackgroundThresholdBatchAsync() {
+  runBackgroundThresholdBatch().catch((e) => console.error('[background threshold]', e.message));
 }
 
 function startBackgroundCollector() {
@@ -11559,6 +11934,16 @@ function startBackgroundCollector() {
     () => runDetailEnrichmentByPriority(3).catch(console.error),
     'Detail enrichment P3',
   );
+
+  if (BACKGROUND_THRESHOLD_SCAN_ENABLED) {
+    const thresholdCron = `*/${BACKGROUND_THRESHOLD_SCAN_EVERY_MINS} * * * *`;
+    collectorState.cronTasks.thresholdBatch = scheduleCronSafe(
+      thresholdCron,
+      () => runBackgroundThresholdBatchAsync(),
+      'Threshold batch',
+    );
+    console.log(`  Scheduling threshold batch every ${BACKGROUND_THRESHOLD_SCAN_EVERY_MINS} minutes (max ${THRESHOLD_SCAN_MAX_WEEKS_PER_RUN} week(s)/run)`);
+  }
 
   scrapeScheduleEnabled = !!(collectorState.cronTasks.tier1 && collectorState.cronTasks.tier2 && collectorState.cronTasks.tier3);
   if (!scrapeScheduleEnabled) {

@@ -96,6 +96,17 @@ Set `"dryRun": false` to write threshold-inferred slots to `current_sessions` (s
 
 **Slot display trust hierarchy:** (1) threshold scan when `thresholdScanVerified` and confidence `exact`/`at_least` — shows *X spots left* or *20+ spots left*; (2) verified modal detail; (3) *Open · details unavailable* (never fake 10/12/2 defaults).
 
+**Threshold scan stability:** Scans one calendar week per run by default, recycle the browser between weeks, batch thresholds in groups of 5, and save/resume via `thresholdScanPendingWeeks`. Frontend `/api/sessions?date=` reads saved Supabase data only — it never triggers threshold scans. Env knobs:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `THRESHOLD_SCAN_MAX_WEEKS_PER_RUN` | `1` | Max weeks per admin/background run |
+| `THRESHOLD_SCAN_RECYCLE_BROWSER_EACH_WEEK` | `true` | Close browser between weeks |
+| `THRESHOLD_SCAN_PAGE_TIMEOUT_MS` | `45000` | `page.goto` timeout for threshold scans |
+| `THRESHOLD_SCAN_THRESHOLD_BATCH_SIZE` | `5` | Threshold filter batches (1–5, 6–10, …) |
+| `SCRAPE_LOCK_MAX_MS` | `900000` | Force-release stuck `scrapeInProgress` lock |
+| `BACKGROUND_THRESHOLD_SCAN_ENABLED` | `false` | Optional small background threshold batches |
+
 **Railway:** Disable **Serverless / App Sleep** — otherwise Tier 2/3 scrapes pause until someone opens the app. Long-term: separate web API service + scraper worker.
 
 ### Future session detail enrichment

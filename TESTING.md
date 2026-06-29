@@ -121,6 +121,17 @@ curl -s http://localhost:3000/api/debug/date/2026-06-28 | jq '{thresholdScanVeri
 - Basic rows remain intact; verified modal values are not overwritten unless modal is unverified.
 - No fake/default 10/12/2 slot values.
 
+**Crash recovery / stability:**
+
+```bash
+curl -s http://localhost:3000/api/debug/collector | jq '{scrapeInProgress,lastPageCrashAt,lastPageCrashStage,thresholdScanWeeksRemaining,thresholdScanBatchProgress,thresholdScanLastError,thresholdScanRecovered}'
+```
+
+- A Playwright page crash must not leave `scrapeInProgress` stuck (check `SCRAPE_LOCK_MAX_MS` force-release).
+- Saved Supabase sessions continue to serve via `/api/sessions?date=` after a crash.
+- Re-run `POST /api/admin/backfill-available-dates` with `mode: threshold_slots` to resume remaining weeks (`thresholdWeeksRemaining` / `thresholdScanPendingWeeks`).
+- One-week admin scan: `POST /api/admin/scan-entries-left-thresholds` with `wait: true`, `dryRun: false`.
+
 **Railway:** App Sleep must be disabled for continuous background collection.
 
 ---
