@@ -45,6 +45,10 @@ const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5'
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
 const DETAIL_ENRICH_MAX_PER_RUN = parseInt(process.env.DETAIL_ENRICH_MAX_PER_RUN || '25', 10);
+const DETAIL_MAX_ATTEMPTS = parseInt(process.env.DETAIL_MAX_ATTEMPTS || '30', 10);
+const DETAIL_RETRY_BASE_MS = parseInt(process.env.DETAIL_RETRY_BASE_MS || '300000', 10);
+const DETAIL_RETRY_MAX_MS = parseInt(process.env.DETAIL_RETRY_MAX_MS || '21600000', 10);
+const DETAIL_QUEUE_DRAIN_DELAY_MS = parseInt(process.env.DETAIL_QUEUE_DRAIN_DELAY_MS || '5000', 10);
 const ENRICHMENT_STALE_HOURS = parseInt(process.env.ENRICHMENT_STALE_HOURS || '6', 10);
 const ENRICHMENT_TIER2_EVERY_MINS = parseInt(process.env.ENRICHMENT_TIER2_EVERY_MINS || '45', 10);
 const ENRICHMENT_TIER3_STALE_HOURS = parseInt(process.env.ENRICHMENT_TIER3_STALE_HOURS || '12', 10);
@@ -315,6 +319,8 @@ const collectorState = {
   lastDiscoveryAt: null,
   discoveryDiagnostics: null,
   lastBackfillAvailableDatesResult: null,
+  detailQueueDrainScheduled: false,
+  lastDetailQueueBatch: null,
 };
 const ambiguousSideMappings = [];
 const recentSideParseLogs = [];
@@ -1171,6 +1177,8 @@ async function buildCoverageDebugPayload() {
   else if (sparse) recommendedAction = 'POST /api/admin/backfill-available-dates or wait for Tier 2 scrape';
   else if (missingDiscoveredDates.length) recommendedAction = 'POST /api/admin/backfill-available-dates';
 
+  const detailCounts = computeDetailCountsByDate(discovered.length ? discovered : expected);
+
   return {
     parkTodayIso: getParkTodayIso(),
     maxHorizonDays: MAX_BOOKING_HORIZON_DAYS,
@@ -1181,6 +1189,7 @@ async function buildCoverageDebugPayload() {
     discoveryDiagnostics: collectorState.discoveryDiagnostics,
     datesWithBasicRows,
     datesWithVerifiedDetails,
+    ...detailCounts,
     missingDiscoveredDates,
     datesAttempted,
     datesAttemptedCount: datesAttempted.length,
@@ -1208,7 +1217,6 @@ async function buildCoverageDebugPayload() {
     datesInAvailabilitySnapshots: Object.keys(availByDate).filter(d => expected.includes(d)).sort(),
     missingDates: missingDatesFromCurrentSessions,
     missingDatesFromCurrentSessions,
-    datesWithBasicRows: dbStats.basicDates.filter(d => expected.includes(d)),
     datesWithDetailedRows: dbStats.detailedDates.filter(d => expected.includes(d)),
     sessionsByDate: currentMap,
     coveragePercent: coverage.sessionsCoveragePercent,
@@ -1388,19 +1396,248 @@ function isTodayOrTomorrowIso(isoDate) {
 
 function scheduleBackgroundDateDetail(isoDate, sessions, { reason = 'api_date_request' } = {}) {
   if (!isoDate) return;
-  const needing = sessionsMissingDetails(sessions);
+  const needing = sessionsMissingDetails(sessions).filter(s => sessionDetailQueueEligible(s));
   if (!needing.length) return;
-  if (scrapeInProgress || detailEnrichmentInProgress) {
-    const priority = isTodayOrTomorrowIso(isoDate) ? 1 : 2;
-    enqueueSessionsForEnrichment(needing, { priority, reason: `${reason}:${isoDate}` }).catch(console.error);
-    return;
+  const priority = isTodayOrTomorrowIso(isoDate) ? 1 : 2;
+  enqueueSessionsForEnrichment(needing, { priority, reason: `${reason}:${isoDate}` }).catch(console.error);
+  scheduleDetailQueueDrain({ reason: `${reason}:${isoDate}`, limit: Math.min(needing.length, DETAIL_ENRICH_MAX_PER_RUN) });
+}
+
+function detailAttemptCountOnSession(s) {
+  if (!s) return 0;
+  return s.detailAttemptCount ?? s.detail_attempt_count ?? s.raw?.detailAttemptCount ?? 0;
+}
+
+function lastDetailAttemptAtOnSession(s) {
+  return s?.lastDetailAttemptAt ?? s?.last_detail_attempt_at ?? s?.raw?.lastDetailAttemptAt ?? null;
+}
+
+function nextDetailRetryAtOnSession(s) {
+  return s?.nextDetailRetryAt ?? s?.next_detail_retry_at ?? s?.raw?.nextDetailRetryAt ?? null;
+}
+
+function computeNextDetailRetryAt(attemptCount) {
+  const delay = Math.min(DETAIL_RETRY_BASE_MS * (2 ** Math.min(attemptCount, 8)), DETAIL_RETRY_MAX_MS);
+  return new Date(Date.now() + delay).toISOString();
+}
+
+function isDetailRetryableFailureStatus(status) {
+  if (!status || status === 'pending' || status === 'unknown') return true;
+  if (status === 'checking') return false;
+  if (status === 'checked_available_no_slot_count' || status === 'checked_open_no_slots_visible') return true;
+  return isDetailFailureStatus(status);
+}
+
+function isDetailPermanentFailure(s) {
+  if (!s?.key) return false;
+  if (sessionDetailVerified(s)) return false;
+  return detailAttemptCountOnSession(s) >= DETAIL_MAX_ATTEMPTS;
+}
+
+function isDetailReadyForQueueRetry(s) {
+  const nextRetry = nextDetailRetryAtOnSession(s);
+  if (!nextRetry) return true;
+  return new Date(nextRetry).getTime() <= Date.now();
+}
+
+function sessionDetailQueueEligible(s, { force = false, availabilityChanged = false } = {}) {
+  if (!s?.key) return false;
+  if (force) return s.available !== false;
+
+  const watchKeys = watchedSessionKeys();
+  const priority = enrichmentPriorityForSession(s);
+  const days = daysFromToday(s.isoDate || s.dateKey || todayDateKey());
+  const status = effectiveDetailStatus(s);
+
+  if (!s.available && !watchKeys.has(s.key)) return false;
+  if (status === 'checking') return false;
+  if (isDetailPermanentFailure(s)) return false;
+  if (!isDetailReadyForQueueRetry(s)) return false;
+
+  if (sessionDetailVerified(s) && sessionHasDetailedData(s)) {
+    if (!sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority))) return false;
   }
-  const priority = isTodayOrTomorrowIso(isoDate) ? 1 : enrichmentPriorityForSession(needing[0]);
-  setImmediate(() => {
-    enqueueSessionsForEnrichment(needing, { priority, reason: `${reason}:${isoDate}` })
-      .then(() => runDetailEnrichment({ isoDate, sessions: needing, reason: `${reason}:${isoDate}` }))
-      .catch(console.error);
+
+  if (availabilityChanged || sessionsNeedingDetailAfterBasic.has(s.key)) return true;
+  if (watchKeys.has(s.key)) {
+    return !sessionDetailVerified(s) || sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+  }
+  if (days <= 2) {
+    return !sessionDetailVerified(s) || sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+  }
+  if (!sessionHasDetailedData(s)) return true;
+  if (isDetailRetryableFailureStatus(status)) return true;
+  if (status === 'pending' || !status) return true;
+  return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority));
+}
+
+function sessionQualifiesForDetailEnrichment(s, opts = {}) {
+  return sessionDetailQueueEligible(s, opts);
+}
+
+function recordDetailAttemptOnSession(entry, { success = false } = {}) {
+  if (!entry) return;
+  const now = new Date().toISOString();
+  const count = detailAttemptCountOnSession(entry) + 1;
+  entry.detailAttemptCount = count;
+  entry.detail_attempt_count = count;
+  entry.lastDetailAttemptAt = now;
+  entry.last_detail_attempt_at = now;
+  if (success || sessionDetailVerified(entry)) {
+    entry.nextDetailRetryAt = null;
+    entry.next_detail_retry_at = null;
+  } else {
+    entry.nextDetailRetryAt = computeNextDetailRetryAt(count);
+    entry.next_detail_retry_at = entry.nextDetailRetryAt;
+  }
+}
+
+function buildDateDetailQueueDiagnostics(isoDate, sessions) {
+  const list = asSessionArray(sessions);
+  const open = list.filter(s => s.available !== false);
+  const verified = open.filter(s => sessionDetailVerified(s));
+  const pending = open.filter(s => {
+    const st = effectiveDetailStatus(s);
+    return (st === 'pending' || !st || st === 'unknown') && !sessionDetailVerified(s);
   });
+  const failed = open.filter(s => isDetailFailureStatus(effectiveDetailStatus(s)));
+  const retryableFailed = failed.filter(s => !isDetailPermanentFailure(s));
+  const permanentFailed = failed.filter(s => isDetailPermanentFailure(s));
+  const queueEligible = open.filter(s => sessionDetailQueueEligible(s));
+  const withVerifiedSlots = verified.filter(s => s.slots != null);
+
+  return {
+    sessionsCount: list.length,
+    openSessionsCount: open.length,
+    detailVerifiedCount: verified.length,
+    detailPendingCount: pending.length,
+    detailRetryableFailedCount: retryableFailed.length,
+    detailPermanentFailedCount: permanentFailed.length,
+    sessionsWithSlotsCount: withVerifiedSlots.length,
+    detailQueueEligibleCount: queueEligible.length,
+    nextDetailRetrySample: open
+      .filter(s => nextDetailRetryAtOnSession(s))
+      .sort((a, b) => (nextDetailRetryAtOnSession(a) || '').localeCompare(nextDetailRetryAtOnSession(b) || ''))
+      .slice(0, 8)
+      .map(s => ({
+        ...sessionDetailDiagnosticsFields(s),
+        detail_verified: sessionDetailVerified(s),
+        detail_attempt_count: detailAttemptCountOnSession(s),
+        next_detail_retry_at: nextDetailRetryAtOnSession(s),
+        slots: s.slots,
+        capacity: s.capacity,
+      })),
+    verifiedDetailSample: verified.slice(0, 8).map(s => ({
+      ...sessionDetailDiagnosticsFields(s),
+      detail_verified: true,
+      detail_confidence: s.detailConfidence || s.raw?.detailConfidence || null,
+      slots: s.slots,
+      capacity: s.capacity,
+      estimatedBooked: s.estimatedBooked,
+    })),
+    failedDetailSample: failed.slice(0, 8).map(s => ({
+      ...sessionDetailDiagnosticsFields(s),
+      detail_attempt_count: detailAttemptCountOnSession(s),
+      next_detail_retry_at: nextDetailRetryAtOnSession(s),
+      detail_verified: false,
+    })),
+  };
+}
+
+function computeDetailCountsByDate(dates) {
+  const verifiedDetailCountsByDate = {};
+  const pendingDetailCountsByDate = {};
+  const failedDetailCountsByDate = {};
+  for (const d of asSessionArray(dates)) {
+    const rows = allStoredSessions().filter(s => sessionDateKey(s) === d);
+    verifiedDetailCountsByDate[d] = rows.filter(s => sessionDetailVerified(s)).length;
+    pendingDetailCountsByDate[d] = rows.filter(s => {
+      const st = effectiveDetailStatus(s);
+      return s.available !== false && (st === 'pending' || !st || st === 'unknown') && !sessionDetailVerified(s);
+    }).length;
+    failedDetailCountsByDate[d] = rows.filter(s =>
+      s.available !== false && isDetailFailureStatus(effectiveDetailStatus(s)),
+    ).length;
+  }
+  return { verifiedDetailCountsByDate, pendingDetailCountsByDate, failedDetailCountsByDate };
+}
+
+function scheduleDetailQueueDrain({ reason = 'queue_drain', limit = DETAIL_ENRICH_MAX_PER_RUN, delayMs = DETAIL_QUEUE_DRAIN_DELAY_MS } = {}) {
+  if (collectorState.detailQueueDrainScheduled) return;
+  collectorState.detailQueueDrainScheduled = true;
+  setTimeout(() => {
+    collectorState.detailQueueDrainScheduled = false;
+    processDetailEnrichmentQueue({ limit, reason }).catch(console.error);
+  }, delayMs);
+}
+
+async function processDetailEnrichmentQueue({ isoDate = null, limit = DETAIL_ENRICH_MAX_PER_RUN, reason = 'detail_queue' } = {}) {
+  await ensureSessionsForStatus();
+  let targets;
+  if (isoDate) {
+    targets = sessionsForDate(isoDate)
+      .filter(s => s.available !== false && sessionDetailQueueEligible(s))
+      .sort((a, b) => enrichmentPriorityForSession(a) - enrichmentPriorityForSession(b))
+      .slice(0, limit);
+    if (targets.length) {
+      await enqueueSessionsForEnrichment(targets, {
+        priority: enrichmentPriorityForSession(targets[0]),
+        reason: `${reason}:${isoDate}`,
+      });
+    }
+  } else {
+    targets = await pickSessionsForDetailEnrichment({ isoDate, limit });
+  }
+
+  if (!targets.length) {
+    return emptyEnrichmentStats({ skipReason: 'no_queue_eligible_sessions', isoDate });
+  }
+
+  return runDetailEnrichment({ isoDate, sessions: targets, reason });
+}
+
+async function processAllAvailableDetailQueue({ limitPerDate = 20, reason = 'admin_enrich_all_available' } = {}) {
+  await ensureSessionsForStatus();
+  const dates = getDiscoveredAvailableDates();
+  const fallbackDates = dates.length
+    ? dates
+    : [...new Set(allStoredSessions().map(sessionDateKey).filter(Boolean))].sort();
+  const report = {
+    limitPerDate,
+    datesProcessed: 0,
+    dateResults: [],
+    totalSessionsAttempted: 0,
+    totalDetailRowsVerified: 0,
+    totalDetailRowsSuppressed: 0,
+    durationMs: 0,
+    skipped: false,
+    skipReason: null,
+  };
+  const started = Date.now();
+
+  for (const isoDate of fallbackDates) {
+    const openOnDate = sessionsForDate(isoDate).filter(s => s.available !== false);
+    if (!openOnDate.length) continue;
+    await enqueueSessionsForEnrichment(
+      openOnDate.filter(s => sessionDetailQueueEligible(s)),
+      { priority: enrichmentPriorityForSession(openOnDate[0]), reason: `${reason}:${isoDate}` },
+    );
+    const result = await processDetailEnrichmentQueue({ isoDate, limit: limitPerDate, reason: `${reason}:${isoDate}` });
+    report.dateResults.push({ isoDate, ...result });
+    report.totalSessionsAttempted += result.sessionsAttempted ?? 0;
+    report.totalDetailRowsVerified += result.detailRowsVerified ?? 0;
+    report.totalDetailRowsSuppressed += result.detailRowsSuppressed ?? 0;
+    report.datesProcessed++;
+    if (result.skipped && (result.skipReason === 'scrape_in_progress' || result.skipReason === 'detail_enrichment_busy')) {
+      report.skipped = true;
+      report.skipReason = result.skipReason;
+      break;
+    }
+  }
+
+  report.durationMs = Date.now() - started;
+  collectorState.lastDetailQueueBatch = { ...report, completedAt: new Date().toISOString() };
+  return report;
 }
 
 function buildDateDetailDiagnostics(isoDate, sessions) {
@@ -1507,6 +1744,7 @@ function buildDateDetailDiagnostics(isoDate, sessions) {
     dateNavigationDiagnostics: collectorState.dateNavigationByDate[isoDate]
       || collectorState.dateCoverageAttempts[isoDate]
       || null,
+    ...buildDateDetailQueueDiagnostics(isoDate, list),
     ...cookieDiagnosticsPayload(),
     ...buildDetailAssociationDiagnostics(isoDate, list),
   };
@@ -1684,6 +1922,9 @@ function currentRowToSession(row) {
     detailParseOutput: raw.detailParseOutput ?? null,
     detailVerified: raw.detailVerified ?? false,
     detailConfidence: raw.detailConfidence ?? null,
+    detailAttemptCount: raw.detailAttemptCount ?? raw.detail_attempt_count ?? 0,
+    lastDetailAttemptAt: raw.lastDetailAttemptAt ?? raw.last_detail_attempt_at ?? null,
+    nextDetailRetryAt: raw.nextDetailRetryAt ?? raw.next_detail_retry_at ?? null,
     detailSourceSessionKey: raw.detailSourceSessionKey ?? null,
     detailSourceIsoDate: raw.detailSourceIsoDate ?? null,
     detailSourceStartTime: raw.detailSourceStartTime ?? null,
@@ -1732,6 +1973,9 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       detailFailedSelector: s.detailFailedSelector ?? null,
       detailVerified: s.detailVerified ?? false,
       detailConfidence: s.detailConfidence ?? null,
+      detailAttemptCount: s.detailAttemptCount ?? s.detail_attempt_count ?? 0,
+      lastDetailAttemptAt: s.lastDetailAttemptAt ?? s.last_detail_attempt_at ?? null,
+      nextDetailRetryAt: s.nextDetailRetryAt ?? s.next_detail_retry_at ?? null,
       detailSourceSessionKey: s.detailSourceSessionKey ?? null,
       detailSourceIsoDate: s.detailSourceIsoDate ?? null,
       detailSourceStartTime: s.detailSourceStartTime ?? null,
@@ -2861,21 +3105,6 @@ function detailStaleMaxAgeHours(priority) {
   return ENRICHMENT_TIER3_STALE_HOURS;
 }
 
-function sessionQualifiesForDetailEnrichment(s, { availabilityChanged = false, force = false } = {}) {
-  if (!s?.key) return false;
-  if (force) return s.available !== false;
-  const watchKeys = watchedSessionKeys();
-  const priority = enrichmentPriorityForSession(s);
-  const days = daysFromToday(s.isoDate || s.dateKey || todayDateKey());
-
-  if (!s.available && !watchKeys.has(s.key)) return false;
-  if (availabilityChanged || sessionsNeedingDetailAfterBasic.has(s.key)) return true;
-  if (watchKeys.has(s.key)) return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
-  if (days <= 2) return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
-  if (!sessionHasDetailedData(s)) return true;
-  return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority));
-}
-
 function sessionHourFromSession(s) {
   if (s?.time) {
     const m = String(s.time).match(/(\d{1,2})/);
@@ -2919,6 +3148,7 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
     'slots', 'capacity', 'estimatedBooked', 'fillRate',
     'priceText', 'priceMin', 'priceMax', 'currency',
     'lastDetailedCheckAt', 'detailError', 'detailWarning',
+    'detailAttemptCount', 'lastDetailAttemptAt', 'nextDetailRetryAt',
   ];
 
   if (scrapeKind === 'basic' && existing) {
@@ -3222,6 +3452,7 @@ function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
   preservePriorVerifiedDetailFields(entry, priorSnapshot);
   if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
   ensureDetailStatusRecorded(entry, status);
+  recordDetailAttemptOnSession(entry, { success: false });
   return { ok: false, category: 'failed', status: entry.detailStatus };
 }
 
@@ -3439,6 +3670,11 @@ function sessionDetailDiagnosticsFields(s) {
     parse_reason: s.detailParseReason || s.raw?.detailParseReason || parserOutput.parse_reason,
     failed_selector: s.detailFailedSelector || s.raw?.detailFailedSelector || null,
     last_detailed_check_at: s.lastDetailedCheckAt || s.last_detailed_check_at,
+    detail_attempt_count: detailAttemptCountOnSession(s),
+    last_detail_attempt_at: lastDetailAttemptAtOnSession(s),
+    next_detail_retry_at: nextDetailRetryAtOnSession(s),
+    detail_verified: sessionDetailVerified(s),
+    detail_confidence: s.detailConfidence || s.raw?.detailConfidence || null,
     reason: reasonForDetailStatus(s),
   };
 }
@@ -3873,23 +4109,24 @@ async function enqueueDateForEnrichment(isoDate, { priority = 1, reason = 'manua
 
 async function pickSessionsForDetailEnrichment({ priority = null, isoDate = null, limit = DETAIL_ENRICH_MAX_PER_RUN } = {}) {
   await ensureSessionsForStatus();
+  await refreshEnrichmentQueueCounts();
 
-  if (isoDate) {
-    return sessionsForDate(isoDate)
-      .filter(s => s.available)
-      .sort((a, b) => enrichmentPriorityForSession(a) - enrichmentPriorityForSession(b))
-      .slice(0, limit);
-  }
+  let candidates = allStoredSessions().filter(s => sessionDetailQueueEligible(s));
+  if (isoDate) candidates = candidates.filter(s => sessionDateKey(s) === isoDate);
+  if (priority != null) candidates = candidates.filter(s => enrichmentPriorityForSession(s) === priority);
 
-  let candidates = allStoredSessions().filter(s => sessionQualifiesForDetailEnrichment(s));
-  if (priority != null) {
-    candidates = candidates.filter(s => enrichmentPriorityForSession(s) === priority);
-  }
   candidates.sort((a, b) => {
     const pDiff = enrichmentPriorityForSession(a) - enrichmentPriorityForSession(b);
     if (pDiff) return pDiff;
+    const aAttempts = detailAttemptCountOnSession(a);
+    const bAttempts = detailAttemptCountOnSession(b);
+    if (aAttempts !== bAttempts) return aAttempts - bAttempts;
+    const aRetry = nextDetailRetryAtOnSession(a) || '';
+    const bRetry = nextDetailRetryAtOnSession(b) || '';
+    if (aRetry !== bRetry) return aRetry.localeCompare(bRetry);
     return (a.ts || 0) - (b.ts || 0);
   });
+
   return candidates.slice(0, limit);
 }
 
@@ -4086,6 +4323,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
           const hadPrice = prior.priceText != null || prior.priceMin != null;
 
           const result = applyDetailPayloadToSession(entry, details, s.level, { prior, session: s });
+          recordDetailAttemptOnSession(entry, { success: sessionDetailVerified(entry) });
           sessionsByKey.set(s.key, entry);
 
           if (sessionDetailVerified(entry)) stats.detailRowsVerified++;
@@ -4154,6 +4392,12 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
     }
 
     console.log(`  detail enrichment done (${durationMs}ms): ${stats.sessionsUpdatedWithSlots} slots, ${stats.sessionsFailedCookieOverlay} cookie, ${stats.sessionsFailedParse} parse`);
+    const updatedKeys = toEnrich.map(s => s.key);
+    await processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts: true });
+    const remainingEligible = allStoredSessions().filter(s => sessionDetailQueueEligible(s)).length;
+    if (remainingEligible > 0) {
+      scheduleDetailQueueDrain({ reason: `${reason}_continue`, limit: Math.min(remainingEligible, DETAIL_ENRICH_MAX_PER_RUN) });
+    }
     return finalizeEnrichmentStats(stats);
   } catch (e) {
     lastDetailEnrichmentError = e.message;
@@ -4170,7 +4414,12 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 }
 
 async function runDetailEnrichmentByPriority(priority) {
-  return runDetailEnrichment({ priority, reason: `priority_${priority}` });
+  await ensureSessionsForStatus();
+  const targets = await pickSessionsForDetailEnrichment({ priority, limit: DETAIL_ENRICH_MAX_PER_RUN });
+  if (!targets.length) {
+    return emptyEnrichmentStats({ skipReason: 'no_queue_eligible_sessions' });
+  }
+  return runDetailEnrichment({ priority, sessions: targets, reason: `priority_${priority}` });
 }
 
 function tryAcquireScrapeLock(context = 'scrape', tier = null) {
@@ -4670,7 +4919,7 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
     };
   }
 
-  if (!chosen && slotsAlerts && currSlots != null) {
+  if (!chosen && slotsAlerts && sessionDetailVerified(session) && currSlots != null) {
     if (watch.alert_when_low_slots !== false
       && shouldSendLowSlotsAlert(watch, prevAvailable, prevSlots, currSlots, threshold)) {
       chosen = {
@@ -4697,7 +4946,8 @@ async function evaluateSessionWatchAlerts(watch, session, ctx) {
 
   if (!chosen && watch.alert_last_call !== false) {
     const minsUntil = minutesUntilSessionStart(session);
-    if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins && (currSlots == null || currSlots > 0)) {
+    if (minsUntil != null && minsUntil > 0 && minsUntil <= lastCallMins
+      && sessionDetailVerified(session) && currSlots != null && currSlots > 0) {
       chosen = {
         eventType: 'last_call',
         urgent: true,
@@ -8255,14 +8505,17 @@ function scheduleEnrichmentBrowserIdleClose() {
 async function buildEnrichmentDebugPayload() {
   await refreshEnrichmentQueueCounts();
   const all = allStoredSessions();
-  const stale = all.filter(s => sessionQualifiesForDetailEnrichment(s));
-  const missingSlots = all.filter(s => s.available && s.slots == null);
-  const missingPrice = all.filter(s => s.available && !s.priceText && s.priceMin == null);
+  const stale = all.filter(s => sessionDetailQueueEligible(s));
+  const missingSlots = all.filter(s => s.available && !sessionDetailVerified(s));
+  const missingPrice = all.filter(s => s.available && !s.priceText && s.priceMin == null && !sessionDetailVerified(s));
   const stats = detailCoverageStats();
 
   return {
     queuePending: enrichmentQueuePendingCount,
     queueRunning: enrichmentQueueRunningCount,
+    detailQueueEligibleCount: stale.length,
+    detailQueueDrainScheduled: collectorState.detailQueueDrainScheduled,
+    lastDetailQueueBatch: collectorState.lastDetailQueueBatch || null,
     lastDetailEnrichmentAt: lastDetailEnrichmentAt,
     lastDetailEnrichmentError: lastDetailEnrichmentError,
     detailEnrichmentInProgress,
@@ -8552,12 +8805,13 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     }
 
     if (!cfg.slotCounts) {
-      const needing = merged.filter(s => sessionQualifiesForDetailEnrichment(s));
+      const needing = merged.filter(s => sessionDetailQueueEligible(s));
       if (needing.length) {
         await enqueueSessionsForEnrichment(needing, {
           priority: tier === 2 ? 2 : 3,
           reason: `tier_${tier}_basic`,
         });
+        scheduleDetailQueueDrain({ reason: `tier_${tier}_basic`, limit: DETAIL_ENRICH_MAX_PER_RUN });
       }
     }
     await saveLatestSnapshotToSupabase();
@@ -9470,6 +9724,96 @@ app.post('/api/admin/enrich-date', async (req, res) => {
     res.json(enrichResponseFields(result));
   } catch (e) {
     res.status(500).json({ isoDate, error: e.message, errors: [{ error: e.message }] });
+  }
+});
+
+app.post('/api/admin/enrich-detail-queue', async (req, res) => {
+  const isoDate = normalizeIsoDateParam(req.body?.isoDate || req.body?.iso_date);
+  const limit = Math.min(
+    Math.max(parseInt(req.body?.limit || req.query?.limit || '20', 10) || 20, 1),
+    100,
+  );
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+
+  if (!isoDate) {
+    return res.status(400).json({ error: 'isoDate required (YYYY-MM-DD)' });
+  }
+
+  try {
+    await ensureSessionsForStatus();
+    const eligible = sessionsForDate(isoDate).filter(s => sessionDetailQueueEligible(s));
+
+    if (!wait) {
+      if (eligible.length) {
+        await enqueueSessionsForEnrichment(eligible, {
+          priority: enrichmentPriorityForSession(eligible[0]),
+          reason: `admin_enrich_detail_queue:${isoDate}`,
+        });
+      }
+      scheduleDetailQueueDrain({
+        reason: `admin_enrich_detail_queue:${isoDate}`,
+        limit,
+        delayMs: 0,
+      });
+      return res.json({
+        isoDate,
+        limit,
+        wait: false,
+        queued: true,
+        detailQueueEligibleCount: eligible.length,
+        message: 'Detail queue drain scheduled — poll /api/debug/date/:isoDate',
+      });
+    }
+
+    const result = await processDetailEnrichmentQueue({
+      isoDate,
+      limit,
+      reason: 'admin_enrich_detail_queue',
+    });
+    res.json({
+      isoDate,
+      limit,
+      wait: true,
+      detailQueueEligibleCount: eligible.length,
+      ...result,
+    });
+  } catch (e) {
+    res.status(500).json({ isoDate, error: e.message, errors: [{ error: e.message }] });
+  }
+});
+
+app.post('/api/admin/enrich-all-available-details', async (req, res) => {
+  const limitPerDate = Math.min(
+    Math.max(parseInt(req.body?.limitPerDate || req.query?.limitPerDate || '20', 10) || 20, 1),
+    100,
+  );
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+
+  try {
+    await ensureSessionsForStatus();
+
+    if (!wait) {
+      setImmediate(() => {
+        processAllAvailableDetailQueue({ limitPerDate, reason: 'admin_enrich_all_available' }).catch(console.error);
+      });
+      return res.json({
+        limitPerDate,
+        wait: false,
+        queued: true,
+        discoveredAvailableDates: getDiscoveredAvailableDates(),
+        message: 'Processing all available dates in background — poll /api/debug/coverage',
+      });
+    }
+
+    const result = await processAllAvailableDetailQueue({ limitPerDate, reason: 'admin_enrich_all_available' });
+    res.json({
+      limitPerDate,
+      wait: true,
+      discoveredAvailableDates: getDiscoveredAvailableDates(),
+      ...result,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, errors: [{ error: e.message }] });
   }
 });
 

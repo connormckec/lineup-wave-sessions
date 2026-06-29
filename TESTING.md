@@ -190,12 +190,32 @@ curl -s http://localhost:3000/api/debug/date/2026-07-02 | jq '{sessionsCount, se
 curl -s http://localhost:3000/api/debug/enrichment | jq '{queuePending, queueRunning, sessionsMissingSlots, sessionsMissingPrice, sessionsWithStaleDetails, lastDetailEnrichmentAt, lastRunDurationMs, averageEnrichmentDurationMs, enrichmentBrowserActive, prioritySchedule, recentErrors}'
 ```
 
-4. **Force enrichment:**
+4. **Force enrichment (single date):**
 
 ```bash
 curl -s -X POST http://localhost:3000/api/admin/enrich-date \
   -H 'Content-Type: application/json' \
   -d '{"isoDate":"2026-07-02","wait":true}' | jq '{sessionsAttempted,sessionsUpdatedWithSlots,sessionsMarkedPacked,sessionsCheckedNoSlotsVisible,sessionsFailed,topErrors}'
+```
+
+4b. **Verified detail queue (background, one date):**
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/enrich-detail-queue \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-29","limit":20,"wait":true}' | jq '{detailQueueEligibleCount,sessionsAttempted,detailRowsVerified,detailRowsSuppressed,errors}'
+
+curl -s http://localhost:3000/api/debug/date/2026-06-29 | jq '{detailVerifiedCount,detailPendingCount,detailRetryableFailedCount,sessionsWithSlotsCount,detailQueueEligibleCount,verifiedDetailSample,failedDetailSample,nextDetailRetrySample}'
+```
+
+4c. **All available dates:**
+
+```bash
+curl -s -X POST http://localhost:3000/api/admin/enrich-all-available-details \
+  -H 'Content-Type: application/json' \
+  -d '{"limitPerDate":20,"wait":true}' | jq '{datesProcessed,totalSessionsAttempted,totalDetailRowsVerified,dateResults}'
+
+curl -s http://localhost:3000/api/debug/coverage | jq '{datesWithBasicRows,datesWithVerifiedDetails,verifiedDetailCountsByDate,pendingDetailCountsByDate,failedDetailCountsByDate}'
 ```
 
 5. Confirm Jul 2 sessions gain slots/capacity/price where the booking site exposes them.

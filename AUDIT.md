@@ -193,8 +193,10 @@ All dates use **`America/New_York`** (Atlantic Park local). `iso_date` in Supaba
 | `POST /api/admin/backfill-available-dates` | Discover all dates exposed on the booking calendar and scrape them (`mode`, `wait`, optional `maxHorizonDays`). Returns per-date diagnostics (`isoDate`, `targetDateVisible`, `sessionsFound`, `rowsUpserted`, `snapshotsInserted`, `verifiedDetailsWritten`, `detailValuesSuppressed`, `failureReason`). |
 | `POST /api/admin/backfill-date-range` | Scrape + upsert an explicit date range (clamped to `maxHorizonDays`) |
 | `POST /api/admin/enrich-date` | Force detail enrichment for all open sessions on a date. Returns reconciled outcome counts (`sessionsUpdatedWithSlots`, `sessionsFailedCookieOverlay`, etc.), `skipReason` when skipped, cookie diagnostics, and `unchangedReasons`. |
+| `POST /api/admin/enrich-detail-queue` | Drain verified detail queue for one date (`isoDate`, `limit`, `wait`). Sequential modal verification; tracks `detailAttemptCount` / `nextDetailRetryAt` in session raw. |
+| `POST /api/admin/enrich-all-available-details` | Process detail queue across all discovered booking dates (`limitPerDate`, `wait`). |
 | `POST /api/admin/repair-detail-data` | Clear unverified/default-like/mismatched detail metrics while preserving basic session rows and verified detail. Optional `{ isoDate, dryRun }`. |
-| `GET /api/debug/coverage` | Dynamic coverage: `discoveredAvailableDates`, `datesWithBasicRows`, `datesWithVerifiedDetails`, `missingDiscoveredDates`, attempt/success/fail counts, `failureReasonCounts`, `lastBackfillAvailableDatesResult`, plus `dateStatuses[]` |
+| `GET /api/debug/coverage` | Dynamic coverage: `discoveredAvailableDates`, `datesWithBasicRows`, `datesWithVerifiedDetails`, `verifiedDetailCountsByDate`, `pendingDetailCountsByDate`, `failedDetailCountsByDate`, attempt/success/fail counts, `lastBackfillAvailableDatesResult`, plus `dateStatuses[]` |
 
 ---
 

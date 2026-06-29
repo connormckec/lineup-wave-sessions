@@ -100,6 +100,10 @@ Two scrape levels run in parallel:
 - Browse reads saved Supabase data only — **no frontend-triggered scraping**. The selected date is used only to raise background enrichment priority.
 - Detail enrichment runs only when data is missing, stale, watched, within 48h, or a basic scrape detected an availability change.
 - `POST /api/admin/enrich-date` with `{ "isoDate": "2026-07-02" }` forces detail collection for a date (admin only).
+- `POST /api/admin/enrich-detail-queue` with `{ "isoDate": "2026-06-29", "limit": 20, "wait": true }` drains the verified detail queue for one date (sequential modal checks, retry backoff).
+- `POST /api/admin/enrich-all-available-details` with `{ "limitPerDate": 20, "wait": true }` processes the queue across all discovered booking dates.
+
+Basic scrapes upsert schedule rows only; a **background verified detail queue** enriches open sessions separately. Slot counts appear only when `detailVerified: true`. Failed attempts retry with exponential backoff (`detailAttemptCount`, `nextDetailRetryAt` in session raw).
 
 **Schedule:**
 
@@ -162,6 +166,9 @@ localStorage caches the watchlist as a fallback. On startup the app loads Lineup
 | `ENRICHMENT_TIER2_EVERY_MINS` | `45` | P2 detail enrichment interval |
 | `ENRICHMENT_TIER3_STALE_HOURS` | `12` | P3 detail enrichment interval |
 | `DETAIL_ENRICH_MAX_PER_RUN` | `25` | Max sessions per enrichment run |
+| `DETAIL_MAX_ATTEMPTS` | `30` | Stop retrying detail after this many attempts |
+| `DETAIL_RETRY_BASE_MS` | `300000` | Initial detail retry delay (5 min) |
+| `DETAIL_QUEUE_DRAIN_DELAY_MS` | `5000` | Delay before chained background queue drain |
 | `ENRICHMENT_DELAY_MS` | `350` | Pause between modal/network detail checks |
 | `ENRICHMENT_BROWSER_IDLE_MS` | `300000` | Close idle enrichment browser after 5 min |
 | `HISTORY_SNAPSHOTS` | `true` | Set `false` to disable `availability_snapshots` inserts |
