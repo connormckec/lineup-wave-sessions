@@ -9955,6 +9955,11 @@ async function runDebugEntriesLeftSelectionContract(page, thresholds) {
 
 function scrapeCalendarGridContractSnapshot() {
   const SESSION_LIKE_RE = /\b(?:AT|AB|ET|EB|PRG|INT|PT|PB|BGN|X)\b/gi;
+  const LEFT_WAVE = 'Left Wave Sessions';
+  const RIGHT_WAVE = 'Right Wave Sessions';
+  const WEEKDAY_HEADER_RE = /\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\.\s*\d+\b/i;
+  const ENTRIES_LEFT_DROPDOWN_LINE_RE = /^\s*at least \d+ entries?\s*left\s*$/i;
+
   function normalizeText(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
@@ -9978,61 +9983,180 @@ function scrapeCalendarGridContractSnapshot() {
     }
     return true;
   }
-  function findCalendarGridRoot() {
-    const tiles = document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]');
-    if (tiles.length) {
-      let node = tiles[0];
-      while (node && node !== document.body) {
-        if (node.tagName === 'TABLE') return node;
-        if (node.classList && [...node.classList].some((c) => /dynamic-cal|agenda|calendar|booking/i.test(c))) return node;
-        node = node.parentElement;
-      }
-    }
-    for (const sel of ['table.dynamic-cal', 'table', '.agenda', '[class*="dynamic-cal"]', '.panel-body']) {
-      const el = document.querySelector(sel);
-      if (el && isVisible(el)) return el;
-    }
-    return null;
+  function rawContainerText(el) {
+    return String(el?.innerText || el?.textContent || '').replace(/\r/g, '');
+  }
+  function excludeEntriesLeftDropdownText(text) {
+    const lines = String(text || '').replace(/\r/g, '').split('\n');
+    const kept = lines.filter((line) => !ENTRIES_LEFT_DROPDOWN_LINE_RE.test(line.trim()));
+    return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
   function countSessionLikeTokens(text) {
     const matches = normalizeText(text).match(SESSION_LIKE_RE);
     return matches ? matches.length : 0;
   }
+  function findLargestVisibleContainer(testFn) {
+    let bestText = '';
+    for (const el of document.querySelectorAll('div, section, main, table, tbody, article, [class*="agenda"], [class*="calendar"], [class*="dynamic-cal"]')) {
+      if (!isVisible(el)) continue;
+      const text = rawContainerText(el);
+      if (!text || text.length < bestText.length) continue;
+      if (!testFn(text)) continue;
+      bestText = text;
+    }
+    return bestText;
+  }
+  function sliceBodyCalendarRegion(bodyRaw) {
+    const leftIdx = bodyRaw.indexOf(LEFT_WAVE);
+    if (leftIdx < 0) return { text: '', source: 'none' };
 
-  const gridRoot = findCalendarGridRoot();
-  const calendarGridText = gridRoot ? normalizeText(gridRoot.innerText || gridRoot.textContent || '') : '';
+    let slice = bodyRaw.slice(leftIdx);
+    const rightIdx = slice.indexOf(RIGHT_WAVE);
+    if (rightIdx >= 0) {
+      const afterRight = slice.slice(rightIdx);
+      const endMarkers = [
+        'Show only activities',
+        'Show only events',
+        'Entries left :',
+        'At least 1 entries left',
+        'Cookie',
+        '©',
+      ];
+      let end = slice.length;
+      for (const marker of endMarkers) {
+        const markerIdx = afterRight.indexOf(marker);
+        if (markerIdx > 80) end = Math.min(end, rightIdx + markerIdx);
+      }
+      slice = slice.slice(0, end);
+      return { text: slice, source: 'body_slice_both_waves' };
+    }
+
+    const partialEndMarkers = ['Show only activities', 'Show only events', 'Entries left :'];
+    let end = slice.length;
+    for (const marker of partialEndMarkers) {
+      const markerIdx = slice.indexOf(marker, LEFT_WAVE.length);
+      if (markerIdx > 80) end = Math.min(end, markerIdx);
+    }
+    return { text: slice.slice(0, end), source: 'partial_wave_section' };
+  }
+  function extractCalendarGridText() {
+    const bothWavesText = findLargestVisibleContainer(
+      (text) => text.includes(LEFT_WAVE) && text.includes(RIGHT_WAVE),
+    );
+    if (bothWavesText.length >= 500) {
+      return { text: bothWavesText, source: 'both_wave_sections_container' };
+    }
+
+    const leftAndWeekdayText = findLargestVisibleContainer(
+      (text) => text.includes(LEFT_WAVE) && WEEKDAY_HEADER_RE.test(text),
+    );
+    if (leftAndWeekdayText.length >= 500) {
+      return { text: leftAndWeekdayText, source: 'left_wave_and_weekday_headers_container' };
+    }
+
+    const bodyRaw = excludeEntriesLeftDropdownText(document.body?.innerText || document.body?.textContent || '');
+    const bodySlice = sliceBodyCalendarRegion(bodyRaw.replace(/\r/g, ''));
+    if (bodySlice.text.length >= 200) {
+      return bodySlice;
+    }
+
+    if (bodyRaw.includes(LEFT_WAVE) || bodyRaw.includes(RIGHT_WAVE)) {
+      const partial = bodyRaw.includes(LEFT_WAVE)
+        ? bodyRaw.slice(bodyRaw.indexOf(LEFT_WAVE))
+        : bodyRaw.slice(bodyRaw.indexOf(RIGHT_WAVE));
+      return { text: partial, source: 'partial_wave_section' };
+    }
+
+    return { text: '', source: 'none' };
+  }
+
   const bodyText = normalizeText(document.body?.innerText || document.body?.textContent || '');
-  const gridTextForCount = calendarGridText || bodyText;
-  const sampleSource = calendarGridText || bodyText;
+  const extracted = extractCalendarGridText();
+  const calendarGridTextRaw = excludeEntriesLeftDropdownText(extracted.text);
+  const calendarGridTextLength = calendarGridTextRaw.length;
+  const calendarGridTextSample = calendarGridTextRaw.slice(0, 800);
+  const calendarGridTextForHash = normalizeText(calendarGridTextRaw);
 
   return {
     bodyTextHash: hashText(bodyText),
-    calendarGridTextHash: hashText(calendarGridText),
-    visibleSessionLikeTextCount: countSessionLikeTokens(gridTextForCount),
-    bodyTextSampleAroundGrid: sampleSource.slice(0, 500),
+    calendarGridTextHash: hashText(calendarGridTextForHash),
+    calendarGridTextLength,
+    visibleSessionLikeTextCount: countSessionLikeTokens(calendarGridTextRaw),
+    calendarGridTextSample,
+    calendarGridTextSource: extracted.source,
   };
 }
 
-async function captureCalendarGridContractSnapshot(page) {
+const GRID_CONTRACT_MIN_TEXT_LENGTH = 500;
+const GRID_CONTRACT_MIN_SESSION_LIKE_COUNT = 20;
+const GRID_CONTRACT_LENGTH_CHANGE_MIN = 50;
+
+function isCalendarGridSnapshotValid(snap) {
+  if (!snap) return false;
+  return (snap.calendarGridTextLength ?? 0) >= GRID_CONTRACT_MIN_TEXT_LENGTH
+    && (snap.visibleSessionLikeTextCount ?? 0) >= GRID_CONTRACT_MIN_SESSION_LIKE_COUNT;
+}
+
+function calendarGridTextLengthChangedMeaningfully(before, after) {
+  const diff = Math.abs((after?.calendarGridTextLength ?? 0) - (before?.calendarGridTextLength ?? 0));
+  return diff >= GRID_CONTRACT_LENGTH_CHANGE_MIN;
+}
+
+async function captureCalendarGridContractSnapshot(page, { dismissDropdown = true } = {}) {
   assertPlaywrightPage(page, 'captureCalendarGridContractSnapshot');
-  return page.evaluate(scrapeCalendarGridContractSnapshot);
+  if (dismissDropdown) {
+    await dismissEntriesLeftPopup(page);
+    await page.waitForTimeout(250);
+  }
+  const snap = await page.evaluate(scrapeCalendarGridContractSnapshot);
+  return {
+    ...snap,
+    gridSnapshotValid: isCalendarGridSnapshotValid(snap),
+  };
 }
 
 function calendarGridContractChanged(before, after) {
   if (!before || !after) return false;
-  return before.bodyTextHash !== after.bodyTextHash
-    || before.calendarGridTextHash !== after.calendarGridTextHash
-    || before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount;
+  if (!isCalendarGridSnapshotValid(before) || !isCalendarGridSnapshotValid(after)) return false;
+  return before.calendarGridTextHash !== after.calendarGridTextHash
+    || before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount
+    || calendarGridTextLengthChangedMeaningfully(before, after);
 }
 
 function classifyCalendarGridChangeReason(before, after) {
-  const reasons = [];
-  if (before.bodyTextHash !== after.bodyTextHash) reasons.push('body_text_hash_changed');
-  if (before.calendarGridTextHash !== after.calendarGridTextHash) reasons.push('calendar_grid_text_hash_changed');
-  if (before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount) {
-    reasons.push('visible_session_like_text_count_changed');
+  if (!isCalendarGridSnapshotValid(before) || !isCalendarGridSnapshotValid(after)) {
+    return 'calendar_grid_snapshot_too_narrow';
   }
-  return reasons.length ? reasons.join(',') : 'grid_changed';
+  if (before.calendarGridTextHash !== after.calendarGridTextHash) {
+    return 'calendar_grid_text_hash_changed';
+  }
+  if (before.visibleSessionLikeTextCount !== after.visibleSessionLikeTextCount) {
+    return 'visible_session_like_text_count_changed';
+  }
+  if (calendarGridTextLengthChangedMeaningfully(before, after)) {
+    return 'calendar_grid_text_length_changed';
+  }
+  return null;
+}
+
+function resolveGridChangeOutcome(gridBefore, gridAfter, labelOk) {
+  if (!isCalendarGridSnapshotValid(gridBefore) || !isCalendarGridSnapshotValid(gridAfter)) {
+    return {
+      gridChanged: false,
+      gridChangeReason: 'calendar_grid_snapshot_too_narrow',
+    };
+  }
+  const gridChanged = calendarGridContractChanged(gridBefore, gridAfter);
+  if (gridChanged) {
+    return {
+      gridChanged: true,
+      gridChangeReason: classifyCalendarGridChangeReason(gridBefore, gridAfter),
+    };
+  }
+  return {
+    gridChanged: false,
+    gridChangeReason: labelOk ? 'entries_left_label_set_but_grid_unchanged' : 'entries_left_label_not_verified_after_grid_wait',
+  };
 }
 
 function mapEntriesLeftSelectionContractFields(setResult) {
@@ -10058,14 +10182,26 @@ async function waitForCalendarGridChangeAfterThreshold(page, gridBefore, thresho
     const labelOk = entriesLeftSelectedLabelMatchesThreshold(afterLabel, threshold);
     const after = await captureCalendarGridContractSnapshot(page);
     lastAfter = after;
-    if (labelOk && calendarGridContractChanged(gridBefore, after)) {
-      return {
-        gridAfter: after,
-        gridChanged: true,
-        gridChangeReason: classifyCalendarGridChangeReason(gridBefore, after),
-        waitedMs: Date.now() - started,
-        labelOk,
-      };
+    if (labelOk) {
+      const outcome = resolveGridChangeOutcome(gridBefore, after, labelOk);
+      if (outcome.gridChanged) {
+        return {
+          gridAfter: after,
+          gridChanged: true,
+          gridChangeReason: outcome.gridChangeReason,
+          waitedMs: Date.now() - started,
+          labelOk,
+        };
+      }
+      if (outcome.gridChangeReason === 'calendar_grid_snapshot_too_narrow') {
+        return {
+          gridAfter: after,
+          gridChanged: false,
+          gridChangeReason: outcome.gridChangeReason,
+          waitedMs: Date.now() - started,
+          labelOk,
+        };
+      }
     }
     await page.waitForTimeout(pollMs);
   }
@@ -10075,14 +10211,12 @@ async function waitForCalendarGridChangeAfterThreshold(page, gridBefore, thresho
   const gridAfter = lastAfter === gridBefore
     ? await captureCalendarGridContractSnapshot(page)
     : lastAfter;
-  const gridChanged = calendarGridContractChanged(gridBefore, gridAfter);
+  const outcome = resolveGridChangeOutcome(gridBefore, gridAfter, labelOk);
 
   return {
     gridAfter,
-    gridChanged,
-    gridChangeReason: gridChanged
-      ? classifyCalendarGridChangeReason(gridBefore, gridAfter)
-      : (labelOk ? 'entries_left_label_set_but_grid_unchanged' : 'entries_left_label_not_verified_after_grid_wait'),
+    gridChanged: outcome.gridChanged,
+    gridChangeReason: outcome.gridChangeReason,
     waitedMs: Date.now() - started,
     labelOk,
   };
@@ -10097,16 +10231,20 @@ async function runEntriesLeftThresholdGridChangeContract(page, threshold, option
 
   if (!selection.filterSetOk) {
     const gridAfter = await captureCalendarGridContractSnapshot(page);
+    const outcome = resolveGridChangeOutcome(gridBefore, gridAfter, false);
     return {
       requestedThreshold,
       selection,
       gridBefore,
       gridAfter,
-      gridChanged: calendarGridContractChanged(gridBefore, gridAfter),
-      gridChangeReason: selection.filterSetError || 'selection_failed',
+      gridChanged: outcome.gridChanged,
+      gridChangeReason: selection.filterSetError || outcome.gridChangeReason || 'selection_failed',
       waitedMs: 0,
     };
   }
+
+  await dismissEntriesLeftPopup(page);
+  await page.waitForTimeout(300);
 
   const waitResult = await waitForCalendarGridChangeAfterThreshold(
     page,
@@ -10248,10 +10386,14 @@ async function runDebugEntriesLeftControl({
       const gridChangeResults = await runDebugEntriesLeftGridChangeContract(launched.page, thresholds);
       const selectionOk = gridChangeResults.length > 0
         && gridChangeResults.every((r) => r.selection?.filterSetOk);
-      const contractOk = selectionOk && gridChangeResults.every((r) => (
+      const snapshotsValid = gridChangeResults.every(
+        (r) => r.gridBefore?.gridSnapshotValid && r.gridAfter?.gridSnapshotValid,
+      );
+      const gridEvidenceOk = gridChangeResults.every((r) => (
         r.gridChanged === true
-        || (r.gridChanged === false && Boolean(r.gridChangeReason))
+        || r.gridChangeReason === 'entries_left_label_set_but_grid_unchanged'
       ));
+      const contractOk = selectionOk && snapshotsValid && gridEvidenceOk;
       return {
         gate: 4,
         mode,
@@ -10278,7 +10420,8 @@ async function runDebugEntriesLeftControl({
           ? null
           : (
             gridChangeResults.find((r) => !r.selection?.filterSetOk)?.selection?.filterSetError
-            || gridChangeResults.find((r) => r.selection?.filterSetOk && !r.gridChangeReason)?.gridChangeReason
+            || (!snapshotsValid ? 'calendar_grid_snapshot_too_narrow' : null)
+            || gridChangeResults.find((r) => r.selection?.filterSetOk && r.gridChanged !== true && r.gridChangeReason !== 'entries_left_label_set_but_grid_unchanged')?.gridChangeReason
             || 'grid_change_contract_failed'
           ),
       };

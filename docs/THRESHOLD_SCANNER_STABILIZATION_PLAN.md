@@ -188,13 +188,23 @@ For N=1,2,3 collect per threshold:
 {
   requestedThreshold: N,
   selection: { beforeLabel, matchingOptionText, afterLabel, filterSetOk, filterSetError },
-  gridBefore: { bodyTextHash, calendarGridTextHash, visibleSessionLikeTextCount, bodyTextSampleAroundGrid },
+  gridBefore: {
+    bodyTextHash,
+    calendarGridTextHash,
+    calendarGridTextLength,
+    visibleSessionLikeTextCount,
+    calendarGridTextSample,
+    calendarGridTextSource,
+    gridSnapshotValid,
+  },
   gridAfter: { ... },
   gridChanged: true | false,
   gridChangeReason,
   waitedMs
 }
 ```
+
+Grid snapshots must capture the full visible schedule (Left/Right Wave Sessions, time rows, weekday headers, session codes). `bodyTextHash` is diagnostic only — grid change requires `calendarGridTextHash`, `visibleSessionLikeTextCount`, or meaningful `calendarGridTextLength` change. Invalid if `calendarGridTextLength < 500` or `visibleSessionLikeTextCount < 20`.
 
 **Acceptance curl:**
 
@@ -205,7 +215,7 @@ curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin
   | jq '{gate,currentUrl,rawMonthLabel,targetDateVisibleFromHeaders,gridChangeResults,writesPerformed,thresholdWriteSafe,error,crashed}'
 ```
 
-**Acceptance:** Label changes correctly; grid changes or returns explicit `gridChangeReason`. No slot inference, no writes.
+**Acceptance:** Label changes correctly; each snapshot has `gridSnapshotValid: true` with broad `calendarGridTextSample`; grid changes via calendar signals or returns `entries_left_label_set_but_grid_unchanged`. No slot inference, no writes.
 
 ---
 
