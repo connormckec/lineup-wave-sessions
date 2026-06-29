@@ -10863,6 +10863,120 @@ function finalizeTileParserContractResult(raw) {
   };
 }
 
+function emptyTileParserContractResult() {
+  return {
+    totalCandidateNodes: 0,
+    excludedCount: 0,
+    parsedCount: 0,
+    duplicateCount: 0,
+    parsedIdentitiesSample: [],
+    excludedSamples: [],
+    countsByDate: {},
+    countsByWaveSide: {},
+    countsBySessionCode: {},
+    parseWarnings: [],
+    spatialIndex: null,
+  };
+}
+
+function normalizeGridSnapshotForResponse(snap) {
+  if (!snap) return null;
+  return {
+    bodyTextHash: snap.bodyTextHash ?? null,
+    calendarGridTextHash: snap.calendarGridTextHash ?? null,
+    calendarGridTextLength: snap.calendarGridTextLength ?? null,
+    visibleSessionLikeTextCount: snap.visibleSessionLikeTextCount ?? null,
+    calendarGridTextSample: snap.calendarGridTextSample ?? null,
+    calendarGridTextSource: snap.calendarGridTextSource ?? null,
+    gridSnapshotValid: snap.gridSnapshotValid === true,
+  };
+}
+
+function visibleCodeMatchesSessionCode(sourceText, sessionCode) {
+  const compact = String(sourceText || '').replace(/\s+/g, '').toUpperCase();
+  const m = compact.match(/^(AT|AB|ET|EB|PRG|INT|PT|PB|BGN)\*?$/);
+  if (!m) return true;
+  return m[1] === sessionCode;
+}
+
+function buildTileParserContractValidation({
+  thresholdSelection,
+  gridSnapshot,
+  tileParserResult,
+} = {}) {
+  const errors = [];
+  const warnings = [];
+
+  if (!thresholdSelection?.filterSetOk) {
+    errors.push('threshold_selection_failed');
+  }
+  if (!gridSnapshot?.gridSnapshotValid) {
+    errors.push('grid_snapshot_invalid');
+  }
+
+  const parsedCount = tileParserResult?.parsedCount ?? 0;
+  const leftCount = tileParserResult?.countsByWaveSide?.left ?? 0;
+  const rightCount = tileParserResult?.countsByWaveSide?.right ?? 0;
+
+  if (parsedCount <= 0) errors.push('parsed_count_zero');
+  if (leftCount <= 0) errors.push('missing_left_wave');
+  if (rightCount <= 0) errors.push('missing_right_wave');
+
+  const parsedSample = tileParserResult?.parsedIdentitiesSample || [];
+  const pbParsed = (tileParserResult?.countsBySessionCode?.PB ?? 0) > 0
+    || parsedSample.some((p) => p.sessionCode === 'PB');
+  if (!pbParsed) warnings.push('pb_not_parsed_in_sample');
+
+  const excludedSamples = tileParserResult?.excludedSamples || [];
+  const xExcluded = excludedSamples.some(
+    (e) => e.reason === 'x_cell' || /^x$/i.test(String(e.sourceText || '').trim()),
+  );
+  if (!xExcluded && parsedCount > 0) warnings.push('x_exclusion_not_observed_in_samples');
+
+  const mismatchWarnings = (tileParserResult?.parseWarnings || []).filter(
+    (w) => w && typeof w === 'object' && w.type === 'title_visible_code_mismatch',
+  );
+  for (const mismatch of mismatchWarnings.slice(0, 10)) {
+    warnings.push(`title_visible_code_mismatch:${mismatch.sourceText}:${mismatch.titleInferredCode}->${mismatch.visibleNormalizedCode}`);
+  }
+
+  const visibleCodeWins = parsedSample.every(
+    (p) => visibleCodeMatchesSessionCode(p.sourceText, p.sessionCode),
+  );
+  if (!visibleCodeWins) errors.push('visible_code_does_not_match_session_code');
+
+  const checks = {
+    parsedCountPositive: parsedCount > 0,
+    hasLeftWave: leftCount > 0,
+    hasRightWave: rightCount > 0,
+    pbParsed,
+    xExcluded,
+    visibleCodeWins,
+  };
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    checks,
+  };
+}
+
+function resolveTileParserContractError(validation, tileParserResult) {
+  if (!validation) return 'tile_parser_contract_failed';
+  if (validation.errors.includes('threshold_selection_failed')) return 'threshold_selection_failed';
+  if (validation.errors.includes('grid_snapshot_invalid')) return 'calendar_grid_snapshot_too_narrow';
+  if (validation.errors.includes('parsed_count_zero')) return 'tile_parser_no_identities_parsed';
+  if (validation.errors.includes('missing_left_wave') || validation.errors.includes('missing_right_wave')) {
+    return 'tile_parser_missing_wave_side_counts';
+  }
+  if (validation.errors.includes('visible_code_does_not_match_session_code')) {
+    return 'tile_parser_visible_code_mismatch';
+  }
+  if ((tileParserResult?.parsedCount ?? 0) <= 0) return 'tile_parser_no_identities_parsed';
+  return 'tile_parser_contract_failed';
+}
+
 async function scrapeTileParserContractFromPage(page) {
   assertPlaywrightPage(page, 'scrapeTileParserContractFromPage');
   return page.evaluate(scrapeCalendarTileParserContract);
@@ -10874,39 +10988,43 @@ async function runDebugEntriesLeftTileParserContract(page, threshold = 1) {
   const thresholdSelection = mapEntriesLeftSelectionContractFields(setResult);
 
   if (!thresholdSelection.filterSetOk) {
+    const tileParserResult = emptyTileParserContractResult();
+    const tileParserValidation = buildTileParserContractValidation({
+      thresholdSelection,
+      gridSnapshot: null,
+      tileParserResult,
+    });
     return {
       thresholdSelection,
       gridSnapshot: null,
-      tileParserResult: null,
-      error: thresholdSelection.filterSetError || 'threshold_selection_failed',
+      tileParserResult,
+      tileParserValidation,
+      error: resolveTileParserContractError(tileParserValidation, tileParserResult),
     };
   }
 
   await dismissEntriesLeftPopup(page);
   await page.waitForTimeout(300);
-  const gridSnapshot = await captureCalendarGridContractSnapshot(page);
-
-  if (!gridSnapshot.gridSnapshotValid) {
-    return {
-      thresholdSelection,
-      gridSnapshot,
-      tileParserResult: null,
-      error: 'calendar_grid_snapshot_too_narrow',
-    };
-  }
+  const gridSnapshot = normalizeGridSnapshotForResponse(
+    await captureCalendarGridContractSnapshot(page),
+  );
 
   const raw = await scrapeTileParserContractFromPage(page);
   const tileParserResult = finalizeTileParserContractResult(raw);
-  const waveSidesOk = (tileParserResult.countsByWaveSide?.left ?? 0) > 0
-    && (tileParserResult.countsByWaveSide?.right ?? 0) > 0;
+  const tileParserValidation = buildTileParserContractValidation({
+    thresholdSelection,
+    gridSnapshot,
+    tileParserResult,
+  });
 
   return {
     thresholdSelection,
     gridSnapshot,
     tileParserResult,
-    error: tileParserResult.parsedCount > 0
-      ? (waveSidesOk ? null : 'tile_parser_missing_wave_side_counts')
-      : 'tile_parser_no_identities_parsed',
+    tileParserValidation,
+    error: tileParserValidation.ok
+      ? null
+      : resolveTileParserContractError(tileParserValidation, tileParserResult),
   };
 }
 
@@ -11064,12 +11182,13 @@ async function runDebugEntriesLeftControl({
     if (mode === 'tile_parser_contract') {
       const parserThreshold = Math.max(1, Number(threshold) || 1);
       const parserRun = await runDebugEntriesLeftTileParserContract(launched.page, parserThreshold);
-      const selectionOk = parserRun.thresholdSelection?.filterSetOk === true;
-      const snapshotOk = parserRun.gridSnapshot?.gridSnapshotValid === true;
-      const parsedOk = (parserRun.tileParserResult?.parsedCount ?? 0) > 0;
-      const waveSidesOk = (parserRun.tileParserResult?.countsByWaveSide?.left ?? 0) > 0
-        && (parserRun.tileParserResult?.countsByWaveSide?.right ?? 0) > 0;
-      const contractOk = selectionOk && snapshotOk && parsedOk && waveSidesOk && !parserRun.error;
+      const tileParserResult = parserRun.tileParserResult || emptyTileParserContractResult();
+      const tileParserValidation = parserRun.tileParserValidation || buildTileParserContractValidation({
+        thresholdSelection: parserRun.thresholdSelection,
+        gridSnapshot: parserRun.gridSnapshot,
+        tileParserResult,
+      });
+      const contractOk = tileParserValidation.ok === true;
       return {
         gate: 5,
         mode,
@@ -11087,13 +11206,14 @@ async function runDebugEntriesLeftControl({
         targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
         thresholdSelection: parserRun.thresholdSelection,
         gridSnapshot: parserRun.gridSnapshot,
-        tileParserResult: parserRun.tileParserResult,
         tileParserContractOk: contractOk,
+        tileParserValidation,
+        tileParserResult,
         durationMs: Date.now() - started,
         writesPerformed: false,
         thresholdWriteSafe: false,
         crashed: false,
-        error: contractOk ? null : (parserRun.error || 'tile_parser_contract_failed'),
+        error: contractOk ? null : (parserRun.error || resolveTileParserContractError(tileParserValidation, tileParserResult)),
       };
     }
 
