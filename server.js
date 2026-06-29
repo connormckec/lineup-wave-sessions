@@ -10291,21 +10291,111 @@ async function collectCalendarFixtureDomFromPage(page, fixtureMeta = {}) {
   };
 }
 
-function mapFixtureParseToTileParserResult(parseResult, domFixture) {
+function mapFixtureParseToTileParserResult(parseResult, domFixture, validationRaw = null) {
+  const parserWarnings = Array.isArray(parseResult?.warnings) ? parseResult.warnings : [];
+  const validationWarnings = Array.isArray(validationRaw?.warnings) ? validationRaw.warnings : [];
+  const parseWarnings = [
+    ...parserWarnings,
+    ...validationWarnings.map((warning) => (
+      typeof warning === 'string'
+        ? { type: 'validation_warning', message: warning }
+        : warning
+    )),
+  ];
+
   return {
-    totalCandidateNodes: domFixture?.summary?.sessionTileCount
-      ?? parseResult.meta?.sessionTileInputCount
+    totalCandidateNodes: Number(
+      domFixture?.summary?.sessionTileCount
+      ?? parseResult?.meta?.sessionTileInputCount
       ?? 0,
-    excludedCount: parseResult.excludedCount,
-    parsedCount: parseResult.parsedCount,
-    duplicateCount: parseResult.duplicateCount,
-    parsedIdentitiesSample: parseResult.parsedIdentitiesSample,
-    excludedSamples: parseResult.excludedSamples,
-    countsByDate: parseResult.countsByDate,
-    countsByWaveSide: parseResult.countsByWaveSide,
-    countsBySessionCode: parseResult.countsBySessionCode,
-    parseWarnings: parseResult.warnings,
-    domSummary: domFixture?.summary ?? null,
+    ),
+    excludedCount: Number(parseResult?.excludedCount ?? 0),
+    parsedCount: Number(parseResult?.parsedCount ?? 0),
+    duplicateCount: Number(parseResult?.duplicateCount ?? 0),
+    countsByDate: parseResult?.countsByDate && typeof parseResult.countsByDate === 'object'
+      ? parseResult.countsByDate
+      : {},
+    countsByWaveSide: parseResult?.countsByWaveSide && typeof parseResult.countsByWaveSide === 'object'
+      ? parseResult.countsByWaveSide
+      : {},
+    countsBySessionCode: parseResult?.countsBySessionCode && typeof parseResult.countsBySessionCode === 'object'
+      ? parseResult.countsBySessionCode
+      : {},
+    parsedIdentitiesSample: Array.isArray(parseResult?.parsedIdentitiesSample)
+      ? parseResult.parsedIdentitiesSample
+      : [],
+    excludedSamples: Array.isArray(parseResult?.excludedSamples)
+      ? parseResult.excludedSamples
+      : [],
+    parseWarnings,
+    spatialIndex: buildSpatialIndexFromDomFixture(domFixture),
+  };
+}
+
+function buildSpatialIndexFromDomFixture(domFixture) {
+  const summary = domFixture?.summary;
+  if (!summary) return null;
+  return {
+    waveHeaderCount: summary.waveHeaderCount ?? null,
+    dayHeaderCount: summary.dayHeaderCount ?? null,
+    timeLabelCount: summary.timeLabelCount ?? null,
+    sessionTileCount: summary.sessionTileCount ?? null,
+    sessionTileLeftCount: summary.sessionTileLeftCount ?? null,
+    sessionTileRightCount: summary.sessionTileRightCount ?? null,
+    waveHeaders: summary.waveHeaders ?? [],
+    hasLeftWaveHeader: summary.hasLeftWaveHeader === true,
+    hasRightWaveHeader: summary.hasRightWaveHeader === true,
+    byCategory: summary.byCategory ?? null,
+  };
+}
+
+function buildGridSnapshotResponse(snap) {
+  if (!snap) return null;
+  return {
+    bodyTextHash: snap.bodyTextHash ?? null,
+    calendarGridTextHash: snap.calendarGridTextHash ?? null,
+    calendarGridTextLength: Number(snap.calendarGridTextLength ?? 0),
+    visibleSessionLikeTextCount: Number(snap.visibleSessionLikeTextCount ?? 0),
+    calendarGridTextSample: snap.calendarGridTextSample ?? null,
+    calendarGridTextSource: snap.calendarGridTextSource ?? null,
+    gridSnapshotValid: snap.gridSnapshotValid === true || isCalendarGridSnapshotValid(snap),
+  };
+}
+
+function assembleGate5TileParserContractPayload(parserRun) {
+  const gridSnapshot = parserRun?.gridSnapshotRaw
+    ? buildGridSnapshotResponse(parserRun.gridSnapshotRaw)
+    : buildGridSnapshotResponse(parserRun?.gridSnapshot);
+
+  const validationRaw = parserRun?.tileParserValidationRaw
+    || buildTileParserContractValidation({
+      thresholdSelection: parserRun?.thresholdSelection,
+      gridSnapshot,
+      tileParserResult: parserRun?.tileParserResult,
+    });
+
+  const tileParserResult = parserRun?.parseResult
+    ? mapFixtureParseToTileParserResult(
+      parserRun.parseResult,
+      {
+        summary: parserRun.domFixtureSummary,
+        threshold: parserRun.parseResult?.meta?.threshold ?? null,
+        isoDate: parserRun.parseResult?.meta?.isoDate ?? null,
+      },
+      validationRaw,
+    )
+    : (parserRun?.tileParserResult || emptyTileParserContractResult());
+
+  const tileParserValidation = formatTileParserValidationForResponse(validationRaw);
+
+  return {
+    gridSnapshot,
+    tileParserResult,
+    tileParserValidation,
+    tileParserContractOk: tileParserValidation?.ok === true,
+    error: tileParserValidation?.ok
+      ? null
+      : resolveTileParserContractError(tileParserValidation, tileParserResult),
   };
 }
 
@@ -10339,16 +10429,7 @@ function emptyTileParserContractResult() {
 }
 
 function normalizeGridSnapshotForResponse(snap) {
-  if (!snap) return null;
-  return {
-    bodyTextHash: snap.bodyTextHash ?? null,
-    calendarGridTextHash: snap.calendarGridTextHash ?? null,
-    calendarGridTextLength: snap.calendarGridTextLength ?? null,
-    visibleSessionLikeTextCount: snap.visibleSessionLikeTextCount ?? null,
-    calendarGridTextSample: snap.calendarGridTextSample ?? null,
-    calendarGridTextSource: snap.calendarGridTextSource ?? null,
-    gridSnapshotValid: snap.gridSnapshotValid === true,
-  };
+  return buildGridSnapshotResponse(snap);
 }
 
 function visibleCodeMatchesSessionCode(sourceText, sessionCode) {
@@ -10461,9 +10542,8 @@ async function runDebugEntriesLeftTileParserContract(page, threshold = 1, { isoD
 
   await dismissEntriesLeftPopup(page);
   await page.waitForTimeout(300);
-  const gridSnapshot = normalizeGridSnapshotForResponse(
-    await captureCalendarGridContractSnapshot(page),
-  );
+  const gridSnapshotRaw = await captureCalendarGridContractSnapshot(page);
+  const gridSnapshot = buildGridSnapshotResponse(gridSnapshotRaw);
 
   const domFixture = await collectCalendarFixtureDomFromPage(page, {
     threshold: requestedThreshold,
@@ -10477,20 +10557,27 @@ async function runDebugEntriesLeftTileParserContract(page, threshold = 1, { isoD
     },
   });
   const parseResult = parseCalendarFixtureDom(domFixture);
-  const tileParserResult = mapFixtureParseToTileParserResult(parseResult, domFixture);
-  const tileParserValidation = formatTileParserValidationForResponse(
-    buildTileParserContractValidation({
-      thresholdSelection,
-      gridSnapshot,
-      tileParserResult,
-    }),
+  const tileParserValidationRaw = buildTileParserContractValidation({
+    thresholdSelection,
+    gridSnapshot,
+    tileParserResult: mapFixtureParseToTileParserResult(parseResult, domFixture),
+  });
+  const tileParserResult = mapFixtureParseToTileParserResult(
+    parseResult,
+    domFixture,
+    tileParserValidationRaw,
   );
+  const tileParserValidation = formatTileParserValidationForResponse(tileParserValidationRaw);
 
   return {
     thresholdSelection,
     gridSnapshot,
+    gridSnapshotRaw,
+    parseResult,
+    domFixtureSummary: domFixture.summary ?? null,
     tileParserResult,
     tileParserValidation,
+    tileParserValidationRaw,
     error: tileParserValidation.ok
       ? null
       : resolveTileParserContractError(tileParserValidation, tileParserResult),
@@ -10654,15 +10741,7 @@ async function runDebugEntriesLeftControl({
         isoDate: requestedIsoDate,
         navigation: nav,
       });
-      const tileParserResult = parserRun.tileParserResult || emptyTileParserContractResult();
-      const tileParserValidation = parserRun.tileParserValidation || formatTileParserValidationForResponse(
-        buildTileParserContractValidation({
-          thresholdSelection: parserRun.thresholdSelection,
-          gridSnapshot: parserRun.gridSnapshot,
-          tileParserResult,
-        }),
-      );
-      const contractOk = tileParserValidation.ok === true;
+      const assembled = assembleGate5TileParserContractPayload(parserRun);
       return {
         gate: 5,
         mode,
@@ -10679,15 +10758,15 @@ async function runDebugEntriesLeftControl({
         visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
         targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
         thresholdSelection: parserRun.thresholdSelection,
-        gridSnapshot: parserRun.gridSnapshot,
-        tileParserContractOk: contractOk,
-        tileParserValidation,
-        tileParserResult,
+        gridSnapshot: assembled.gridSnapshot,
+        tileParserContractOk: assembled.tileParserContractOk,
+        tileParserValidation: assembled.tileParserValidation,
+        tileParserResult: assembled.tileParserResult,
         durationMs: Date.now() - started,
         writesPerformed: false,
         thresholdWriteSafe: false,
         crashed: false,
-        error: contractOk ? null : (parserRun.error || resolveTileParserContractError(tileParserValidation, tileParserResult)),
+        error: assembled.error,
       };
     }
 
