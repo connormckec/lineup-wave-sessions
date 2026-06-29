@@ -3514,6 +3514,12 @@ function applyPageDiagnosticsTo(target, diagnostics = {}) {
   return target;
 }
 
+function assertPlaywrightPage(page, label) {
+  if (!page || typeof page.evaluate !== 'function') {
+    throw new Error(`${label}: expected Playwright page, got ${Object.prototype.toString.call(page)} keys=${page && typeof page === 'object' ? Object.keys(page).join(',') : String(page)}`);
+  }
+}
+
 async function collectPageDiagnostics(page, label = 'unknown') {
   const out = {
     diagnosticLabel: label,
@@ -3530,6 +3536,8 @@ async function collectPageDiagnostics(page, label = 'unknown') {
     out.pageUnavailableReason = 'page_object_missing';
     return out;
   }
+
+  assertPlaywrightPage(page, `collectPageDiagnostics(${label})`);
 
   try { out.currentUrl = page.url?.() || null; } catch {
     out.pageUnavailableReason = out.pageUnavailableReason || 'current_url_unavailable';
@@ -8983,6 +8991,7 @@ function scrapeVisibleSessions({ excludedLevels = [], excludedWaves = [], weekOf
 }
 
 async function scrapeVisibleSessionsFromPage(page, options = {}) {
+  assertPlaywrightPage(page, 'scrapeVisibleSessionsFromPage');
   return page.evaluate(scrapeVisibleSessions, { ...SCRAPE_OPTS, ...options });
 }
 
@@ -9185,6 +9194,7 @@ function enrichThresholdTile(tile) {
 }
 
 async function scrapeThresholdSessionTilesFromPage(page, options = {}) {
+  assertPlaywrightPage(page, 'scrapeThresholdSessionTilesFromPage');
   const scrape = await page.evaluate(scrapeVisibleThresholdTilesStrict, { ...SCRAPE_OPTS, ...options });
   const sessions = (scrape.sessions || [])
     .filter(s => s.available && !isThresholdPlaceholderTile(s))
@@ -9198,6 +9208,7 @@ async function scrapeThresholdSessionTilesFromPage(page, options = {}) {
 }
 
 async function getThresholdGridSnapshot(page) {
+  assertPlaywrightPage(page, 'getThresholdGridSnapshot');
   return page.evaluate(() => {
     function readEntriesLeftFilterLabel() {
       for (const sel of document.querySelectorAll('select')) {
@@ -9242,6 +9253,7 @@ async function getThresholdGridSnapshot(page) {
 }
 
 async function waitForThresholdGridChange(page, before, { timeoutMs = 8000, pollMs = 250 } = {}) {
+  assertPlaywrightPage(page, 'waitForThresholdGridChange');
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const after = await getThresholdGridSnapshot(page);
@@ -9262,11 +9274,12 @@ async function waitForThresholdGridChange(page, before, { timeoutMs = 8000, poll
 }
 
 async function applyEntriesLeftFilterWithVerification(page, threshold) {
+  assertPlaywrightPage(page, 'applyEntriesLeftFilterWithVerification');
   const requestedThreshold = Number(threshold);
   const before = await getThresholdGridSnapshot(page);
   const changed = await setEntriesLeftFilter(page, requestedThreshold);
   let afterLabelSnap = await getThresholdGridSnapshot(page);
-  const settle = await waitForThresholdGridChange(before, {
+  const settle = await waitForThresholdGridChange(page, before, {
     timeoutMs: Math.max(THRESHOLD_FILTER_SETTLE_MS * 2, 6000),
   });
   afterLabelSnap = await getThresholdGridSnapshot(page);
@@ -9299,6 +9312,7 @@ async function normalizeBookingFiltersOnPage(page) {
 }
 
 async function getCalendarHeaderParseFromPage(page) {
+  assertPlaywrightPage(page, 'getCalendarHeaderParseFromPage');
   return page.evaluate(scrapeCalendarHeaderDates);
 }
 
@@ -9369,6 +9383,7 @@ async function blurActiveFilterDropdown(page) {
 }
 
 async function setEntriesLeftFilter(page, minThreshold) {
+  assertPlaywrightPage(page, 'setEntriesLeftFilter');
   await dismissCookieBanner(page).catch(() => {});
   const n = Math.max(1, Number(minThreshold) || 1);
 
