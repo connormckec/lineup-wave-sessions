@@ -228,10 +228,48 @@ curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin
 Each identity:
 
 ```js
-{ isoDate, timeLabel, waveSide, sessionCode, identityKey, sourceText }
+{
+  isoDate,
+  timeLabel,
+  waveSide,
+  sessionCode,
+  identityKey,
+  sourceText,
+  boundingBox,
+  confidence,
+  parseMethod
+}
 ```
 
-**Acceptance:** Excludes X cells, day headers, time labels, filter chips, hidden/stale DOM; dedupes parent/child; returns samples for review.
+**Acceptance curl:**
+
+```bash
+curl -s -X POST https://lineup-wave-sessions-production.up.railway.app/api/admin/debug-entries-left-control \
+  -H 'Content-Type: application/json' \
+  -d '{"isoDate":"2026-06-30","weekMode":true,"threshold":1,"dryRun":true,"debug":true,"wait":true,"mode":"tile_parser_contract"}' \
+  | jq '{
+    gate,
+    currentUrl,
+    rawMonthLabel,
+    rawDayHeaderTexts,
+    visibleIsoDatesFromHeaders,
+    targetDateVisibleFromHeaders,
+    thresholdSelection,
+    gridSnapshot: {
+      gridSnapshotValid,
+      calendarGridTextSource,
+      calendarGridTextLength,
+      visibleSessionLikeTextCount
+    },
+    tileParserResult,
+    writesPerformed,
+    thresholdWriteSafe,
+    error,
+    crashed
+  }'
+```
+
+**Acceptance:** Excludes X cells, day headers, time labels, filter chips, hidden/stale DOM; dedupes parent/child; `parsedCount > 0`; `countsByDate` spans the visible week. No inference, no writes.
 
 ---
 
