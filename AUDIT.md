@@ -137,7 +137,7 @@ If fallback rows exist, API returns `statusReason: fallback_sessions_found` — 
 | `last_scraped_at` | timestamptz | |
 | `last_basic_check_at` | timestamptz | Set on basic tile scrape |
 | `last_detailed_check_at` | timestamptz | Set on modal/network detail scrape |
-| `detail_status` | text | `pending`, `checking`, `checked_with_slots`, `checked_packed`, `checked_open_no_slots_visible`, `checked_available_no_slot_count`, `failed_modal_mismatch`, `failed_modal_open`, `failed_selector`, `failed_cookie_overlay`, `failed_parse`, `failed_timeout`, `unknown` (legacy: `checked_packed_no_slots`, `checked_no_slots_visible`, `checked`, `failed`) |
+| `detail_status` | text | `pending`, `checking`, `checked_with_slots`, `checked_packed`, `checked_open_no_slots_visible`, `checked_available_no_slot_count`, `failed_modal_mismatch`, `failed_modal_stale`, `failed_tile_mismatch`, `failed_modal_open`, `failed_selector`, `failed_cookie_overlay`, `failed_parse`, `failed_timeout`, `unknown` (legacy: `checked_packed_no_slots`, `checked_no_slots_visible`, `checked`, `failed`) |
 | `detail_error` | text | e.g. `slots_exceed_capacity`, `modal_mismatch: …` |
 
 **Verification fields (stored in `raw` jsonb):** `detailVerified`, `detailConfidence` (`exact_match`, `weak_match`, `mismatch`, `default_suppressed`), `detailSourceSessionKey`, `detailSourceIsoDate`, `detailSourceStartTime`, `detailSourceSessionType`, `detailSourceWaveSide`, `detailParseOutput`.

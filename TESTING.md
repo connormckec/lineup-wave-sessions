@@ -221,7 +221,15 @@ curl -s -X POST http://localhost:3000/api/admin/repair-detail-data \
 
 6. **Future week navigation** — enrichment for 2026-06-29 must navigate until target date is visible (`targetDateVisible: true` in enrichment `navigationDiagnostics`).
 
-7. **UI** — open sessions without verified detail show *details pending* / *Open*; no fake “2/12 booked · 10 spots left”.
+7. **Stale modal reuse** — same `detailRawText` must not attach to unrelated sessions; debug should show `staleModalCount` and `failedModalStaleSample`:
+
+```bash
+curl -s http://localhost:3000/api/debug/date/2026-06-29 | jq '{staleModalCount,failedModalStaleSample,rowsWithCheckedWithSlotsButNullValuesSample,duplicateRawModalGroups,tileClickSamples}'
+```
+
+8. **Invalid status** — no row should have `detailStatus: checked_with_slots` while `slots` or `capacity` is null.
+
+9. **UI** — open sessions without verified detail show *details pending* / *Open*; no fake “2/12 booked · 10 spots left”.
 
 ---
 

@@ -109,6 +109,56 @@ const sessionsNeedingDetailAfterBasic = new Set();
 let enrichmentBrowserPool = null;
 let enrichmentBrowserLastUsed = 0;
 let enrichmentNetworkCapture = null;
+let detailModalLifecycleState = null;
+
+function createEmptyModalLifecycleState() {
+  return {
+    lastModalTextHash: null,
+    lastModalText: null,
+    lastSessionKey: null,
+    modalLifecycleSamples: [],
+    tileClickSamples: [],
+  };
+}
+
+function resetDetailModalLifecycleState() {
+  detailModalLifecycleState = createEmptyModalLifecycleState();
+  return detailModalLifecycleState;
+}
+
+function hashModalText(text) {
+  if (!text) return null;
+  const s = String(text).replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return `m${Math.abs(h)}`;
+}
+
+function modalAssociationVerifiedOnSession(s) {
+  if (!s) return false;
+  if (s.modalAssociationVerified === true || s.raw?.modalAssociationVerified === true) return true;
+  return sessionDetailVerified(s);
+}
+
+function isInvalidCheckedWithSlotsStatus(s) {
+  const st = normalizeDetailStatus(s?.detailStatus || s?.detail_status);
+  if (st !== 'checked_with_slots') return false;
+  return s?.slots == null || s?.capacity == null || !modalAssociationVerifiedOnSession(s);
+}
+
+function reconcileDetailStatusForSession(s) {
+  const st = normalizeDetailStatus(s?.detailStatus || s?.detail_status);
+  if (st !== 'checked_with_slots') return st;
+  if (s?.slots == null || s?.capacity == null) {
+    if (s?.staleModalDetected || s?.raw?.staleModalDetected) return 'failed_modal_stale';
+    if (!modalAssociationVerifiedOnSession(s)) return 'failed_modal_mismatch';
+    return 'checked_available_no_slot_count';
+  }
+  if (!modalAssociationVerifiedOnSession(s)) return 'failed_modal_mismatch';
+  return st;
+}
+
 const enrichmentMetrics = {
   lastRunAt: null,
   lastDurationMs: null,
@@ -1517,6 +1567,13 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       detailSourceStartTime: s.detailSourceStartTime ?? null,
       detailSourceSessionType: s.detailSourceSessionType ?? null,
       detailSourceWaveSide: s.detailSourceWaveSide ?? null,
+      modalAssociationVerified: s.modalAssociationVerified ?? false,
+      modalDiagnosticRawText: s.modalDiagnosticRawText ?? null,
+      modalMismatchReason: s.modalMismatchReason ?? null,
+      staleModalDetected: s.staleModalDetected ?? false,
+      previousModalTextHash: s.previousModalTextHash ?? null,
+      currentModalTextHash: s.currentModalTextHash ?? null,
+      tileClickDiagnostics: s.tileClickDiagnostics ?? null,
       tileText: s.tileText ?? s.detailRawTileText ?? null,
     },
     last_seen_at: now,
@@ -2374,6 +2431,9 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
         out.priceMin = null;
         out.priceMax = null;
       }
+      if (!modalAssociationVerifiedOnSession(s)) {
+        out.detailRawText = null;
+      }
     } else if (isDefaultLikeDetailValues(out.slots, out.capacity, out.estimatedBooked)) {
       out.slots = null;
       out.capacity = null;
@@ -2383,6 +2443,13 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
       out.detailConfidence = 'default_suppressed';
     }
   }
+
+  out.detailStatus = reconcileDetailStatusForSession(out);
+  out.modalAssociationVerified = modalAssociationVerifiedOnSession(s);
+  out.modalDiagnosticRawText = s.modalDiagnosticRawText || s.raw?.modalDiagnosticRawText || null;
+  out.staleModalDetected = s.staleModalDetected === true || s.raw?.staleModalDetected === true;
+  out.previousModalTextHash = s.previousModalTextHash || s.raw?.previousModalTextHash || null;
+  out.currentModalTextHash = s.currentModalTextHash || s.raw?.currentModalTextHash || null;
 
   out.detailParseOutput = parserOutput;
   out.detailVerified = verified;
@@ -2402,12 +2469,17 @@ function buildDetailAssociationDiagnostics(isoDate, sessions) {
   const unparsedButDisplayed = [];
   const dateDiffers = [];
   const timeDiffers = [];
+  const staleModal = [];
+  const tileMismatch = [];
+  const checkedWithSlotsButNull = [];
   const detailValueGroups = new Map();
   const rawModalGroups = new Map();
   const associationSamples = [];
+  const modalLifecycleSamples = [];
+  const tileClickSamples = [];
 
   for (const s of list) {
-    const rawModal = s.detailRawText || s.raw?.detailRawText || '';
+    const rawModal = s.detailRawText || s.raw?.detailRawText || s.modalDiagnosticRawText || s.raw?.modalDiagnosticRawText || '';
     const parserOutput = s.detailParseOutput || s.raw?.detailParseOutput
       || buildParserOutputFromText(rawModal);
     const validation = rawModal ? validateModalAssociation(s, rawModal) : null;
@@ -2456,6 +2528,53 @@ function buildDetailAssociationDiagnostics(isoDate, sessions) {
       if (!detailValueGroups.has(dvKey)) detailValueGroups.set(dvKey, []);
       detailValueGroups.get(dvKey).push(s.key);
     }
+    if (isInvalidCheckedWithSlotsStatus(s)) {
+      checkedWithSlotsButNull.push({
+        key: s.key,
+        time: s.time,
+        sessionType: s.level,
+        detailStatus: s.detailStatus || s.detail_status,
+        slots: s.slots,
+        capacity: s.capacity,
+        modalAssociationVerified: modalAssociationVerifiedOnSession(s),
+      });
+    }
+
+    if (effectiveDetailStatus(s) === 'failed_modal_stale' || s.staleModalDetected || s.raw?.staleModalDetected) {
+      staleModal.push({
+        key: s.key, time: s.time, sessionType: s.level,
+        previousModalTextHash: s.previousModalTextHash || s.raw?.previousModalTextHash,
+        currentModalTextHash: s.currentModalTextHash || s.raw?.currentModalTextHash,
+      });
+    }
+
+    if (effectiveDetailStatus(s) === 'failed_tile_mismatch') {
+      tileMismatch.push({
+        key: s.key,
+        time: s.time,
+        tileClickDiagnostics: s.tileClickDiagnostics || s.raw?.tileClickDiagnostics || null,
+      });
+    }
+
+    if (s.tileClickDiagnostics || s.raw?.tileClickDiagnostics) {
+      tileClickSamples.push({
+        key: s.key,
+        ...(s.tileClickDiagnostics || s.raw?.tileClickDiagnostics),
+      });
+    }
+
+    if (s.staleModalDetected || s.raw?.staleModalDetected || s.modalDiagnosticRawText || s.raw?.modalDiagnosticRawText) {
+      modalLifecycleSamples.push({
+        key: s.key,
+        time: s.time,
+        staleModalDetected: s.staleModalDetected || s.raw?.staleModalDetected || false,
+        previousModalTextHash: s.previousModalTextHash || s.raw?.previousModalTextHash || null,
+        currentModalTextHash: s.currentModalTextHash || s.raw?.currentModalTextHash || null,
+        modalMismatchReason: s.modalMismatchReason || s.raw?.modalMismatchReason || null,
+        modalAssociationVerified: modalAssociationVerifiedOnSession(s),
+      });
+    }
+
     if (rawModal) {
       const rmKey = rawModal.slice(0, 120);
       if (!rawModalGroups.has(rmKey)) rawModalGroups.set(rmKey, []);
@@ -2491,6 +2610,10 @@ function buildDetailAssociationDiagnostics(isoDate, sessions) {
   return {
     modalMismatchCount: modalMismatch.length,
     failedModalMismatchSample: modalMismatch.slice(0, 12),
+    staleModalCount: staleModal.length,
+    failedModalStaleSample: staleModal.slice(0, 12),
+    failedTileMismatchSample: tileMismatch.slice(0, 12),
+    rowsWithCheckedWithSlotsButNullValuesSample: checkedWithSlotsButNull.slice(0, 12),
     rowsWithDefaultLikeDetailsSample: defaultLike.slice(0, 12),
     rowsWithUnparsedButDisplayedSlotsSample: unparsedButDisplayed.slice(0, 12),
     rowsWhereDetailRawTextDateDiffersFromIsoDate: dateDiffers.slice(0, 12),
@@ -2498,6 +2621,8 @@ function buildDetailAssociationDiagnostics(isoDate, sessions) {
     duplicateDetailValueGroups,
     duplicateRawModalGroups,
     detailAssociationSamples: associationSamples.slice(0, 20),
+    modalLifecycleSamples: modalLifecycleSamples.slice(0, 20),
+    tileClickSamples: tileClickSamples.slice(0, 20),
   };
 }
 
@@ -2651,11 +2776,11 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
       merged.detailStatus = incomingStatus || merged.detailStatus;
       merged.detailError = incoming.detailError ?? merged.detailError;
     } else {
-      merged.detailStatus = incomingStatus
-        || (sessionHasDetailedData(merged) ? 'checked_with_slots' : merged.detailStatus);
+      merged.detailStatus = incomingStatus || merged.detailStatus;
       if (merged.detailWarning) merged.detailError = merged.detailWarning;
       else if (isDetailSuccessStatus(merged.detailStatus)) merged.detailError = null;
     }
+    merged.detailStatus = reconcileDetailStatusForSession(merged);
   }
 
   return merged;
@@ -2677,6 +2802,25 @@ function detailCoverageStats() {
   };
 }
 
+function applyModalTrustFields(entry, details, { trusted = false } = {}) {
+  entry.modalAssociationVerified = trusted;
+  entry.modalMismatchReason = details?.modalMismatchReason || details?.detailError || null;
+  entry.staleModalDetected = details?.staleModalDetected === true;
+  entry.previousModalTextHash = details?.previousModalTextHash ?? entry.previousModalTextHash ?? null;
+  entry.currentModalTextHash = details?.currentModalTextHash ?? entry.currentModalTextHash ?? null;
+  if (details?.tileClickDiagnostics) entry.tileClickDiagnostics = details.tileClickDiagnostics;
+
+  if (trusted && details?.rawModalText) {
+    entry.detailRawText = truncateDetailText(details.rawModalText);
+    entry.modalDiagnosticRawText = null;
+  } else {
+    entry.detailRawText = null;
+    if (details?.rawModalText) {
+      entry.modalDiagnosticRawText = truncateDetailText(details.rawModalText);
+    }
+  }
+}
+
 function applyDetailPayloadToSession(entry, details, level, { prior = null, session = null } = {}) {
   if (!entry || !details) return { ok: false, category: 'failed' };
 
@@ -2686,12 +2830,28 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
   const sourceSession = session || entry;
   const rawModal = details.rawModalText || null;
 
-  if (details.rawModalText) entry.detailRawText = truncateDetailText(details.rawModalText);
   if (details.rawTileText) entry.detailRawTileText = truncateDetailText(details.rawTileText);
   if (details.parseReason) entry.detailParseReason = details.parseReason;
   if (details.failedSelector) entry.detailFailedSelector = details.failedSelector;
-  entry.detailParseOutput = buildParserOutputFromText(details.rawModalText || details.rawTileText || '');
   entry.lastDetailedCheckAt = now;
+
+  if (isDetailFailureStatus(status)) {
+    entry.detailParseOutput = buildParserOutputFromText(details.rawModalText || details.rawTileText || '');
+    applyModalTrustFields(entry, details, { trusted: false });
+    entry.detailStatus = normalizeDetailStatus(status) || status;
+    entry.detailError = details.detailError || status;
+    entry.detailVerified = false;
+    entry.detailConfidence = status === 'failed_modal_stale' ? 'mismatch'
+      : status === 'failed_tile_mismatch' ? 'mismatch'
+      : status === 'failed_modal_mismatch' ? 'mismatch'
+      : 'default_suppressed';
+    preservePriorVerifiedDetailFields(entry, priorSnapshot);
+    if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
+    ensureDetailStatusRecorded(entry, entry.detailStatus);
+    return { ok: false, category: 'failed', status: entry.detailStatus };
+  }
+
+  entry.detailParseOutput = buildParserOutputFromText(details.rawModalText || details.rawTileText || '');
 
   if (rawModal) {
     const validation = details.modalValidation || validateModalAssociation(sourceSession, rawModal);
@@ -2699,8 +2859,12 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     applyDetailSourceFields(entry, sourceSession, validation);
 
     if (validation.confidence === 'mismatch') {
+      applyModalTrustFields(entry, {
+        ...details,
+        modalMismatchReason: `modal_mismatch: ${validation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`,
+      }, { trusted: false });
       entry.detailStatus = 'failed_modal_mismatch';
-      entry.detailError = `modal_mismatch: ${validation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`;
+      entry.detailError = entry.modalMismatchReason;
       entry.detailVerified = false;
       entry.detailConfidence = 'mismatch';
       clearUnverifiedDetailMetrics(entry);
@@ -2710,6 +2874,10 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     }
 
     if (validation.confidence === 'weak_match' && (details.slots != null || details.capacity != null || details.slotsFromClicks != null)) {
+      applyModalTrustFields(entry, {
+        ...details,
+        modalMismatchReason: 'modal_identity_not_confirmed',
+      }, { trusted: false });
       entry.detailStatus = 'failed_modal_mismatch';
       entry.detailError = 'modal_identity_not_confirmed';
       entry.detailVerified = false;
@@ -2719,6 +2887,8 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
       ensureDetailStatusRecorded(entry, 'failed_modal_mismatch');
       return { ok: false, category: 'failed', status: 'failed_modal_mismatch', validation };
     }
+  } else {
+    applyModalTrustFields(entry, details, { trusted: false });
   }
 
   if (status === 'unknown') {
@@ -2730,16 +2900,6 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     preservePriorVerifiedDetailFields(entry, priorSnapshot);
     ensureDetailStatusRecorded(entry, 'failed_parse');
     return { ok: false, category: 'failed', status: 'failed_parse' };
-  }
-
-  if (isDetailFailureStatus(status)) {
-    entry.detailStatus = normalizeDetailStatus(status) || status;
-    entry.detailError = details.detailError || status;
-    entry.detailVerified = false;
-    preservePriorVerifiedDetailFields(entry, priorSnapshot);
-    if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
-    ensureDetailStatusRecorded(entry, entry.detailStatus);
-    return { ok: false, category: 'failed', status: entry.detailStatus };
   }
 
   const parserOutput = entry.detailParseOutput || {};
@@ -2758,7 +2918,10 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
       entry.estimatedBooked = null;
       entry.fillRate = null;
     }
-    if (details.price_text && hasParsedSlots) {
+    const validation = rawModal ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal)) : null;
+    const trusted = validation?.match && validation?.confidence === 'exact_match';
+    applyModalTrustFields(entry, details, { trusted });
+    if (details.price_text && trusted && parserOutput.parsed_price_text) {
       entry.priceText = details.price_text;
       entry.priceMin = details.price_min;
       entry.priceMax = details.price_max;
@@ -2766,8 +2929,8 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     }
     entry.detailStatus = 'checked_packed';
     entry.detailError = null;
-    entry.detailVerified = rawModal ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal)).match : false;
-    entry.detailConfidence = entry.detailVerified ? 'exact_match' : 'weak_match';
+    entry.detailVerified = trusted;
+    entry.detailConfidence = trusted ? 'exact_match' : 'weak_match';
     return { ok: entry.detailVerified, category: 'packed' };
   }
 
@@ -2777,45 +2940,42 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     entry.capacity = null;
     entry.estimatedBooked = null;
     entry.fillRate = null;
+    const validation = rawModal ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal)) : null;
+    const trusted = validation?.match && validation?.confidence === 'exact_match';
+    applyModalTrustFields(entry, details, { trusted });
     entry.detailStatus = status === 'checked_available_no_slot_count'
       ? 'checked_available_no_slot_count'
       : 'checked_open_no_slots_visible';
     entry.detailError = details.parseReason || null;
     entry.detailVerified = false;
-    entry.detailConfidence = 'weak_match';
-    if (details.price_text && parserOutput.parsed_price_text) {
-      entry.priceText = details.price_text;
-      entry.priceMin = details.price_min;
-      entry.priceMax = details.price_max;
-      entry.currency = details.currency || 'USD';
-    } else {
-      entry.priceText = null;
-      entry.priceMin = null;
-      entry.priceMax = null;
-    }
+    entry.detailConfidence = trusted ? 'exact_match' : 'weak_match';
+    entry.priceText = null;
+    entry.priceMin = null;
+    entry.priceMax = null;
     return { ok: true, category: 'open_no_slots_visible' };
   }
 
-  if (details.slots != null && hasParsedSlots) {
-    entry.slots = details.slots;
-  } else {
-    entry.slots = null;
-  }
-  if (details.capacity != null && (hasParsedCapacity || hasParsedSlots)) {
-    entry.capacity = details.capacity;
-  } else {
-    entry.capacity = null;
-  }
+  if (details.slots != null && hasParsedSlots) entry.slots = details.slots;
+  else entry.slots = null;
+  if (details.capacity != null && hasParsedCapacity) entry.capacity = details.capacity;
+  else entry.capacity = null;
+
   attachSessionMetrics(entry, {
     slots: entry.slots,
     capacity: entry.capacity,
-    price_text: hasParsedSlots || hasParsedCapacity ? details.price_text : null,
-    price_min: hasParsedSlots || hasParsedCapacity ? details.price_min : null,
-    price_max: hasParsedSlots || hasParsedCapacity ? details.price_max : null,
+    price_text: hasParsedSlots && hasParsedCapacity ? details.price_text : null,
+    price_min: hasParsedSlots && hasParsedCapacity ? details.price_min : null,
+    price_max: hasParsedSlots && hasParsedCapacity ? details.price_max : null,
     currency: details.currency,
   }, level, { scrapeKind: 'detailed' });
 
-  if (!hasParsedSlots && !hasParsedCapacity) {
+  const validation = rawModal
+    ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal))
+    : { match: false, confidence: 'weak_match' };
+  const trusted = validation.match && validation.confidence === 'exact_match';
+  applyModalTrustFields(entry, details, { trusted });
+
+  if (!hasParsedSlots || !hasParsedCapacity || entry.slots == null || entry.capacity == null) {
     clearUnverifiedDetailMetrics(entry);
     entry.detailStatus = details.parseReason === 'text_open_or_available'
       ? 'checked_available_no_slot_count'
@@ -2833,25 +2993,20 @@ function applyDetailPayloadToSession(entry, details, level, { prior = null, sess
     return { ok: true, category: 'open_no_slots_visible' };
   }
 
-  const validation = rawModal
-    ? (details.modalValidation || validateModalAssociation(sourceSession, rawModal))
-    : { match: false, confidence: 'weak_match' };
-  entry.detailVerified = validation.match && validation.confidence === 'exact_match';
-  entry.detailConfidence = entry.detailVerified ? 'exact_match' : 'weak_match';
+  entry.detailVerified = trusted;
+  entry.detailConfidence = trusted ? 'exact_match' : 'weak_match';
 
-  if (!entry.detailVerified) {
+  if (!trusted) {
     clearUnverifiedDetailMetrics(entry);
-    entry.detailStatus = 'checked_open_no_slots_visible';
-    return { ok: true, category: 'open_no_slots_visible' };
+    entry.detailStatus = 'failed_modal_mismatch';
+    entry.detailError = entry.detailError || 'modal_not_verified_for_slots';
+    return { ok: false, category: 'failed', status: 'failed_modal_mismatch' };
   }
 
   entry.detailStatus = 'checked_with_slots';
   entry.detailError = entry.detailWarning || null;
   ensureDetailStatusRecorded(entry, 'checked_with_slots');
-  return {
-    ok: true,
-    category: entry.slots != null ? 'with_slots' : 'open_no_slots_visible',
-  };
+  return { ok: true, category: 'with_slots' };
 }
 
 function preservePriorDetailFields(entry, prior) {
@@ -2868,11 +3023,11 @@ function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
   entry.detailError = failure?.detailError || status;
   entry.detailVerified = false;
   if (failure?.modalValidation) entry.modalValidation = failure.modalValidation;
-  if (failure?.rawModalText) entry.detailRawText = truncateDetailText(failure.rawModalText);
   if (failure?.rawTileText) entry.detailRawTileText = truncateDetailText(failure.rawTileText);
   if (failure?.failedSelector) entry.detailFailedSelector = failure.failedSelector;
   if (failure?.parseReason) entry.detailParseReason = failure.parseReason;
   if (failure?.mismatches) entry.modalMismatches = failure.mismatches;
+  applyModalTrustFields(entry, failure, { trusted: false });
   entry.detailParseOutput = buildParserOutputFromText(failure?.rawModalText || failure?.rawTileText || '');
   preservePriorVerifiedDetailFields(entry, priorSnapshot);
   if (!sessionDetailVerified(entry)) clearUnverifiedDetailMetrics(entry);
@@ -2883,6 +3038,8 @@ function applyDetailFailureToSession(entry, failure, { prior = null } = {}) {
 function incrementDetailFailureStats(stats, status) {
   const st = normalizeDetailStatus(status) || status;
   if (st === 'failed_modal_mismatch') stats.sessionsFailedModalMismatch = (stats.sessionsFailedModalMismatch || 0) + 1;
+  else if (st === 'failed_modal_stale') stats.sessionsFailedModalStale = (stats.sessionsFailedModalStale || 0) + 1;
+  else if (st === 'failed_tile_mismatch') stats.sessionsFailedTileMismatch = (stats.sessionsFailedTileMismatch || 0) + 1;
   else if (st === 'failed_cookie_overlay') stats.sessionsFailedCookieOverlay = (stats.sessionsFailedCookieOverlay || 0) + 1;
   else if (st === 'failed_parse') stats.sessionsFailedParse = (stats.sessionsFailedParse || 0) + 1;
   else if (st === 'failed_selector') stats.sessionsFailedSelector = (stats.sessionsFailedSelector || 0) + 1;
@@ -2939,7 +3096,7 @@ function emptyEnrichmentStats({ skipped = false, skipReason = null, sessionsQueu
 
 function sessionQualifiesForFailedFirstEnrich(s) {
   const st = effectiveDetailStatus(s);
-  if (['failed_cookie_overlay', 'failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout', 'failed_modal_mismatch'].includes(st)) return true;
+  if (['failed_cookie_overlay', 'failed_parse', 'failed_selector', 'failed_modal_open', 'failed_timeout', 'failed_modal_mismatch', 'failed_modal_stale', 'failed_tile_mismatch'].includes(st)) return true;
   if (st === 'unknown' && (s.lastDetailedCheckAt || s.last_detailed_check_at)) return true;
   if (s.available !== false && !sessionHasDetailedData(s)) return true;
   return false;
@@ -2988,12 +3145,16 @@ function normalizeDetailStatus(status) {
 
 function effectiveDetailStatus(s) {
   const raw = normalizeDetailStatus(s?.detailStatus || s?.detail_status);
+  const reconciled = reconcileDetailStatusForSession(s);
+  if (raw === 'checked_with_slots' && reconciled !== 'checked_with_slots') return reconciled;
   if (raw && raw !== 'unknown') return raw;
   const attempted = !!(s?.lastDetailedCheckAt || s?.last_detailed_check_at);
   if (!attempted) return 'unknown';
   if (s?.slots === 0 && s?.available === false && sessionDetailVerified(s)) return 'checked_packed';
-  if (s?.slots != null && sessionDetailVerified(s)) return 'checked_with_slots';
+  if (s?.slots != null && s?.capacity != null && sessionDetailVerified(s)) return 'checked_with_slots';
   const err = String(s?.detailError || s?.detail_error || '').toLowerCase();
+  if (err.includes('modal_stale') || s?.staleModalDetected || s?.raw?.staleModalDetected) return 'failed_modal_stale';
+  if (err.includes('tile_mismatch')) return 'failed_tile_mismatch';
   if (err.includes('modal_mismatch') || err.includes('modal_identity')) return 'failed_modal_mismatch';
   if (err.includes('cookie')) return 'failed_cookie_overlay';
   if (err.includes('tile not found') || err.includes('selector')) return 'failed_selector';
@@ -3026,6 +3187,10 @@ function reasonForDetailStatus(s) {
       return err || 'modal_open_available_no_slot_count';
     case 'failed_modal_mismatch':
       return err || 'modal_text_does_not_match_session_row';
+    case 'failed_modal_stale':
+      return err || 'modal_text_unchanged_after_tile_click';
+    case 'failed_tile_mismatch':
+      return err || 'clicked_tile_does_not_match_session_row';
     case 'failed_selector':
       return err || 'booking_tile_or_modal_selector_missing';
     case 'failed_cookie_overlay':
@@ -3605,6 +3770,7 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
   }
 
   resetCookieDismissDiagnostics();
+  resetDetailModalLifecycleState();
   const runStarted = Date.now();
   const stats = {
     isoDate: isoDate || null,
@@ -5301,6 +5467,94 @@ async function dismissCookieBanner(page) {
   return { success: false, method: cookieDismissDiagnostics.cookieClickMethod };
 }
 
+async function readAnyVisibleModalText(page) {
+  return page.evaluate(() => {
+    const el = document.querySelector('.modal.in, .modal.show, [role="dialog"].show, [role="dialog"][aria-modal="true"]');
+    if (!el) return { text: '', visible: false };
+    const style = window.getComputedStyle(el);
+    const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+    if (!visible) return { text: '', visible: false };
+    return { text: (el.innerText || '').replace(/\s+/g, ' ').trim(), visible: true };
+  });
+}
+
+async function waitForModalTextAbsent(page, previousHash, timeoutMs = 4000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const snap = await readAnyVisibleModalText(page);
+    const h = hashModalText(snap.text);
+    if (!snap.visible || !snap.text || snap.text.length < 8) return true;
+    if (previousHash && h !== previousHash) return true;
+    await page.waitForTimeout(150);
+  }
+  return false;
+}
+
+async function waitForModalTextChange(page, previousHash, label, timeoutMs = 6000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const snap = await readAnyVisibleModalText(page);
+    const h = hashModalText(snap.text);
+    if (snap.text && snap.text.length > 8 && h && h !== previousHash) {
+      console.log(`  [getSessionModalDetails ${label}] modal text changed (${previousHash || 'none'} → ${h})`);
+      return { text: snap.text, hash: h, changed: true };
+    }
+    await page.waitForTimeout(180);
+  }
+  const snap = await readAnyVisibleModalText(page);
+  const h = hashModalText(snap.text);
+  console.log(`  [getSessionModalDetails ${label}] modal text did not change (hash=${h || 'none'})`);
+  return { text: snap.text || '', hash: h, changed: false };
+}
+
+function validateTileMatchesSession(tileMeta, session) {
+  const ctx = sessionLookupContext(session);
+  const mismatches = [];
+  if (Number.isFinite(ctx.ts) && tileMeta?.elTs && tileMeta.elTs !== ctx.ts) {
+    mismatches.push({ field: 'ts', expected: ctx.ts, found: tileMeta.elTs });
+  }
+  if (ctx.time && tileMeta?.elTime && normalizeTimeToken(tileMeta.elTime) !== normalizeTimeToken(ctx.time)) {
+    mismatches.push({ field: 'time', expected: ctx.time, found: tileMeta.elTime });
+  }
+  if (ctx.level && tileMeta?.elLevel && !levelsMatch(ctx.level, tileMeta.elLevel)) {
+    mismatches.push({ field: 'sessionType', expected: ctx.level, found: tileMeta.elLevel });
+  }
+  if (ctx.waveSide && tileMeta?.elWaveSide && !waveSidesMatch(ctx.waveSide, tileMeta.elWaveSide)) {
+    mismatches.push({ field: 'waveSide', expected: ctx.waveSide, found: tileMeta.elWaveSide });
+  }
+  return { match: mismatches.length === 0, mismatches, score: tileMeta?.score ?? null };
+}
+
+async function extractTileMeta(tile, score = null) {
+  return tile.evaluate((node, tileScore) => {
+    const rect = node.getBoundingClientRect();
+    const cls = node.className || '';
+    const title = node.dataset.originalTitle || '';
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    const wm = cls.match(/booking-agenda-clickable_(\d+)_(\d+)/);
+    const lm = title.match(/Session level\s*:<\/b>\s*([^<]+)/i);
+    const fm = title.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
+    const td = node.closest('td');
+    let elWaveSide = '';
+    if (td) {
+      const table = td.closest('table');
+      const headerRow = table?.querySelector('thead tr') || table?.querySelector('tr');
+      elWaveSide = (headerRow?.cells?.[td.cellIndex]?.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+    return {
+      className: cls,
+      text: text.slice(0, 120),
+      boundingBox: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+      elTs: wm ? +wm[1] : null,
+      elWave: wm ? +wm[2] : null,
+      elTime: fm ? fm[1].replace(/\s+/g, ' ').trim().toLowerCase() : '',
+      elLevel: lm ? lm[1].replace(/\s+/g, ' ').trim() : '',
+      elWaveSide: elWaveSide,
+      score: tileScore,
+    };
+  }, score);
+}
+
 async function readModalText(page, modal) {
   return modal.evaluate(() => {
     const modalEl = document.querySelector('.modal.in, .modal.show, [role="dialog"].show, [role="dialog"][aria-modal="true"]');
@@ -5314,16 +5568,142 @@ async function readModalText(page, modal) {
   });
 }
 
-async function clickSessionTileForModal(page, session, label) {
+async function clickSessionTileForModal(page, session, label, lifecycleState = detailModalLifecycleState) {
+  const state = lifecycleState || resetDetailModalLifecycleState();
   await dismissCookieBanner(page);
   await waitForCookieBannerGone(page, 4000);
-  const { tile, selector: tileSel, method: tileMethod } = await findSessionTile(page, session, label);
-  if (!tile) return { tile: null, tileSel, tileMethod, modal: null, rawTileText: null };
-  const rawTileText = await tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => '');
-  console.log(`  [getSessionModalDetails ${label}] clicking tile (${tileMethod})`);
-  await tile.click({ timeout: 10_000 });
-  const modal = await waitForModal(page, label);
-  return { tile, tileSel, tileMethod, modal, rawTileText };
+
+  const previousModalTextHash = state.lastModalTextHash;
+  if (await isModalVisible(page)) {
+    state.modalLifecycleSamples.push({
+      sessionKey: session.key,
+      phase: 'pre_close_modal_visible',
+      previousModalTextHash,
+    });
+    await closeModal(page, label);
+    await waitForModalGone(page, 5000);
+  }
+  await waitForModalTextAbsent(page, previousModalTextHash, 4000);
+
+  const tileResult = await findSessionTileWithDiagnostics(page, session, label);
+  const tileClickDiagnostics = tileResult.tileClickDiagnostics;
+  state.tileClickSamples.push({ sessionKey: session.key, ...tileClickDiagnostics });
+
+  if (!tileResult.tile) {
+    return {
+      tile: null,
+      tileSel: tileResult.selector,
+      tileMethod: tileResult.method,
+      modal: null,
+      rawTileText: null,
+      tileClickDiagnostics,
+    };
+  }
+
+  const tileValidation = validateTileMatchesSession(tileResult.tileMeta, session);
+  if (!tileValidation.match) {
+    console.log(`  [getSessionModalDetails ${label}] tile mismatch — ${tileValidation.mismatches.map(m => m.field).join(', ')}`);
+    return {
+      tile: tileResult.tile,
+      tileSel: tileResult.selector,
+      tileMethod: tileResult.method,
+      modal: null,
+      rawTileText: tileResult.tileMeta?.text || null,
+      tileClickDiagnostics,
+      tileValidation,
+      detailStatus: 'failed_tile_mismatch',
+      failureType: 'failed_tile_mismatch',
+      detailError: `tile_mismatch: ${tileValidation.mismatches.map(m => `${m.field} expected ${m.expected} got ${m.found}`).join('; ')}`,
+    };
+  }
+
+  const rawTileText = tileResult.tileMeta?.text
+    || await tileResult.tile.evaluate(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => '');
+  console.log(`  [getSessionModalDetails ${label}] clicking tile (${tileResult.method}, score=${tileResult.tileMeta?.score ?? 'n/a'})`);
+
+  await tileResult.tile.click({ timeout: 10_000 });
+  await page.waitForTimeout(250);
+
+  let modal = await waitForModal(page, label);
+  let rawModalText = '';
+  if (modal) {
+    try {
+      const meta = await readModalText(page, modal);
+      rawModalText = meta.text || '';
+    } catch {}
+  } else {
+    rawModalText = (await readAnyVisibleModalText(page)).text || '';
+  }
+
+  let currentModalTextHash = hashModalText(rawModalText);
+  let staleModalDetected = !!(previousModalTextHash && currentModalTextHash && currentModalTextHash === previousModalTextHash && rawModalText.length > 20);
+
+  if (staleModalDetected) {
+    console.log(`  [getSessionModalDetails ${label}] stale modal detected (hash=${currentModalTextHash}) — retrying after force close`);
+    await closeModal(page, label);
+    await waitForModalGone(page, 5000);
+    await waitForModalTextAbsent(page, previousModalTextHash, 4000);
+    await tileResult.tile.click({ timeout: 10_000 });
+    await page.waitForTimeout(300);
+    modal = await waitForModal(page, label);
+    const change = await waitForModalTextChange(page, previousModalTextHash, label, 6000);
+    rawModalText = change.text || '';
+    currentModalTextHash = change.hash;
+    staleModalDetected = !!(previousModalTextHash && currentModalTextHash && currentModalTextHash === previousModalTextHash && rawModalText.length > 20);
+  } else if (previousModalTextHash && rawModalText.length > 20) {
+    const change = await waitForModalTextChange(page, previousModalTextHash, label, 2000);
+    if (change.changed) {
+      rawModalText = change.text;
+      currentModalTextHash = change.hash;
+    }
+  }
+
+  state.modalLifecycleSamples.push({
+    sessionKey: session.key,
+    phase: staleModalDetected ? 'post_click_stale' : 'post_click',
+    previousModalTextHash,
+    currentModalTextHash,
+    staleModalDetected,
+  });
+
+  if (staleModalDetected) {
+    await closeModal(page, label);
+    await waitForModalGone(page, 3000);
+    return {
+      tile: tileResult.tile,
+      tileSel: tileResult.selector,
+      tileMethod: tileResult.method,
+      modal,
+      rawTileText,
+      rawModalText,
+      tileClickDiagnostics,
+      staleModalDetected: true,
+      previousModalTextHash,
+      currentModalTextHash,
+      detailStatus: 'failed_modal_stale',
+      failureType: 'failed_modal_stale',
+      detailError: 'modal_text_unchanged_after_tile_click',
+    };
+  }
+
+  if (rawModalText.length > 20) {
+    state.lastModalTextHash = currentModalTextHash;
+    state.lastModalText = rawModalText;
+    state.lastSessionKey = session.key;
+  }
+
+  return {
+    tile: tileResult.tile,
+    tileSel: tileResult.selector,
+    tileMethod: tileResult.method,
+    modal,
+    rawTileText,
+    rawModalText,
+    tileClickDiagnostics,
+    staleModalDetected: false,
+    previousModalTextHash,
+    currentModalTextHash,
+  };
 }
 
 function cookieOverlayFailure(rawTileText, rawModalText) {
@@ -5581,6 +5961,20 @@ function buildDetailPayloadFromParsed(parsed, { rawTileText, rawModalText, capac
 }
 
 async function findSessionTile(page, session, label) {
+  const result = await findSessionTileWithDiagnostics(page, session, label);
+  return {
+    tile: result.tile,
+    selector: result.selector,
+    method: result.method,
+    tilePreview: result.tileMeta?.text,
+    tileMeta: result.tileMeta,
+    tileClickDiagnostics: result.tileClickDiagnostics,
+    candidatesCount: result.candidatesCount,
+    selectedIndex: result.selectedIndex,
+  };
+}
+
+async function findSessionTileWithDiagnostics(page, session, label) {
   const ctx = sessionLookupContext(session);
   const ts = ctx.ts;
   const wave = ctx.wave;
@@ -5597,11 +5991,22 @@ async function findSessionTile(page, session, label) {
 
   for (const sel of selectors) {
     const tile = await page.$(sel).catch(() => null);
-    if (tile) return { tile, selector: sel, method: 'css_selector' };
+    if (tile) {
+      const tileMeta = await extractTileMeta(tile, 200);
+      return {
+        tile,
+        selector: sel,
+        method: 'css_selector',
+        tileMeta,
+        candidatesCount: 1,
+        selectedIndex: 0,
+        tileClickDiagnostics: buildTileClickDiagnostics(session, tileMeta, 0, 1, 'css_selector', sel),
+      };
+    }
   }
 
   try {
-    const handle = await page.evaluateHandle(({ ctx: c }) => {
+    const scored = await page.evaluate(({ ctx: c }) => {
       const normTime = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
       const normLevel = (l) => String(l || '').toLowerCase().replace(/\s+/g, ' ').trim();
       const normSide = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -5612,11 +6017,6 @@ async function findSessionTile(page, session, label) {
       const targetSide = normSide(c.waveSide);
       const targetTileText = normText(c.tileText);
       const targetIso = c.isoDate;
-
-      function columnIndex(el) {
-        const td = el.closest('td');
-        return td ? td.cellIndex : null;
-      }
 
       function columnHeader(el) {
         const td = el.closest('td');
@@ -5639,11 +6039,7 @@ async function findSessionTile(page, session, label) {
         const elLevel = lm ? normLevel(lm[1]) : '';
         const elTime = fm ? normTime(fm[1]) : '';
         const elText = normText((el.innerText || el.textContent || title).replace(/<[^>]+>/g, ' '));
-        const elIso = (() => {
-          try {
-            return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(elTs * 1000));
-          } catch { return null; }
-        })();
+        const hdr = columnHeader(el);
 
         let score = 0;
         if (Number.isFinite(c.ts) && elTs === c.ts) score += 100;
@@ -5652,41 +6048,118 @@ async function findSessionTile(page, session, label) {
         if (targetTime && elTime && targetTime === elTime) score += 45;
         else if (targetTime && elTime && targetTime.replace(/\s/g, '') === elTime.replace(/\s/g, '')) score += 35;
         if (targetLevel && elLevel && (targetLevel === elLevel || elLevel.includes(targetLevel) || targetLevel.includes(elLevel))) score += 35;
-        if (targetIso && elIso && targetIso === elIso) score += 25;
-        if (targetSide) {
-          const hdr = columnHeader(el);
-          if (hdr.includes(targetSide) || elText.includes(targetSide)) score += 30;
-        }
+        if (targetSide && (hdr.includes(targetSide) || elText.includes(targetSide))) score += 30;
         if (targetTileText && elText) {
           if (elText === targetTileText) score += 50;
           else if (elText.includes(targetTileText) || targetTileText.includes(elText)) score += 30;
         }
         if (c.tileClassName && cls === c.tileClassName) score += 80;
-        if (c.tileColumnIndex != null && columnIndex(el) === c.tileColumnIndex) score += 20;
         if (cls.includes(`_${c.ts}_${c.wave}`)) score += 60;
 
-        if (score >= 80) candidates.push({ el, score, elTs, elWave, elTime, elLevel });
+        candidates.push({ score, elTs, elWave, elTime, elLevel, elWaveSide: hdr, className: cls, text: elText.slice(0, 120) });
       }
 
       candidates.sort((a, b) => b.score - a.score);
-      return candidates[0]?.el || null;
+      return { candidates, bestIndex: candidates.length ? 0 : -1, bestScore: candidates[0]?.score || 0 };
     }, { ctx });
+
+    const handle = await page.evaluateHandle(({ ctx: c, bestScore }) => {
+      const normTime = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const normLevel = (l) => String(l || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const normText = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const targetTime = normTime(c.time);
+      const targetLevel = normLevel(c.level);
+      const targetSide = String(c.waveSide || '').toLowerCase();
+      const targetTileText = normText(c.tileText);
+
+      function columnHeader(el) {
+        const td = el.closest('td');
+        if (!td) return '';
+        const table = td.closest('table');
+        const headerRow = table?.querySelector('thead tr') || table?.querySelector('tr');
+        return normText(headerRow?.cells?.[td.cellIndex]?.textContent);
+      }
+
+      const candidates = [];
+      for (const el of document.querySelectorAll('div.dynamic-cal-booking-ts[data-original-title]')) {
+        const cls = el.className || '';
+        const title = el.dataset.originalTitle || '';
+        const wm = cls.match(/booking-agenda-clickable_(\d+)_(\d+)/);
+        if (!wm) continue;
+        const elTs = +wm[1];
+        const elWave = +wm[2];
+        const lm = title.match(/Session level\s*:<\/b>\s*([^<]+)/i);
+        const fm = title.match(/From\s*:<\/b>\s*([\d:]+\s*[apm]+)/i);
+        const elLevel = lm ? normLevel(lm[1]) : '';
+        const elTime = fm ? normTime(fm[1]) : '';
+        const elText = normText((el.innerText || el.textContent || title).replace(/<[^>]+>/g, ' '));
+        const hdr = columnHeader(el);
+        let score = 0;
+        if (Number.isFinite(c.ts) && elTs === c.ts) score += 100;
+        if (Number.isFinite(c.wave) && elWave === c.wave) score += 50;
+        if (targetTime && elTime && targetTime === elTime) score += 45;
+        if (targetLevel && elLevel && (targetLevel === elLevel || elLevel.includes(targetLevel) || targetLevel.includes(elLevel))) score += 35;
+        if (targetSide && (hdr.includes(targetSide) || elText.includes(targetSide))) score += 30;
+        if (targetTileText && elText && (elText === targetTileText || elText.includes(targetTileText))) score += 30;
+        if (cls.includes(`_${c.ts}_${c.wave}`)) score += 60;
+        if (score >= bestScore - 5) candidates.push({ el, score });
+      }
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0]?.el || null;
+    }, { ctx, bestScore: scored.bestScore });
 
     const el = handle.asElement();
     if (el) {
-      const meta = await el.evaluate(node => ({
-        className: node.className,
-        text: (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-      }));
-      console.log(`  [getSessionModalDetails ${label}] tile found via scored DOM scan (class="${meta.className.slice(0, 60)}")`);
-      return { tile: el, selector: 'scored_dom_scan', method: 'scored_dom_scan', tilePreview: meta.text };
+      const tileMeta = await extractTileMeta(el, scored.bestScore);
+      tileMeta.elTs = tileMeta.elTs ?? scored.candidates[0]?.elTs ?? null;
+      tileMeta.elWave = tileMeta.elWave ?? scored.candidates[0]?.elWave ?? null;
+      tileMeta.elTime = tileMeta.elTime || scored.candidates[0]?.elTime || '';
+      tileMeta.elLevel = tileMeta.elLevel || scored.candidates[0]?.elLevel || '';
+      tileMeta.elWaveSide = tileMeta.elWaveSide || scored.candidates[0]?.elWaveSide || '';
+      console.log(`  [getSessionModalDetails ${label}] tile found via scored DOM scan (score=${scored.bestScore}, candidates=${scored.candidates.length})`);
+      return {
+        tile: el,
+        selector: 'scored_dom_scan',
+        method: 'scored_dom_scan',
+        tileMeta,
+        candidatesCount: scored.candidates.length,
+        selectedIndex: scored.bestIndex,
+        tileClickDiagnostics: buildTileClickDiagnostics(session, tileMeta, scored.bestIndex, scored.candidates.length, 'scored_dom_scan', 'scored_dom_scan'),
+      };
     }
     await handle.dispose();
   } catch (e) {
     console.log(`  [getSessionModalDetails ${label}] scored DOM scan failed: ${e.message}`);
   }
 
-  return { tile: null, selector: selectors[0], method: 'not_found' };
+  return {
+    tile: null,
+    selector: selectors[0],
+    method: 'not_found',
+    tileMeta: null,
+    candidatesCount: 0,
+    selectedIndex: -1,
+    tileClickDiagnostics: buildTileClickDiagnostics(session, null, -1, 0, 'not_found', selectors[0]),
+  };
+}
+
+function buildTileClickDiagnostics(session, tileMeta, selectedIndex, candidatesCount, method, selector) {
+  return {
+    expectedSessionKey: session?.key || null,
+    expectedTileClassName: session?.tileClassName || session?.raw?.tileClassName || null,
+    expectedIsoDate: session?.isoDate || session?.dateKey || null,
+    expectedTime: session?.time || null,
+    expectedSessionType: session?.level || null,
+    expectedWaveSide: session?.waveSide || null,
+    actualClickedTileClass: tileMeta?.className || null,
+    actualClickedTileText: tileMeta?.text || null,
+    actualClickedTileBoundingBox: tileMeta?.boundingBox || null,
+    clickedTileIndexAmongCandidates: selectedIndex,
+    tileMatchScore: tileMeta?.score ?? null,
+    candidateTilesCount: candidatesCount,
+    tileMethod: method,
+    tileSelector: selector,
+  };
 }
 
 async function waitForModalGone(page, timeoutMs = 3000) {
@@ -5742,7 +6215,7 @@ function wrapModalDetailPayload(session, rawModalText, rawTileText, payload) {
   ) || payload;
 }
 
-async function getSessionModalDetails(page, session, { cookieRetryAllowed = true } = {}) {
+async function getSessionModalDetails(page, session, { cookieRetryAllowed = true, lifecycleState = detailModalLifecycleState } = {}) {
   const ctx = sessionLookupContext(session);
   const label = ctx.key || `${ctx.ts}_${ctx.wave}`;
   console.log(`\n[getSessionModalDetails ${label}] starting`);
@@ -5751,7 +6224,22 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
   await waitForCookieBannerGone(page, 4000);
 
   try {
-    const firstOpen = await clickSessionTileForModal(page, session, label);
+    const firstOpen = await clickSessionTileForModal(page, session, label, lifecycleState);
+    if (firstOpen.detailStatus === 'failed_tile_mismatch' || firstOpen.detailStatus === 'failed_modal_stale') {
+      return {
+        detailStatus: firstOpen.detailStatus,
+        failureType: firstOpen.failureType,
+        detailError: firstOpen.detailError,
+        rawTileText: firstOpen.rawTileText || ctx.tileText || null,
+        rawModalText: firstOpen.rawModalText || null,
+        tileClickDiagnostics: firstOpen.tileClickDiagnostics,
+        staleModalDetected: firstOpen.staleModalDetected === true,
+        previousModalTextHash: firstOpen.previousModalTextHash || null,
+        currentModalTextHash: firstOpen.currentModalTextHash || null,
+        tileValidation: firstOpen.tileValidation || null,
+        parseReason: firstOpen.detailStatus,
+      };
+    }
     if (!firstOpen.tile) {
       console.log(`  [getSessionModalDetails ${label}] tile not found (${firstOpen.tileSel})`);
       return {
@@ -5767,6 +6255,14 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
 
     const rawTileText = firstOpen.rawTileText || ctx.tileText || '';
     console.log(`  [getSessionModalDetails ${label}] tile found via ${firstOpen.tileMethod}, text="${rawTileText.slice(0, 80)}"`);
+
+    const tileClickDiagnostics = firstOpen.tileClickDiagnostics || null;
+    const lifecycleMeta = {
+      tileClickDiagnostics,
+      previousModalTextHash: firstOpen.previousModalTextHash || null,
+      currentModalTextHash: firstOpen.currentModalTextHash || null,
+      staleModalDetected: firstOpen.staleModalDetected === true,
+    };
 
     const tileParsed = parseDetailAvailabilityFromText(rawTileText);
     if (tileParsed?.packed) {
@@ -5801,14 +6297,21 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
       console.log(`  [getSessionModalDetails ${label}] debug screenshot saved → ${screenshotPath}`);
     }
 
-    let rawModalText = '';
+    let rawModalText = firstOpen.rawModalText || '';
     let capacityFromModal = null;
-    try {
-      const meta = await readModalText(page, modal);
-      rawModalText = meta.text || '';
-      capacityFromModal = meta.maxQty;
-    } catch (pe) {
-      console.log(`  [getSessionModalDetails ${label}] modal text read skipped: ${pe.message}`);
+    if (!rawModalText && modal) {
+      try {
+        const meta = await readModalText(page, modal);
+        rawModalText = meta.text || '';
+        capacityFromModal = meta.maxQty;
+      } catch (pe) {
+        console.log(`  [getSessionModalDetails ${label}] modal text read skipped: ${pe.message}`);
+      }
+    } else if (modal) {
+      try {
+        const meta = await readModalText(page, modal);
+        capacityFromModal = meta.maxQty;
+      } catch {}
     }
 
     const bannerStillVisible = await isCookieBannerVisible(page);
@@ -5859,6 +6362,8 @@ async function getSessionModalDetails(page, session, { cookieRetryAllowed = true
         modalValidation,
         mismatches: modalValidation.mismatches,
         parseReason: 'failed_modal_mismatch',
+        ...lifecycleMeta,
+        modalMismatchReason: `modal_mismatch: ${modalValidation.mismatches.map(m => m.field).join(', ')}`,
       };
     }
 
@@ -7424,8 +7929,15 @@ app.get('/api/sessions', async (req, res) => {
           estimatedBooked: s.estimatedBooked,
           detailStatus: effectiveDetailStatus(s),
           detailVerified: sessionDetailVerified(s),
+          modalAssociationVerified: modalAssociationVerifiedOnSession(s),
           detailConfidence: s.detailConfidence || s.raw?.detailConfidence || null,
           detailRawText: truncateDetailText(s.detailRawText || s.raw?.detailRawText || null, 1500),
+          modalDiagnosticRawText: truncateDetailText(s.modalDiagnosticRawText || s.raw?.modalDiagnosticRawText || null, 1500),
+          modalMismatchReason: s.modalMismatchReason || s.raw?.modalMismatchReason || null,
+          staleModalDetected: s.staleModalDetected === true || s.raw?.staleModalDetected === true,
+          previousModalTextHash: s.previousModalTextHash || s.raw?.previousModalTextHash || null,
+          currentModalTextHash: s.currentModalTextHash || s.raw?.currentModalTextHash || null,
+          tileClickDiagnostics: s.tileClickDiagnostics || s.raw?.tileClickDiagnostics || null,
           detailParseOutput: s.detailParseOutput || s.raw?.detailParseOutput || buildParserOutputFromText(s.detailRawText || ''),
           detailSourceSessionKey: s.detailSourceSessionKey || s.raw?.detailSourceSessionKey || null,
           detailSourceIsoDate: s.detailSourceIsoDate || s.raw?.detailSourceIsoDate || null,
@@ -7772,7 +8284,7 @@ app.post('/api/admin/repair-detail-data', async (req, res) => {
     const skipped = [];
 
     for (const s of candidates) {
-      const rawModal = s.detailRawText || s.raw?.detailRawText || '';
+      const rawModal = s.detailRawText || s.raw?.detailRawText || s.modalDiagnosticRawText || s.raw?.modalDiagnosticRawText || '';
       const parserOutput = s.detailParseOutput || s.raw?.detailParseOutput
         || buildParserOutputFromText(rawModal);
       const validation = rawModal ? validateModalAssociation(s, rawModal) : null;
@@ -7782,36 +8294,53 @@ app.post('/api/admin/repair-detail-data', async (req, res) => {
         && parserOutput.parsed_slots_available == null
         && parserOutput.parsed_capacity == null;
       const mismatch = validation?.confidence === 'mismatch';
+      const invalidCheckedWithSlots = isInvalidCheckedWithSlotsStatus(s);
+      const stale = s.staleModalDetected || s.raw?.staleModalDetected
+        || effectiveDetailStatus(s) === 'failed_modal_stale';
 
-      if (verified && !defaultLike && !mismatch && !unparsedDisplayed) {
+      if (verified && !defaultLike && !mismatch && !unparsedDisplayed && !invalidCheckedWithSlots && !stale) {
         preserved.push(s.key);
         continue;
       }
-      if (!s.slots && !s.capacity && !s.estimatedBooked && !s.priceText && !rawModal) {
+      if (!s.slots && !s.capacity && !s.estimatedBooked && !s.priceText && !rawModal
+        && !invalidCheckedWithSlots && !stale && !mismatch) {
         skipped.push(s.key);
         continue;
       }
 
       const entry = { ...s };
-      if (mismatch) {
+      if (stale) {
+        entry.detailStatus = 'failed_modal_stale';
+        entry.detailError = entry.detailError || 'repaired_modal_stale';
+        entry.detailConfidence = 'mismatch';
+        entry.staleModalDetected = true;
+      } else if (mismatch) {
         entry.detailStatus = 'failed_modal_mismatch';
         entry.detailError = entry.detailError || 'repaired_modal_mismatch';
         entry.detailConfidence = 'mismatch';
+      } else if (invalidCheckedWithSlots) {
+        entry.detailStatus = 'checked_available_no_slot_count';
+        entry.detailConfidence = 'default_suppressed';
+        entry.detailError = entry.detailError || 'repaired_invalid_checked_with_slots';
       } else if (defaultLike || unparsedDisplayed) {
         entry.detailStatus = entry.detailStatus === 'checked_with_slots'
-          ? 'checked_open_no_slots_visible'
+          ? 'checked_available_no_slot_count'
           : entry.detailStatus;
         entry.detailConfidence = 'default_suppressed';
         entry.detailError = entry.detailError || 'repaired_unverified_defaults';
       }
+
       entry.detailVerified = false;
+      entry.modalAssociationVerified = false;
+      entry.detailRawText = null;
+      if (rawModal) entry.modalDiagnosticRawText = truncateDetailText(rawModal, 1500);
       clearUnverifiedDetailMetrics(entry);
       repaired.push({
         key: s.key,
         isoDate: s.isoDate || s.dateKey,
         time: s.time,
-        reason: mismatch ? 'modal_mismatch' : (defaultLike ? 'default_like' : 'unparsed_displayed'),
-        prior: { slots: s.slots, capacity: s.capacity, estimatedBooked: s.estimatedBooked },
+        reason: stale ? 'modal_stale' : (mismatch ? 'modal_mismatch' : (invalidCheckedWithSlots ? 'invalid_checked_with_slots' : (defaultLike ? 'default_like' : 'unparsed_displayed'))),
+        prior: { slots: s.slots, capacity: s.capacity, estimatedBooked: s.estimatedBooked, detailStatus: s.detailStatus || s.detail_status },
       });
 
       if (!dryRun) {

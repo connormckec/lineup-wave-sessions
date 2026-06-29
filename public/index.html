@@ -1343,7 +1343,8 @@ function formatDetailStatusLine(s) {
   if (status === 'checked_no_slots_visible') return 'details unavailable';
   if (status === 'checked_open_no_slots_visible') return 'details unavailable';
   if (status === 'checked_available_no_slot_count') return 'details unavailable';
-  if (status === 'failed_modal_mismatch') return 'details unavailable';
+  if (status === 'failed_modal_stale') return 'details unavailable';
+  if (status === 'failed_tile_mismatch') return 'details unavailable';
   if (status === 'pending' || !status) return 'details pending';
   return 'details pending';
 }
