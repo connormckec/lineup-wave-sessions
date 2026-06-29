@@ -10517,6 +10517,100 @@ function resolveTileParserContractError(validation, tileParserResult) {
   return 'tile_parser_contract_failed';
 }
 
+function buildGate7ThresholdParseValidation(threshold, {
+  thresholdSelection,
+  gridSnapshot,
+  tileParserResult,
+  tileParserValidationRaw,
+  parseResult,
+} = {}) {
+  const requestedThreshold = Math.max(1, Number(threshold) || 1);
+  const warnings = [];
+  const errors = [];
+  const parsedCount = tileParserResult?.parsedCount ?? parseResult?.parsedCount ?? 0;
+
+  if (!thresholdSelection?.filterSetOk) {
+    errors.push('threshold_selection_failed');
+    return {
+      ok: false,
+      errors,
+      warnings,
+      parsedCount,
+      zeroTiles: false,
+      cleanStop: false,
+    };
+  }
+
+  if (!parseResult) {
+    errors.push('parse_not_completed');
+    return {
+      ok: false,
+      errors,
+      warnings,
+      parsedCount: 0,
+      zeroTiles: false,
+      cleanStop: false,
+    };
+  }
+
+  if (requestedThreshold === 1) {
+    const gate5Validation = tileParserValidationRaw || buildTileParserContractValidation({
+      thresholdSelection,
+      gridSnapshot,
+      tileParserResult,
+    });
+    return {
+      ok: gate5Validation.ok === true,
+      errors: gate5Validation.errors || [],
+      warnings: gate5Validation.warnings || [],
+      parsedCount,
+      zeroTiles: parsedCount === 0,
+      cleanStop: false,
+      usesFullGate5Contract: true,
+    };
+  }
+
+  if (parsedCount === 0) {
+    return {
+      ok: true,
+      errors: [],
+      warnings: ['no_visible_tiles_at_threshold'],
+      parsedCount: 0,
+      zeroTiles: true,
+      cleanStop: true,
+    };
+  }
+
+  const leftCount = tileParserResult?.countsByWaveSide?.left ?? 0;
+  const rightCount = tileParserResult?.countsByWaveSide?.right ?? 0;
+  if ((leftCount > 0) !== (rightCount > 0)) {
+    warnings.push('single_wave_visible_at_threshold');
+  }
+
+  return {
+    ok: true,
+    errors: [],
+    warnings,
+    parsedCount,
+    zeroTiles: false,
+    cleanStop: false,
+  };
+}
+
+function resolveGate7ParserError(threshold, gate7Validation, tileParserResult) {
+  if (gate7Validation?.ok) return null;
+  if (Number(threshold) === 1) {
+    return resolveTileParserContractError(
+      { errors: gate7Validation?.errors || [] },
+      tileParserResult,
+    );
+  }
+  if ((gate7Validation?.errors || []).includes('parse_not_completed')) {
+    return 'tile_parser_parse_not_completed';
+  }
+  return 'tile_parser_contract_failed';
+}
+
 async function runDebugEntriesLeftTileParserContract(page, threshold = 1, { isoDate, navigation } = {}) {
   const requestedThreshold = Math.max(1, Number(threshold) || 1);
   const setResult = await setEntriesLeftThreshold(page, requestedThreshold);
@@ -10919,8 +11013,10 @@ async function runDebugEntriesLeftFullScanContract(page, {
   const visibleByThreshold = new Map();
   const tileByIdentity = new Map();
   const thresholdsScanned = [];
+  const thresholdParseDiagnostics = [];
   let thresholdStopReason = null;
   let thresholdScanMaxReached = null;
+  let zeroTilesAtThreshold = null;
   let scanFailed = false;
 
   for (const threshold of thresholdCandidates) {
@@ -10931,10 +11027,33 @@ async function runDebugEntriesLeftFullScanContract(page, {
         || 'entries_left_option_unavailable_or_not_selected';
       break;
     }
-    if (!run.tileParserContractOk) {
-      thresholdStopReason = resolveTileParserContractError(run.tileParserValidation, run.tileParserResult)
+
+    const gate7Validation = buildGate7ThresholdParseValidation(threshold, {
+      thresholdSelection: run.thresholdSelection,
+      gridSnapshot: run.gridSnapshot,
+      tileParserResult: run.tileParserResult,
+      tileParserValidationRaw: run.tileParserValidationRaw,
+      parseResult: run.parseResult,
+    });
+
+    thresholdParseDiagnostics.push({
+      threshold,
+      parsedCount: gate7Validation.parsedCount,
+      gate7ParserOk: gate7Validation.ok,
+      warnings: gate7Validation.warnings,
+      errors: gate7Validation.errors,
+    });
+
+    if (!gate7Validation.ok) {
+      thresholdStopReason = resolveGate7ParserError(threshold, gate7Validation, run.tileParserResult)
         || 'tile_parser_contract_failed';
       scanFailed = true;
+      break;
+    }
+
+    if (gate7Validation.cleanStop) {
+      thresholdStopReason = 'no_visible_tiles_at_threshold';
+      zeroTilesAtThreshold = threshold;
       break;
     }
 
@@ -10980,6 +11099,8 @@ async function runDebugEntriesLeftFullScanContract(page, {
     noMatchCount,
     thresholdStopReason,
     thresholdScanMaxReached,
+    zeroTilesAtThreshold,
+    thresholdParseDiagnostics,
     fullScanContractOk,
     error,
   };
@@ -11250,6 +11371,8 @@ async function runDebugEntriesLeftControl({
         noMatchCount: fullScanRun.noMatchCount,
         thresholdStopReason: fullScanRun.thresholdStopReason,
         thresholdScanMaxReached: fullScanRun.thresholdScanMaxReached,
+        zeroTilesAtThreshold: fullScanRun.zeroTilesAtThreshold,
+        thresholdParseDiagnostics: fullScanRun.thresholdParseDiagnostics,
         fullScanContractOk: fullScanRun.fullScanContractOk,
         durationMs: Date.now() - started,
         writesPerformed: false,
