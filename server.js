@@ -9382,6 +9382,443 @@ async function blurActiveFilterDropdown(page) {
   await page.waitForTimeout(300);
 }
 
+function reconEntriesLeftControlSnapshot() {
+  function normalizeText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isVisible(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    let node = el;
+    while (node && node !== document.body) {
+      const st = window.getComputedStyle(node);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      node = node.parentElement;
+    }
+    return true;
+  }
+
+  function boundingBox(el) {
+    const rect = el.getBoundingClientRect();
+    return {
+      top: Math.round(rect.top),
+      left: Math.round(rect.left),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  }
+
+  function selectorHint(el) {
+    if (!el) return null;
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const tag = el.tagName ? el.tagName.toLowerCase() : 'node';
+    const classes = [...(el.classList || [])].filter(Boolean).slice(0, 4);
+    if (classes.length) return `${tag}.${classes.join('.')}`;
+    const name = el.getAttribute?.('name');
+    if (name) return `${tag}[name="${name}"]`;
+    return tag;
+  }
+
+  function describeElement(el, source) {
+    const text = normalizeText(el.innerText || el.textContent || '');
+    return {
+      text: text.slice(0, 160),
+      role: el.getAttribute?.('role') || null,
+      tagName: el.tagName || null,
+      className: el.className || null,
+      ariaLabel: el.getAttribute?.('aria-label') || null,
+      id: el.id || null,
+      name: el.getAttribute?.('name') || null,
+      selectorHint: selectorHint(el),
+      boundingBox: boundingBox(el),
+      visible: isVisible(el),
+      source,
+    };
+  }
+
+  function readCurrentLabel() {
+    for (const el of document.querySelectorAll('button, span, label, div, a, th')) {
+      const t = normalizeText(el.innerText || el.textContent || '');
+      if (/entries?\s*left\s*:/i.test(t) && t.length < 80) return t;
+    }
+    for (const sel of document.querySelectorAll('select')) {
+      const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''} ${sel.previousElementSibling?.textContent || ''}`.replace(/\s+/g, ' ');
+      if (/entries?\s*left/i.test(context)) {
+        const opt = sel.options[sel.selectedIndex];
+        return normalizeText(opt?.textContent || opt?.label || '');
+      }
+    }
+    return null;
+  }
+
+  function collectControlCandidates() {
+    const candidates = [];
+    const seen = new Set();
+    const push = (el, source) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      candidates.push(describeElement(el, source));
+    };
+
+    for (const sel of document.querySelectorAll('select')) {
+      const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''} ${sel.previousElementSibling?.textContent || ''}`.replace(/\s+/g, ' ');
+      const optionText = [...sel.options].map((o) => normalizeText(o.textContent || o.label || '')).join(' | ');
+      if (/entries?\s*left/i.test(context) || /entries?\s*left/i.test(optionText)) {
+        push(sel, 'select');
+      }
+    }
+
+    for (const el of document.querySelectorAll('button, span, label, div, a, th, [role="button"], [role="combobox"], [role="listbox"]')) {
+      const t = normalizeText(el.textContent || '');
+      if (/entries?\s*left/i.test(t) && t.length < 120) push(el, 'text_match');
+    }
+
+    for (const el of document.querySelectorAll('[aria-label], [title]')) {
+      const aria = normalizeText(el.getAttribute('aria-label') || el.getAttribute('title') || '');
+      if (/entries?\s*left/i.test(aria)) push(el, 'aria_match');
+    }
+
+    return candidates.sort((a, b) => Number(b.visible) - Number(a.visible));
+  }
+
+  function collectOptionCandidates() {
+    const options = [];
+    const seen = new Set();
+    const push = (el, source) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      const text = normalizeText(el.innerText || el.textContent || el.label || '');
+      if (!text || text.length > 120) return;
+      options.push({
+        text: text.slice(0, 160),
+        normalizedText: text,
+        role: el.getAttribute?.('role') || null,
+        tagName: el.tagName || null,
+        className: el.className || null,
+        ariaSelected: el.getAttribute?.('aria-selected') || el.selected === true || null,
+        selectorHint: selectorHint(el),
+        boundingBox: boundingBox(el),
+        visible: isVisible(el),
+        source,
+      });
+    };
+
+    for (const sel of document.querySelectorAll('select')) {
+      const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''}`.replace(/\s+/g, ' ');
+      if (!/entries?\s*left/i.test(context) && ![...sel.options].some((o) => /entries?\s*left/i.test(o.textContent || ''))) continue;
+      for (const opt of sel.options) push(opt, 'select_option');
+    }
+
+    const popupSelectors = '.dropdown-menu, .select2-results, .select2-dropdown, ul[role="listbox"], [role="menu"], .popover, .autocomplete, .ui-menu, .chosen-results';
+    for (const popup of document.querySelectorAll(popupSelectors)) {
+      if (!isVisible(popup)) continue;
+      for (const el of popup.querySelectorAll('option, li, a, button, span, div[role="option"], [role="menuitem"]')) {
+        push(el, 'popup_option');
+      }
+    }
+
+    for (const el of document.querySelectorAll('option, li, a, button, span, div[role="option"], [role="menuitem"]')) {
+      const t = normalizeText(el.textContent || '');
+      if (/entries?\s*left/i.test(t) || /^at least \d+/i.test(t) || /^\d+\s*entries?\s*left/i.test(t)) {
+        push(el, 'dom_option_scan');
+      }
+    }
+
+    return options.sort((a, b) => Number(b.visible) - Number(a.visible));
+  }
+
+  function bodyTextSampleAroundEntriesLeft() {
+    const bodyText = document.body?.innerText || '';
+    const idx = bodyText.search(/entries?\s*left/i);
+    if (idx < 0) return bodyText.slice(0, 1200);
+    return bodyText.slice(Math.max(0, idx - 300), idx + 900);
+  }
+
+  function popupVisible() {
+    const popupSelectors = '.dropdown-menu, .select2-results, .select2-dropdown, ul[role="listbox"], [role="menu"], .popover.open, .dropdown.open .dropdown-menu';
+    for (const el of document.querySelectorAll(popupSelectors)) {
+      if (isVisible(el)) return true;
+    }
+    for (const sel of document.querySelectorAll('select')) {
+      const context = `${sel.name || ''} ${sel.id || ''}`.replace(/\s+/g, ' ');
+      if (/entries?\s*left/i.test(context) && document.activeElement === sel) return true;
+    }
+    return false;
+  }
+
+  function findOpenClickTarget() {
+    const scored = [];
+    for (const el of document.querySelectorAll('button, span, label, div, a, th, select, [role="button"], [role="combobox"]')) {
+      const t = normalizeText(el.textContent || '');
+      const aria = normalizeText(el.getAttribute?.('aria-label') || '');
+      if (!/entries?\s*left/i.test(t) && !/entries?\s*left/i.test(aria)) continue;
+      if (!isVisible(el)) continue;
+      let score = 0;
+      if (/entries?\s*left\s*:/i.test(t)) score += 5;
+      if (el.tagName === 'SELECT') score += 4;
+      if (el.tagName === 'BUTTON') score += 3;
+      if (el.getAttribute?.('role') === 'combobox') score += 3;
+      if (el.classList?.contains('dropdown-toggle')) score += 2;
+      scored.push({ el, score, selectorHint: selectorHint(el) });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0] || null;
+  }
+
+  return {
+    currentLabel: readCurrentLabel(),
+    controlCandidates: collectControlCandidates(),
+    openClickTarget: findOpenClickTarget()?.selectorHint || null,
+  };
+}
+
+function reconEntriesLeftControlAfterOpen() {
+  function normalizeText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+  function isVisible(el) {
+    if (!el?.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+  }
+  function boundingBox(el) {
+    const rect = el.getBoundingClientRect();
+    return { top: Math.round(rect.top), left: Math.round(rect.left), width: Math.round(rect.width), height: Math.round(rect.height) };
+  }
+  function selectorHint(el) {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const tag = el.tagName.toLowerCase();
+    const classes = [...(el.classList || [])].slice(0, 4);
+    return classes.length ? `${tag}.${classes.join('.')}` : tag;
+  }
+  const optionCandidates = [];
+  const seen = new Set();
+  const push = (el, source) => {
+    if (!el || seen.has(el)) return;
+    seen.add(el);
+    const text = normalizeText(el.innerText || el.textContent || el.label || '');
+    if (!text || text.length > 120) return;
+    optionCandidates.push({
+      text: text.slice(0, 160),
+      normalizedText: text,
+      role: el.getAttribute?.('role') || null,
+      tagName: el.tagName || null,
+      className: el.className || null,
+      ariaSelected: el.getAttribute?.('aria-selected') || (el.selected === true ? 'true' : null),
+      selectorHint: selectorHint(el),
+      boundingBox: boundingBox(el),
+      visible: isVisible(el),
+      source,
+    });
+  };
+  for (const sel of document.querySelectorAll('select')) {
+    const context = `${sel.name || ''} ${sel.id || ''} ${sel.closest('label')?.textContent || ''}`.replace(/\s+/g, ' ');
+    if (!/entries?\s*left/i.test(context) && ![...sel.options].some((o) => /entries?\s*left/i.test(o.textContent || ''))) continue;
+    for (const opt of sel.options) push(opt, 'select_option');
+  }
+  const popupSelectors = '.dropdown-menu, .select2-results, .select2-dropdown, ul[role="listbox"], [role="menu"], .popover, .autocomplete, .ui-menu, .chosen-results';
+  for (const popup of document.querySelectorAll(popupSelectors)) {
+    for (const el of popup.querySelectorAll('option, li, a, button, span, div[role="option"], [role="menuitem"]')) push(el, 'popup_option');
+  }
+  for (const el of document.querySelectorAll('option, li, a, button, span, div[role="option"], [role="menuitem"]')) {
+    const t = normalizeText(el.textContent || '');
+    if (/entries?\s*left/i.test(t) || /^at least \d+/i.test(t) || /^\d+\s*entries?\s*left/i.test(t)) push(el, 'dom_option_scan');
+  }
+  const bodyText = document.body?.innerText || '';
+  const idx = bodyText.search(/entries?\s*left/i);
+  const bodyTextSampleAroundEntriesLeft = idx < 0 ? bodyText.slice(0, 1200) : bodyText.slice(Math.max(0, idx - 300), idx + 900);
+  let popupVisibleFlag = false;
+  for (const el of document.querySelectorAll(popupSelectors)) {
+    if (isVisible(el)) { popupVisibleFlag = true; break; }
+  }
+  return {
+    popupVisible: popupVisibleFlag,
+    optionCandidates: optionCandidates.sort((a, b) => Number(b.visible) - Number(a.visible)),
+    bodyTextSampleAroundEntriesLeft,
+  };
+}
+
+async function openEntriesLeftControlForRecon(page) {
+  assertPlaywrightPage(page, 'openEntriesLeftControlForRecon');
+  return page.evaluate(() => {
+    function normalizeText(text) {
+      return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+    function isVisible(el) {
+      if (!el?.getBoundingClientRect) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+    }
+    const scored = [];
+    for (const el of document.querySelectorAll('button, span, label, div, a, th, select, [role="button"], [role="combobox"]')) {
+      const t = normalizeText(el.textContent || '');
+      const aria = normalizeText(el.getAttribute?.('aria-label') || '');
+      if (!/entries?\s*left/i.test(t) && !/entries?\s*left/i.test(aria)) continue;
+      if (!isVisible(el)) continue;
+      let score = 0;
+      if (/entries?\s*left\s*:/i.test(t)) score += 5;
+      if (el.tagName === 'SELECT') score += 4;
+      if (el.tagName === 'BUTTON') score += 3;
+      if (el.getAttribute?.('role') === 'combobox') score += 3;
+      if (el.classList?.contains('dropdown-toggle')) score += 2;
+      scored.push({ el, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const target = scored[0]?.el || null;
+    if (!target) return { ok: false, reason: 'no_click_target' };
+    if (target.tagName === 'SELECT') {
+      target.focus();
+      target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return { ok: true, openMethod: 'select_focus_click', tagName: target.tagName };
+    }
+    target.click();
+    return { ok: true, openMethod: 'click', tagName: target.tagName, text: normalizeText(target.textContent || '').slice(0, 80) };
+  });
+}
+
+function buildThresholdAvailabilityFromOptions(optionCandidates, thresholds) {
+  const optionTexts = (optionCandidates || []).map((o) => o.normalizedText || o.text).filter(Boolean);
+  return (thresholds || []).map((threshold) => {
+    const n = Number(threshold);
+    const patterns = [
+      new RegExp(`entries?\\s*left\\s*:?\\s*${n}\\b`, 'i'),
+      new RegExp(`at\\s*least\\s*${n}\\s*entries?\\s*left`, 'i'),
+      new RegExp(`\\b${n}\\s*entries?\\s*left`, 'i'),
+    ];
+    const matchingOptionTexts = optionTexts.filter((text) => patterns.some((re) => re.test(text)));
+    return {
+      threshold: n,
+      optionFound: matchingOptionTexts.length > 0,
+      matchingOptionTexts,
+    };
+  });
+}
+
+async function scrapeEntriesLeftControlReconFromPage(page) {
+  assertPlaywrightPage(page, 'scrapeEntriesLeftControlReconFromPage');
+  const beforeOpen = await page.evaluate(reconEntriesLeftControlSnapshot);
+  const openAttempt = await openEntriesLeftControlForRecon(page);
+  await page.waitForTimeout(600);
+  const afterOpen = await page.evaluate(reconEntriesLeftControlAfterOpen);
+  const pageDiag = await collectPageDiagnostics(page, 'entries_left_control_recon');
+  return {
+    currentLabel: beforeOpen.currentLabel,
+    controlCandidates: beforeOpen.controlCandidates,
+    openClickTarget: beforeOpen.openClickTarget,
+    openAttempt,
+    afterOpen: {
+      popupVisible: afterOpen.popupVisible,
+      openMethod: openAttempt?.openMethod || null,
+      optionCandidates: afterOpen.optionCandidates,
+      bodyTextSampleAroundEntriesLeft: afterOpen.bodyTextSampleAroundEntriesLeft,
+    },
+    currentUrl: pageDiag.currentUrl,
+    pageTitle: pageDiag.pageTitle,
+  };
+}
+
+async function runDebugEntriesLeftControl({
+  isoDate,
+  weekMode = true,
+  thresholds = [1, 2, 3],
+  dryRun = true,
+  debug = true,
+} = {}) {
+  const requestedIsoDate = isoDate;
+  const computedWeekStart = getMondayWeekStartIso(isoDate);
+  const navigationIsoDate = weekMode ? computedWeekStart : isoDate;
+  let launched = null;
+  const started = Date.now();
+
+  try {
+    launched = await launchBrowser();
+    await openBookingPageForThreshold(launched.page);
+    await waitForThresholdCalendarShell(launched.page).catch(() => {});
+
+    const nav = await navigateCalendarToShowDate(launched.page, navigationIsoDate, {
+      headerOnly: true,
+      validateIsoDate: requestedIsoDate,
+      waitForShell: true,
+    });
+
+    if (nav.statusReason === 'calendar_day_headers_not_parsed' || nav.headerParseError) {
+      return {
+        gate: 2,
+        dryRun,
+        debug,
+        isoDate: requestedIsoDate,
+        weekMode,
+        thresholds,
+        skipped: true,
+        skipReason: nav.statusReason || 'header_parse_failed',
+        navigation: nav,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    if (!nav.targetDateVisibleFromHeaders) {
+      return {
+        gate: 2,
+        dryRun,
+        debug,
+        isoDate: requestedIsoDate,
+        weekMode,
+        thresholds,
+        skipped: true,
+        skipReason: 'target_date_not_visible',
+        navigation: {
+          rawMonthLabel: nav.rawMonthLabel,
+          rawDayHeaderTexts: nav.rawDayHeaderTexts,
+          visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
+          targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+          currentUrl: nav.currentUrl,
+        },
+        durationMs: Date.now() - started,
+      };
+    }
+
+    await normalizeBookingFiltersOnPage(launched.page).catch(() => {});
+    await launched.page.waitForTimeout(500);
+
+    const recon = await scrapeEntriesLeftControlReconFromPage(launched.page);
+    const thresholdAvailability = buildThresholdAvailabilityFromOptions(
+      recon.afterOpen.optionCandidates,
+      thresholds,
+    );
+
+    return {
+      gate: 2,
+      dryRun,
+      debug,
+      isoDate: requestedIsoDate,
+      computedWeekStart,
+      navigationIsoDate,
+      weekMode,
+      thresholds,
+      thresholdAvailability,
+      rawMonthLabel: nav.rawMonthLabel,
+      rawDayHeaderTexts: nav.rawDayHeaderTexts,
+      visibleIsoDatesFromHeaders: nav.visibleIsoDatesFromHeaders,
+      targetDateVisibleFromHeaders: nav.targetDateVisibleFromHeaders,
+      ...recon,
+      durationMs: Date.now() - started,
+      writesPerformed: false,
+      thresholdWriteSafe: false,
+    };
+  } finally {
+    await safeCloseBrowser(launched);
+  }
+}
+
 async function setEntriesLeftFilter(page, minThreshold) {
   assertPlaywrightPage(page, 'setEntriesLeftFilter');
   await dismissCookieBanner(page).catch(() => {});
@@ -13064,6 +13501,100 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
       error: e.message,
       errors: [{ error: e.message }],
       mode,
+    });
+  }
+});
+
+app.post('/api/admin/debug-entries-left-control', async (req, res) => {
+  const isoDate = req.body?.isoDate;
+  const weekMode = req.body?.weekMode !== false;
+  const thresholds = Array.isArray(req.body?.thresholds) && req.body.thresholds.length
+    ? req.body.thresholds.map((t) => Number(t)).filter((t) => Number.isFinite(t) && t >= 1)
+    : [1, 2, 3];
+  const wait = req.body?.wait === true || req.query?.wait === 'true';
+  const dryRun = req.body?.dryRun !== false;
+  const debug = req.body?.debug !== false;
+
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
+    return res.status(400).json({ error: 'isoDate must be YYYY-MM-DD' });
+  }
+
+  const runRecon = async () => {
+    if (!tryAcquireScrapeLock('debug entries-left control recon', 0)) {
+      return {
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        gate: 2,
+        isoDate,
+        weekMode,
+        dryRun,
+      };
+    }
+    try {
+      await ensureSessionsForStatus();
+      return await runDebugEntriesLeftControl({
+        isoDate,
+        weekMode,
+        thresholds,
+        dryRun,
+        debug,
+      });
+    } finally {
+      releaseScrapeLock();
+    }
+  };
+
+  try {
+    if (scrapeInProgress && !wait) {
+      return res.json({
+        started: false,
+        skipped: true,
+        skipReason: 'scrape_in_progress',
+        gate: 2,
+        isoDate,
+        weekMode,
+        dryRun,
+        message: 'Another scrape is running — retry with wait=true',
+      });
+    }
+
+    if (wait && scrapeInProgress) {
+      await new Promise((resolve) => {
+        const poll = setInterval(() => {
+          if (!scrapeInProgress) { clearInterval(poll); resolve(); }
+        }, 1000);
+        setTimeout(() => { clearInterval(poll); resolve(); }, 300_000);
+      });
+    }
+
+    if (!wait) {
+      setImmediate(() => {
+        runRecon().catch((err) => console.error('debug-entries-left-control error:', err));
+      });
+      return res.json({
+        started: true,
+        queued: true,
+        wait: false,
+        gate: 2,
+        isoDate,
+        weekMode,
+        thresholds,
+        dryRun,
+        message: 'Entries-left control recon queued — retry with wait=true',
+      });
+    }
+
+    const result = await runRecon();
+    res.json(result);
+  } catch (e) {
+    handlePlaywrightFailure(e, 'debug_entries_left_control', { weekKey: isoDate });
+    res.status(500).json({
+      gate: 2,
+      error: e.message,
+      isoDate,
+      weekMode,
+      dryRun,
+      crashed: isPlaywrightCrashError(e),
     });
   }
 });
