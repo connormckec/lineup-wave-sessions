@@ -11574,6 +11574,287 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
   };
 }
 
+async function openGate8ThresholdBrowserSession() {
+  const launched = await launchBrowser();
+  await openBookingPageForThreshold(launched.page);
+  await waitForThresholdCalendarShell(launched.page).catch(() => {});
+  return launched;
+}
+
+async function navigateGate8ThresholdDate(page, isoDate, weekMode = true) {
+  const navigationIsoDate = weekMode ? getMondayWeekStartIso(isoDate) : isoDate;
+  const nav = await navigateCalendarToShowDate(page, navigationIsoDate, {
+    headerOnly: true,
+    validateIsoDate: isoDate,
+    waitForShell: true,
+  });
+
+  if (nav.statusReason === 'calendar_day_headers_not_parsed' || nav.headerParseError) {
+    return {
+      ok: false,
+      nav,
+      error: nav.statusReason || nav.headerParseError || 'header_parse_failed',
+    };
+  }
+  if (!nav.targetDateVisibleFromHeaders) {
+    return { ok: false, nav, error: 'target_date_not_visible' };
+  }
+
+  await normalizeBookingFiltersOnPage(page).catch(() => {});
+  await page.waitForTimeout(400);
+  return { ok: true, nav, error: null };
+}
+
+function buildGate8NavFailureWriteRun(error, meta = {}) {
+  return {
+    fullScanContractOk: false,
+    exactCount: 0,
+    atLeastCount: 0,
+    noMatchCount: 0,
+    thresholdsScanned: [],
+    thresholdScanMaxReached: null,
+    thresholdStopReason: null,
+    rowsPrepared: 0,
+    rowsWritten: 0,
+    writeMode: 'blocked',
+    writesPerformed: false,
+    thresholdWriteSafe: false,
+    inferredForIsoDateCount: null,
+    currentSessionsFetchedForIsoDateCount: null,
+    currentSessionMatchKeysSample: [],
+    inferenceKeysForIsoDateSample: [],
+    unmatchedInferenceSample: [],
+    unmatchedCurrentSessionSample: [],
+    scanAttemptCount: meta.scanAttemptCount ?? 1,
+    recoveredFromCrash: meta.recoveredFromCrash === true,
+    crashReason: meta.crashReason ?? null,
+    crashed: false,
+    error,
+  };
+}
+
+function buildGate8CrashFailureWriteRun(err, meta = {}) {
+  const message = err?.message || String(err || 'playwright_crash');
+  return attachGate8ScanStabilityMeta(buildGate8NavFailureWriteRun(message, meta), {
+    ...meta,
+    crashReason: meta.crashReason || message,
+    crashed: true,
+  });
+}
+
+async function withGate8PlaywrightCrashRecovery(runFn, { relaunch } = {}) {
+  let scanAttemptCount = 0;
+  let crashReason = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    scanAttemptCount = attempt;
+    try {
+      const result = await runFn(attempt);
+      return {
+        result,
+        scanAttemptCount,
+        recoveredFromCrash: !!crashReason && attempt === 2,
+        crashReason,
+        crashed: false,
+        error: null,
+      };
+    } catch (err) {
+      if (isPlaywrightCrashError(err) && attempt === 1 && typeof relaunch === 'function') {
+        crashReason = err.message || String(err);
+        await relaunch(err);
+        continue;
+      }
+      return {
+        result: null,
+        scanAttemptCount,
+        recoveredFromCrash: false,
+        crashReason: crashReason || err?.message || String(err),
+        crashed: isPlaywrightCrashError(err),
+        error: err,
+      };
+    }
+  }
+
+  return {
+    result: null,
+    scanAttemptCount,
+    recoveredFromCrash: false,
+    crashReason,
+    crashed: true,
+    error: new Error(crashReason || 'gate8_scan_retry_exhausted'),
+  };
+}
+
+function attachGate8ScanStabilityMeta(writeRun, meta = {}) {
+  return {
+    ...writeRun,
+    scanAttemptCount: meta.scanAttemptCount ?? writeRun.scanAttemptCount ?? 1,
+    recoveredFromCrash: meta.recoveredFromCrash === true,
+    crashReason: meta.crashReason ?? null,
+    crashed: meta.crashed === true,
+  };
+}
+
+async function runGate8DateWriteContractWithRecovery({
+  isoDate,
+  weekMode = true,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  dryRun = true,
+  write = false,
+  launched: initialLaunched = null,
+} = {}) {
+  let launched = initialLaunched;
+  let relaunchCount = 0;
+
+  const recovery = await withGate8PlaywrightCrashRecovery(async () => {
+    if (!launched) {
+      launched = await openGate8ThresholdBrowserSession();
+    }
+    const navResult = await navigateGate8ThresholdDate(launched.page, isoDate, weekMode);
+    if (!navResult.ok) {
+      return {
+        kind: 'nav_error',
+        error: navResult.error,
+      };
+    }
+    const writeRun = await runDebugEntriesLeftThresholdWriteContract(launched.page, {
+      isoDate,
+      navigation: navResult.nav,
+      minThreshold,
+      maxThreshold,
+      dryRun,
+      write,
+    });
+    return { kind: 'write', writeRun };
+  }, {
+    relaunch: async () => {
+      relaunchCount += 1;
+      await safeCloseBrowser(launched);
+      launched = await openGate8ThresholdBrowserSession();
+    },
+  });
+
+  if (recovery.crashed || recovery.error) {
+    return {
+      launched,
+      writeRun: buildGate8CrashFailureWriteRun(recovery.error || new Error(recovery.crashReason), recovery),
+      scanAttemptCount: recovery.scanAttemptCount,
+      recoveredFromCrash: recovery.recoveredFromCrash,
+      crashReason: recovery.crashReason,
+      crashed: recovery.crashed,
+      relaunchCount,
+    };
+  }
+
+  if (recovery.result?.kind === 'nav_error') {
+    return {
+      launched,
+      writeRun: buildGate8NavFailureWriteRun(recovery.result.error, recovery),
+      scanAttemptCount: recovery.scanAttemptCount,
+      recoveredFromCrash: recovery.recoveredFromCrash,
+      crashReason: recovery.crashReason,
+      crashed: false,
+      relaunchCount,
+    };
+  }
+
+  return {
+    launched,
+    writeRun: attachGate8ScanStabilityMeta(recovery.result.writeRun, recovery),
+    scanAttemptCount: recovery.scanAttemptCount,
+    recoveredFromCrash: recovery.recoveredFromCrash,
+    crashReason: recovery.crashReason,
+    crashed: false,
+    relaunchCount,
+  };
+}
+
+async function runGate8FullScanWithCrashRecovery({
+  isoDate,
+  weekMode = true,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  launched: initialLaunched = null,
+  navigation: initialNavigation = null,
+} = {}) {
+  let launched = initialLaunched;
+  let navigation = initialNavigation;
+
+  const recovery = await withGate8PlaywrightCrashRecovery(async () => {
+    if (!launched) {
+      launched = await openGate8ThresholdBrowserSession();
+    }
+    if (!navigation) {
+      const navResult = await navigateGate8ThresholdDate(launched.page, isoDate, weekMode);
+      if (!navResult.ok) {
+        return { kind: 'nav_error', error: navResult.error, nav: navResult.nav };
+      }
+      navigation = navResult.nav;
+    }
+    const fullScanRun = await runDebugEntriesLeftFullScanContract(launched.page, {
+      isoDate,
+      navigation,
+      minThreshold,
+      maxThreshold,
+    });
+    return { kind: 'scan', fullScanRun, navigation };
+  }, {
+    relaunch: async () => {
+      await safeCloseBrowser(launched);
+      launched = await openGate8ThresholdBrowserSession();
+      navigation = null;
+    },
+  });
+
+  if (recovery.crashed || recovery.error) {
+    return {
+      launched,
+      navigation,
+      fullScanRun: null,
+      scanAttemptCount: recovery.scanAttemptCount,
+      recoveredFromCrash: recovery.recoveredFromCrash,
+      crashReason: recovery.crashReason,
+      crashed: recovery.crashed,
+      error: recovery.crashReason || recovery.error?.message || 'playwright_crash',
+    };
+  }
+
+  if (recovery.result?.kind === 'nav_error') {
+    return {
+      launched,
+      navigation: recovery.result.nav,
+      fullScanRun: {
+        fullScanContractOk: false,
+        exactCount: 0,
+        atLeastCount: 0,
+        noMatchCount: 0,
+        thresholdsScanned: [],
+        thresholdStopReason: null,
+        thresholdScanMaxReached: null,
+        visibleTileCountsByThreshold: {},
+        error: recovery.result.error,
+      },
+      scanAttemptCount: recovery.scanAttemptCount,
+      recoveredFromCrash: recovery.recoveredFromCrash,
+      crashReason: recovery.crashReason,
+      crashed: false,
+      error: recovery.result.error,
+    };
+  }
+
+  return {
+    launched,
+    navigation: recovery.result.navigation,
+    fullScanRun: recovery.result.fullScanRun,
+    scanAttemptCount: recovery.scanAttemptCount,
+    recoveredFromCrash: recovery.recoveredFromCrash,
+    crashReason: recovery.crashReason,
+    crashed: false,
+    error: recovery.result.fullScanRun?.error ?? null,
+  };
+}
+
 const GATE8_BATCH_MAX_DATES = 5;
 
 function buildGate8BatchDateRange(startDate, endDate, maxDates = GATE8_BATCH_MAX_DATES) {
@@ -11622,137 +11903,85 @@ async function runDebugEntriesLeftThresholdWriteBatchContract({
   const dateResults = [];
   let totalRowsPrepared = 0;
   let totalRowsWritten = 0;
-  let launched = null;
   const started = Date.now();
 
-  try {
-    launched = await launchBrowser();
-    await openBookingPageForThreshold(launched.page);
-    await waitForThresholdCalendarShell(launched.page).catch(() => {});
+  for (const isoDate of datesRequested) {
+    const dateStarted = Date.now();
+    let launched = null;
+    try {
+      const recovery = await runGate8DateWriteContractWithRecovery({
+        isoDate,
+        weekMode,
+        minThreshold,
+        maxThreshold,
+        dryRun,
+        write,
+        launched: null,
+      });
+      launched = recovery.launched;
+      const writeRun = recovery.writeRun;
 
-    for (const isoDate of datesRequested) {
-      const dateStarted = Date.now();
-      try {
-        const navigationIsoDate = weekMode ? getMondayWeekStartIso(isoDate) : isoDate;
-        const nav = await navigateCalendarToShowDate(launched.page, navigationIsoDate, {
-          headerOnly: true,
-          validateIsoDate: isoDate,
-          waitForShell: true,
-        });
-
-        if (nav.statusReason === 'calendar_day_headers_not_parsed' || nav.headerParseError) {
-          dateResults.push({
-            isoDate,
-            fullScanContractOk: false,
-            rowsPrepared: 0,
-            rowsWritten: 0,
-            writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
-            writesPerformed: false,
-            exactCount: 0,
-            error: nav.statusReason || nav.headerParseError || 'header_parse_failed',
-            durationMs: Date.now() - dateStarted,
-          });
-          continue;
-        }
-
-        if (!nav.targetDateVisibleFromHeaders) {
-          dateResults.push({
-            isoDate,
-            fullScanContractOk: false,
-            rowsPrepared: 0,
-            rowsWritten: 0,
-            writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
-            writesPerformed: false,
-            exactCount: 0,
-            error: 'target_date_not_visible',
-            durationMs: Date.now() - dateStarted,
-          });
-          continue;
-        }
-
-        await normalizeBookingFiltersOnPage(launched.page).catch(() => {});
-        await launched.page.waitForTimeout(400);
-
-        const writeRun = await runDebugEntriesLeftThresholdWriteContract(launched.page, {
-          isoDate,
-          navigation: nav,
-          minThreshold,
-          maxThreshold,
-          dryRun,
-          write,
-        });
-
-        dateResults.push({
-          isoDate,
-          fullScanContractOk: writeRun.fullScanContractOk,
-          rowsPrepared: writeRun.rowsPrepared,
-          rowsWritten: writeRun.rowsWritten,
-          writeMode: writeRun.writeMode,
-          writesPerformed: writeRun.writesPerformed,
-          exactCount: writeRun.exactCount,
-          atLeastCount: writeRun.atLeastCount,
-          thresholdStopReason: writeRun.thresholdStopReason,
-          error: writeRun.error,
-          durationMs: Date.now() - dateStarted,
-        });
-        totalRowsPrepared += writeRun.rowsPrepared || 0;
-        totalRowsWritten += writeRun.rowsWritten || 0;
-      } catch (err) {
-        dateResults.push({
-          isoDate,
-          fullScanContractOk: false,
-          rowsPrepared: 0,
-          rowsWritten: 0,
-          writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
-          writesPerformed: false,
-          exactCount: 0,
-          error: err.message || String(err),
-          durationMs: Date.now() - dateStarted,
-        });
-      }
+      dateResults.push({
+        isoDate,
+        fullScanContractOk: writeRun.fullScanContractOk,
+        rowsPrepared: writeRun.rowsPrepared,
+        rowsWritten: writeRun.rowsWritten,
+        writeMode: writeRun.writeMode,
+        writesPerformed: writeRun.writesPerformed,
+        exactCount: writeRun.exactCount,
+        atLeastCount: writeRun.atLeastCount,
+        thresholdStopReason: writeRun.thresholdStopReason,
+        scanAttemptCount: writeRun.scanAttemptCount,
+        recoveredFromCrash: writeRun.recoveredFromCrash,
+        crashReason: writeRun.crashReason,
+        crashed: writeRun.crashed === true,
+        error: writeRun.error,
+        durationMs: Date.now() - dateStarted,
+      });
+      totalRowsPrepared += writeRun.rowsPrepared || 0;
+      totalRowsWritten += writeRun.rowsWritten || 0;
+    } catch (err) {
+      dateResults.push({
+        isoDate,
+        fullScanContractOk: false,
+        rowsPrepared: 0,
+        rowsWritten: 0,
+        writeMode: resolveGate8WriteMode({ thresholdWriteSafe: false, writeEnabled: write === true, dryRun }),
+        writesPerformed: false,
+        exactCount: 0,
+        scanAttemptCount: 1,
+        recoveredFromCrash: false,
+        crashReason: err.message || String(err),
+        crashed: isPlaywrightCrashError(err),
+        error: err.message || String(err),
+        durationMs: Date.now() - dateStarted,
+      });
+    } finally {
+      await safeCloseBrowser(launched);
     }
-
-    return {
-      gate: 8,
-      mode: 'threshold_write_batch_contract',
-      dryRun,
-      write,
-      startDate,
-      endDate,
-      weekMode,
-      minThreshold: Math.max(1, Number(minThreshold) || 1),
-      maxThreshold: Math.max(
-        1,
-        Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
-      ),
-      datesRequested,
-      dateResults,
-      totalRowsPrepared,
-      totalRowsWritten,
-      writesPerformed: totalRowsWritten > 0,
-      durationMs: Date.now() - started,
-      error: null,
-    };
-  } catch (err) {
-    return {
-      gate: 8,
-      mode: 'threshold_write_batch_contract',
-      dryRun,
-      write,
-      startDate,
-      endDate,
-      datesRequested,
-      dateResults,
-      totalRowsPrepared,
-      totalRowsWritten,
-      writesPerformed: false,
-      durationMs: Date.now() - started,
-      error: err.message || String(err),
-      crashed: isPlaywrightCrashError(err),
-    };
-  } finally {
-    await safeCloseBrowser(launched);
   }
+
+  return {
+    gate: 8,
+    mode: 'threshold_write_batch_contract',
+    dryRun,
+    write,
+    startDate,
+    endDate,
+    weekMode,
+    minThreshold: Math.max(1, Number(minThreshold) || 1),
+    maxThreshold: Math.max(
+      1,
+      Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+    ),
+    datesRequested,
+    dateResults,
+    totalRowsPrepared,
+    totalRowsWritten,
+    writesPerformed: totalRowsWritten > 0,
+    durationMs: Date.now() - started,
+    error: null,
+  };
 }
 
 function entriesLeftDebugGateForMode(mode) {
@@ -11991,12 +12220,16 @@ async function runDebugEntriesLeftControl({
     }
 
     if (mode === 'full_scan_contract') {
-      const fullScanRun = await runDebugEntriesLeftFullScanContract(launched.page, {
+      const scanRecovery = await runGate8FullScanWithCrashRecovery({
         isoDate: requestedIsoDate,
-        navigation: nav,
+        weekMode,
         minThreshold,
         maxThreshold,
+        launched,
+        navigation: nav,
       });
+      launched = scanRecovery.launched;
+      const fullScanRun = scanRecovery.fullScanRun || {};
       return {
         gate: 7,
         mode,
@@ -12026,23 +12259,29 @@ async function runDebugEntriesLeftControl({
         zeroTilesAtThreshold: fullScanRun.zeroTilesAtThreshold,
         thresholdParseDiagnostics: fullScanRun.thresholdParseDiagnostics,
         fullScanContractOk: fullScanRun.fullScanContractOk,
+        scanAttemptCount: scanRecovery.scanAttemptCount,
+        recoveredFromCrash: scanRecovery.recoveredFromCrash,
+        crashReason: scanRecovery.crashReason,
         durationMs: Date.now() - started,
         writesPerformed: false,
         thresholdWriteSafe: false,
-        crashed: false,
-        error: fullScanRun.error,
+        crashed: scanRecovery.crashed === true,
+        error: scanRecovery.error || fullScanRun.error,
       };
     }
 
     if (mode === 'threshold_write_contract') {
-      const writeRun = await runDebugEntriesLeftThresholdWriteContract(launched.page, {
+      const recovery = await runGate8DateWriteContractWithRecovery({
         isoDate: requestedIsoDate,
-        navigation: nav,
+        weekMode,
         minThreshold,
         maxThreshold,
         dryRun,
         write,
+        launched,
       });
+      launched = recovery.launched;
+      const writeRun = recovery.writeRun;
       return {
         gate: 8,
         mode,
@@ -12077,8 +12316,11 @@ async function runDebugEntriesLeftControl({
         inferenceKeysForIsoDateSample: writeRun.inferenceKeysForIsoDateSample,
         unmatchedInferenceSample: writeRun.unmatchedInferenceSample,
         unmatchedCurrentSessionSample: writeRun.unmatchedCurrentSessionSample,
+        scanAttemptCount: writeRun.scanAttemptCount,
+        recoveredFromCrash: writeRun.recoveredFromCrash,
+        crashReason: writeRun.crashReason,
         durationMs: Date.now() - started,
-        crashed: false,
+        crashed: writeRun.crashed === true,
         error: writeRun.error,
       };
     }
