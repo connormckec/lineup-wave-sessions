@@ -245,6 +245,7 @@ alter table notification_events add column if not exists event_reason text;
 create table if not exists threshold_scan_jobs (
   id uuid primary key default gen_random_uuid(),
   status text not null default 'queued',
+  mode text not null default 'date_threshold_write',
   dates jsonb not null default '[]'::jsonb,
   min_threshold integer not null default 1,
   max_threshold integer not null default 20,
@@ -256,6 +257,8 @@ create table if not exists threshold_scan_jobs (
   error text,
   results_json jsonb
 );
+
+alter table threshold_scan_jobs add column if not exists mode text not null default 'date_threshold_write';
 
 create index if not exists threshold_scan_jobs_status_created_idx
   on threshold_scan_jobs (status, created_at);
