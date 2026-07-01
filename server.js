@@ -63,6 +63,8 @@ const THRESHOLD_JOB_MAX_THRESHOLD = Math.max(1, parseInt(process.env.THRESHOLD_J
 const THRESHOLD_SCAN_JOB_MODE_DATE = 'date_threshold_write';
 const THRESHOLD_SCAN_JOB_MODE_WEEK = 'threshold_week_write_contract';
 const THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS || '480000', 10);
+const WEEKLY_BOOKING_WIDGET_TIMEOUT_MS = parseInt(process.env.WEEKLY_BOOKING_WIDGET_TIMEOUT_MS || '45000', 10);
+const WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS = Math.max(1, parseInt(process.env.WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS || '10', 10));
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -11613,6 +11615,270 @@ async function navigateGate8ThresholdDate(page, isoDate, weekMode = true) {
   return { ok: true, nav, error: null };
 }
 
+function weeklyTargetWeekContains(headers, targetWeekStart, validateIsoDate) {
+  if (!headers?.length) return false;
+  const target = validateIsoDate || targetWeekStart;
+  if (target && headers.includes(target)) return true;
+  if (targetWeekStart) {
+    const { dates } = buildThresholdWeekDates(targetWeekStart, THRESHOLD_JOB_MAX_DATES);
+    return dates.some((isoDate) => headers.includes(isoDate));
+  }
+  return false;
+}
+
+function isWeeklyBookingWidgetTimeoutError(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('weekly_booking_widget_timeout')
+    || (msg.includes('waitForSelector') && msg.includes('dynamic-cal-booking-ts'));
+}
+
+async function waitForWeeklyBookingWidgetVisible(page, { timeoutMs = WEEKLY_BOOKING_WIDGET_TIMEOUT_MS } = {}) {
+  try {
+    await page.waitForSelector('.dynamic-cal-booking-ts', {
+      state: 'visible',
+      timeout: timeoutMs,
+    });
+  } catch (err) {
+    throw new Error('weekly_booking_widget_timeout');
+  }
+}
+
+async function openWeeklyThresholdBookingPage(page) {
+  await dismissCookieBanner(page).catch(() => {});
+  await withPlaywrightGuard(
+    () => page.goto(BOOKING, { waitUntil: 'domcontentloaded', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS }),
+    { stage: 'weekly_open_booking_page', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS + 5000 },
+  );
+  await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 6000).catch(() => {});
+  await waitForWeeklyBookingWidgetVisible(page);
+}
+
+async function readWeeklyJobHeaderState(page) {
+  const scraped = await scrapeCalendarHeadersWithRetry(page);
+  const headerParse = scraped.headerParse || {};
+  const pageDiag = scraped.pageDiagnostics || {};
+  let headers = headerParse?.visibleIsoDatesFromHeaders || headerParse?.dates || [];
+  if (!headers.length) {
+    headers = await getVisibleDateKeysFromPage(page).catch(() => []);
+  }
+  return {
+    visibleIsoDatesFromHeaders: headers,
+    visibleWeekStart: headers[0] ?? null,
+    visibleWeekEnd: headers[headers.length - 1] ?? null,
+    rawMonthLabel: headerParse?.rawMonthLabel ?? null,
+    rawDayHeaderTexts: headerParse?.rawDayHeaderTexts || [],
+    headerParseError: headerParse?.headerParseError ?? null,
+    currentUrl: pageDiag?.currentUrl ?? null,
+    pageTitle: pageDiag?.pageTitle ?? null,
+  };
+}
+
+function buildWeeklyPreflightNavigation(headerState, navClicks, navSteps) {
+  const headers = headerState.visibleIsoDatesFromHeaders || [];
+  return {
+    visibleIsoDatesFromHeaders: headers,
+    visibleWeekStart: headerState.visibleWeekStart ?? headers[0] ?? null,
+    visibleWeekEnd: headerState.visibleWeekEnd ?? headers[headers.length - 1] ?? null,
+    rawMonthLabel: headerState.rawMonthLabel ?? null,
+    rawDayHeaderTexts: headerState.rawDayHeaderTexts || [],
+    targetDateVisibleFromHeaders: true,
+    clickedNextWeekCount: navClicks,
+    currentUrl: headerState.currentUrl ?? null,
+    pageTitle: headerState.pageTitle ?? null,
+    weeklyPreflightNavSteps: navSteps,
+  };
+}
+
+async function navigateWeeklyJobToTargetWeek(page, {
+  targetWeekStart,
+  validateIsoDate,
+  maxNavClicks = WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS,
+  onNavStep = null,
+} = {}) {
+  const validationTarget = validateIsoDate || targetWeekStart;
+  const navSteps = [];
+  let navClicks = 0;
+  let headerState = await readWeeklyJobHeaderState(page);
+
+  if (weeklyTargetWeekContains(headerState.visibleIsoDatesFromHeaders, targetWeekStart, validationTarget)) {
+    await normalizeBookingFiltersOnPage(page).catch(() => {});
+    await page.waitForTimeout(400);
+    return {
+      ok: true,
+      navigation: buildWeeklyPreflightNavigation(headerState, navClicks, navSteps),
+      navClicks,
+      lastVisibleHeader: headerState,
+      navSteps,
+    };
+  }
+
+  for (let step = 0; step < maxNavClicks; step += 1) {
+    const headers = headerState.visibleIsoDatesFromHeaders || [];
+    const direction = headers.length
+      ? navigationDirectionForVisibleHeaders(headers, validationTarget)
+      : navigationDirectionForEmptyHeaders(headerState, validationTarget);
+
+    if (!direction || direction === 'stop') break;
+
+    const before = await getCalendarFingerprint(page);
+    const clicked = direction === 'next'
+      ? await advanceCalendarWeek(page)
+      : await retreatCalendarWeek(page);
+
+    const stepRecord = {
+      step: step + 1,
+      direction,
+      clicked,
+      beforeHeader: before.label || null,
+      beforeTileCount: before.count,
+    };
+
+    if (!clicked) {
+      navSteps.push(stepRecord);
+      break;
+    }
+
+    navClicks += 1;
+    headerState = await readWeeklyJobHeaderState(page);
+    stepRecord.afterHeader = headerState.rawMonthLabel ?? null;
+    stepRecord.visibleIsoDatesFromHeaders = headerState.visibleIsoDatesFromHeaders || [];
+    navSteps.push(stepRecord);
+
+    if (typeof onNavStep === 'function') {
+      await onNavStep({
+        navClicks,
+        lastVisibleHeader: headerState,
+        navSteps: [...navSteps],
+      });
+    }
+
+    if (weeklyTargetWeekContains(headerState.visibleIsoDatesFromHeaders, targetWeekStart, validationTarget)) {
+      await normalizeBookingFiltersOnPage(page).catch(() => {});
+      await page.waitForTimeout(400);
+      return {
+        ok: true,
+        navigation: buildWeeklyPreflightNavigation(headerState, navClicks, navSteps),
+        navClicks,
+        lastVisibleHeader: headerState,
+        navSteps,
+      };
+    }
+  }
+
+  const pageDiag = await collectPageDiagnostics(page, 'weekly_target_week_nav_failed');
+  return {
+    ok: false,
+    error: 'weekly_target_week_navigation_failed',
+    targetWeekStart,
+    validateIsoDate: validationTarget,
+    navClicks,
+    lastVisibleHeader: headerState,
+    navSteps,
+    currentUrl: pageDiag.currentUrl ?? headerState.currentUrl ?? null,
+    pageTitle: pageDiag.pageTitle ?? headerState.pageTitle ?? null,
+  };
+}
+
+async function runWeeklyThresholdWeekPreflight({
+  targetWeekStart,
+  validateIsoDate,
+  launchedRef = null,
+  onStageUpdate = null,
+} = {}) {
+  const launched = await launchBrowser();
+  if (launchedRef) launchedRef.current = launched;
+
+  try {
+    await openWeeklyThresholdBookingPage(launched.page);
+    const widgetDiag = await collectPageDiagnostics(launched.page, 'weekly_booking_widget_visible');
+    if (typeof onStageUpdate === 'function') {
+      await onStageUpdate({
+        stage: 'booking_widget_visible',
+        currentUrl: widgetDiag.currentUrl ?? null,
+        pageTitle: widgetDiag.pageTitle ?? null,
+      });
+    }
+
+    if (typeof onStageUpdate === 'function') {
+      await onStageUpdate({
+        stage: 'navigating_to_week',
+        targetWeekStart,
+        validateIsoDate: validateIsoDate || targetWeekStart,
+        navClicks: 0,
+      });
+    }
+
+    const navResult = await navigateWeeklyJobToTargetWeek(launched.page, {
+      targetWeekStart,
+      validateIsoDate,
+      maxNavClicks: WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS,
+      onNavStep: async (stepPatch) => {
+        if (typeof onStageUpdate === 'function') {
+          await onStageUpdate({
+            stage: 'navigating_to_week',
+            targetWeekStart,
+            validateIsoDate: validateIsoDate || targetWeekStart,
+            ...stepPatch,
+          });
+        }
+      },
+    });
+
+    if (!navResult.ok) {
+      return {
+        ok: false,
+        launched,
+        error: navResult.error,
+        targetWeekStart,
+        validateIsoDate: validateIsoDate || targetWeekStart,
+        navClicks: navResult.navClicks,
+        lastVisibleHeader: navResult.lastVisibleHeader,
+        navSteps: navResult.navSteps,
+        currentUrl: navResult.currentUrl,
+        pageTitle: navResult.pageTitle,
+      };
+    }
+
+    if (typeof onStageUpdate === 'function') {
+      await onStageUpdate({
+        stage: 'target_week_visible',
+        targetWeekStart,
+        validateIsoDate: validateIsoDate || targetWeekStart,
+        navClicks: navResult.navClicks,
+        lastVisibleHeader: navResult.lastVisibleHeader,
+        navigation: navResult.navigation,
+      });
+    }
+
+    return {
+      ok: true,
+      launched,
+      navigation: navResult.navigation,
+      navClicks: navResult.navClicks,
+      lastVisibleHeader: navResult.lastVisibleHeader,
+      navSteps: navResult.navSteps,
+      currentUrl: navResult.navigation?.currentUrl ?? null,
+      pageTitle: navResult.navigation?.pageTitle ?? null,
+    };
+  } catch (err) {
+    const pageDiag = launched?.page
+      ? await collectPageDiagnostics(launched.page, 'weekly_preflight_error').catch(() => ({}))
+      : {};
+    const error = isWeeklyBookingWidgetTimeoutError(err)
+      ? 'weekly_booking_widget_timeout'
+      : (err.message || String(err));
+    return {
+      ok: false,
+      launched,
+      error,
+      currentUrl: pageDiag.currentUrl ?? null,
+      pageTitle: pageDiag.pageTitle ?? null,
+      stage: isWeeklyBookingWidgetTimeoutError(err) ? 'failed' : 'failed',
+    };
+  }
+}
+
 function buildGate8NavFailureWriteRun(error, meta = {}) {
   return {
     fullScanContractOk: false,
@@ -12481,26 +12747,103 @@ async function executeThresholdWeekScanJob(job) {
       claimedAt: new Date().toISOString(),
     });
 
-    startedFullScanAt = new Date().toISOString();
     resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
-      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
-      weekStart,
-      stage: 'starting_full_scan',
-      startedFullScanAt,
+      stage: 'starting_preflight',
+      targetWeekStart: weekStart,
+      validateIsoDate: anchorIsoDate || weekStart,
       dateResults: [],
     });
 
     await ensureSessionsForStatus();
     const launchedRef = { current: null };
+    const validateIsoDate = anchorIsoDate || weekStart;
+    let preflightNavigation = null;
+
+    const preflight = await runWeeklyThresholdWeekPreflight({
+      targetWeekStart: weekStart,
+      validateIsoDate,
+      launchedRef,
+      onStageUpdate: async (patch) => {
+        resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+          weekStart,
+          targetWeekStart: weekStart,
+          validateIsoDate,
+          dateResults: [],
+          ...patch,
+        });
+      },
+    });
+
+    launched = preflight.launched || launchedRef.current;
+
+    if (!preflight.ok) {
+      workerError = preflight.error;
+      resultsJson = buildThresholdWeekWriteResultsJson({
+        mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+        weekStart,
+        targetDates: storedTargetDates,
+        fullScanRun: null,
+        dateResults: [],
+        writeMode: resolveGate8WriteMode({
+          thresholdWriteSafe: false,
+          writeEnabled: write,
+          dryRun,
+        }),
+        stage: 'failed',
+        claimedAt: resultsJson.claimedAt ?? null,
+        startedFullScanAt: resultsJson.startedFullScanAt ?? null,
+        failedAt: new Date().toISOString(),
+        error: workerError,
+      });
+      Object.assign(resultsJson, {
+        currentUrl: preflight.currentUrl ?? null,
+        pageTitle: preflight.pageTitle ?? null,
+        targetWeekStart: weekStart,
+        validateIsoDate,
+        lastVisibleHeader: preflight.lastVisibleHeader ?? null,
+        navClicks: preflight.navClicks ?? 0,
+        navSteps: preflight.navSteps ?? [],
+      });
+      await finalizeThresholdScanJob(job.id, {
+        status: 'failed',
+        error: workerError,
+        resultsJson,
+      });
+      finalizedEarly = true;
+      return {
+        ok: false,
+        job_id: job.id,
+        status: 'failed',
+        mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+        weekStart,
+        stage: 'failed',
+        error: workerError,
+      };
+    }
+
+    preflightNavigation = preflight.navigation;
+    startedFullScanAt = new Date().toISOString();
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'starting_full_scan',
+      startedFullScanAt,
+      targetWeekStart: weekStart,
+      validateIsoDate,
+      navClicks: preflight.navClicks ?? 0,
+      lastVisibleHeader: preflight.lastVisibleHeader ?? null,
+      navigation: preflightNavigation,
+    });
+
     let recovery;
     try {
       recovery = await withTimeout(
         runGate8FullScanWithCrashRecovery({
-          isoDate: anchorIsoDate || weekStart,
+          isoDate: validateIsoDate,
           weekMode: true,
           minThreshold: job.min_threshold,
           maxThreshold: job.max_threshold,
-          launched: null,
+          launched: preflight.launched,
+          navigation: preflightNavigation,
           launchedRef,
         }),
         THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS,
@@ -12561,7 +12904,9 @@ async function executeThresholdWeekScanJob(job) {
 
     targetDates = resolveThresholdWeekTargetDates(
       weekStart,
-      recovery.navigation?.visibleIsoDatesFromHeaders || [],
+      recovery.navigation?.visibleIsoDatesFromHeaders
+        || preflightNavigation?.visibleIsoDatesFromHeaders
+        || [],
       THRESHOLD_JOB_MAX_DATES,
     );
 
