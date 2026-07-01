@@ -62,6 +62,8 @@ const THRESHOLD_JOB_MAX_DATES = Math.max(1, parseInt(process.env.THRESHOLD_JOB_M
 const THRESHOLD_JOB_MAX_THRESHOLD = Math.max(1, parseInt(process.env.THRESHOLD_JOB_MAX_THRESHOLD || '20', 10));
 const THRESHOLD_SCAN_JOB_MODE_DATE = 'date_threshold_write';
 const THRESHOLD_SCAN_JOB_MODE_WEEK = 'threshold_week_write_contract';
+const THRESHOLD_SCAN_JOB_MODE_APPLY = 'threshold_week_apply_prepared';
+const THRESHOLD_PREPARED_SCAN_MAX_AGE_MS = parseInt(process.env.THRESHOLD_PREPARED_SCAN_MAX_AGE_MS || '21600000', 10);
 const THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS || '480000', 10);
 const WEEKLY_BOOKING_WIDGET_TIMEOUT_MS = parseInt(process.env.WEEKLY_BOOKING_WIDGET_TIMEOUT_MS || '45000', 10);
 const WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS = Math.max(1, parseInt(process.env.WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS || '10', 10));
@@ -11732,6 +11734,186 @@ async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun
   };
 }
 
+function serializeGate8PreparedUpdate(sessionEntry) {
+  const isoDate = extractGate8SessionIsoDate(sessionEntry);
+  const identityKey = sessionEntry.thresholdDiagnostics?.identityKey
+    || buildGate8SessionIdentityKey(sessionEntry);
+  return {
+    isoDate,
+    identityKey,
+    sessionKey: sessionEntry.key ?? null,
+    available_entries: sessionEntry.available_entries ?? null,
+    available_entries_at_least: sessionEntry.available_entries_at_least ?? null,
+    threshold_confidence: sessionEntry.threshold_confidence ?? sessionEntry.thresholdConfidence ?? null,
+    threshold_max_visible: sessionEntry.threshold_max_visible ?? sessionEntry.thresholdMaxVisible ?? null,
+    threshold_scanned_at: sessionEntry.threshold_scanned_at ?? sessionEntry.thresholdScanAt ?? null,
+    threshold_scan_verified: sessionEntry.threshold_scan_verified ?? sessionEntry.thresholdScanVerified === true,
+    slot_source: sessionEntry.slot_source ?? 'entries_left_threshold_scan',
+    slot_status: sessionEntry.slot_status ?? null,
+    thresholdInferredSlots: sessionEntry.thresholdInferredSlots ?? null,
+    thresholdMaxVisible: sessionEntry.thresholdMaxVisible ?? null,
+    thresholdConfidence: sessionEntry.thresholdConfidence ?? null,
+    thresholdScanVerified: sessionEntry.thresholdScanVerified === true,
+    thresholdScanAt: sessionEntry.thresholdScanAt ?? null,
+    thresholdScanMaxTested: sessionEntry.thresholdScanMaxTested ?? null,
+    thresholdScanMethod: sessionEntry.thresholdScanMethod ?? 'entries_left_filter',
+    thresholdDiagnostics: sessionEntry.thresholdDiagnostics ?? null,
+  };
+}
+
+function buildPreparedUpdatesByDateFromRows(rowsPrepared) {
+  const byDate = {};
+  for (const row of rowsPrepared || []) {
+    const serialized = serializeGate8PreparedUpdate(row);
+    if (!serialized.isoDate || !serialized.sessionKey) continue;
+    if (!byDate[serialized.isoDate]) byDate[serialized.isoDate] = [];
+    byDate[serialized.isoDate].push(serialized);
+  }
+  return byDate;
+}
+
+function mergePreparedUpdatesByDate(existing, incoming) {
+  const out = { ...(existing || {}) };
+  for (const [isoDate, updates] of Object.entries(incoming || {})) {
+    out[isoDate] = updates;
+  }
+  return out;
+}
+
+function flattenPreparedUpdatesFromResults(resultsJson = {}) {
+  if (Array.isArray(resultsJson.preparedUpdates) && resultsJson.preparedUpdates.length) {
+    return resultsJson.preparedUpdates;
+  }
+  const byDate = resultsJson.preparedUpdatesByDate;
+  if (byDate && typeof byDate === 'object') {
+    return Object.values(byDate).flat();
+  }
+  return [];
+}
+
+function countPreparedUpdates(preparedUpdatesByDate = {}) {
+  return Object.values(preparedUpdatesByDate).reduce((sum, rows) => sum + (rows?.length || 0), 0);
+}
+
+function groupPreparedUpdatesByDate(preparedUpdates) {
+  const byDate = {};
+  for (const prep of preparedUpdates || []) {
+    if (!prep?.isoDate) continue;
+    if (!byDate[prep.isoDate]) byDate[prep.isoDate] = [];
+    byDate[prep.isoDate].push(prep);
+  }
+  return byDate;
+}
+
+function applyGate8PreparedUpdateToSession(session, prep) {
+  const entry = { ...session };
+  const confidence = prep.threshold_confidence ?? prep.thresholdConfidence ?? null;
+  const scannedAt = prep.threshold_scanned_at ?? prep.thresholdScanAt ?? null;
+  entry.thresholdInferredSlots = prep.thresholdInferredSlots
+    ?? prep.available_entries
+    ?? prep.available_entries_at_least
+    ?? null;
+  entry.thresholdMaxVisible = prep.threshold_max_visible ?? prep.thresholdMaxVisible ?? null;
+  entry.thresholdConfidence = confidence;
+  entry.thresholdScanVerified = prep.threshold_scan_verified ?? prep.thresholdScanVerified === true;
+  entry.thresholdScanAt = scannedAt;
+  entry.thresholdScanMaxTested = prep.thresholdScanMaxTested ?? null;
+  entry.thresholdScanMethod = prep.thresholdScanMethod ?? 'entries_left_filter';
+  entry.thresholdDiagnostics = prep.thresholdDiagnostics ?? null;
+  entry.threshold_confidence = confidence;
+  entry.threshold_max_visible = entry.thresholdMaxVisible;
+  entry.threshold_scanned_at = scannedAt;
+  entry.threshold_scan_at = scannedAt;
+  entry.threshold_scan_verified = entry.thresholdScanVerified;
+  entry.slot_source = prep.slot_source ?? 'entries_left_threshold_scan';
+  entry.available_entries = prep.available_entries ?? null;
+  entry.available_entries_at_least = prep.available_entries_at_least ?? null;
+  entry.slot_status = prep.slot_status ?? confidence ?? null;
+  return entry;
+}
+
+async function rehydrateGate8PreparedRowsForApply(preparedUpdatesForDate, isoDate) {
+  const { currentSessions } = await fetchGate8CurrentSessionsForIsoDate(isoDate);
+  const byKey = new Map(currentSessions.map((session) => [session.key, session]));
+  const rows = [];
+  const missingSessionKeys = [];
+  for (const prep of preparedUpdatesForDate || []) {
+    if (prep.isoDate && prep.isoDate !== isoDate) continue;
+    const session = byKey.get(prep.sessionKey);
+    if (!session) {
+      missingSessionKeys.push(prep.sessionKey);
+      continue;
+    }
+    rows.push(applyGate8PreparedUpdateToSession(session, prep));
+  }
+  return { rows, missingSessionKeys };
+}
+
+function getPreparedScanTimestamp(sourceJob) {
+  const resultsJson = sourceJob?.results_json || {};
+  return resultsJson.preparedScanCompletedAt
+    || resultsJson.completedFullScanAt
+    || sourceJob?.completed_at
+    || null;
+}
+
+function validatePreparedSourceJob(sourceJob) {
+  if (!sourceJob) {
+    return { ok: false, error: 'source_job_not_found' };
+  }
+  if (sourceJob.status !== 'completed') {
+    return { ok: false, error: 'source_job_not_completed' };
+  }
+  if (sourceJob.error) {
+    return { ok: false, error: 'source_job_has_error' };
+  }
+  const resultsJson = sourceJob.results_json || {};
+  if (resultsJson.fullScanContractOk !== true) {
+    return { ok: false, error: 'source_scan_not_ok' };
+  }
+  if (resultsJson.error) {
+    return { ok: false, error: 'source_job_results_error' };
+  }
+  const preparedUpdates = flattenPreparedUpdatesFromResults(resultsJson);
+  if (!preparedUpdates.length) {
+    return { ok: false, error: 'source_prepared_updates_empty' };
+  }
+  const scanAt = getPreparedScanTimestamp(sourceJob);
+  if (scanAt) {
+    const ageMs = Date.now() - new Date(scanAt).getTime();
+    if (ageMs > THRESHOLD_PREPARED_SCAN_MAX_AGE_MS) {
+      return {
+        ok: false,
+        error: 'source_scan_stale',
+        scanAgeMs: ageMs,
+        maxAgeMs: THRESHOLD_PREPARED_SCAN_MAX_AGE_MS,
+      };
+    }
+  }
+  const preparedUpdatesByDate = resultsJson.preparedUpdatesByDate
+    || groupPreparedUpdatesByDate(preparedUpdates);
+  return {
+    ok: true,
+    sourceJob,
+    resultsJson,
+    preparedUpdates,
+    preparedUpdatesByDate,
+    preparedUpdatesCount: preparedUpdates.length,
+    scanAt,
+  };
+}
+
+async function loadThresholdScanJobById(jobId) {
+  if (!supabase || !jobId) return null;
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('*')
+    .eq('id', jobId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
 async function runDebugEntriesLeftThresholdWriteContract(page, {
   isoDate,
   navigation,
@@ -12401,6 +12583,28 @@ function resolveThresholdWeekTargetDates(weekStart, visibleIsoDatesFromHeaders =
 }
 
 function resolveThresholdScanJobEnqueue(body = {}) {
+  if (body.mode === THRESHOLD_SCAN_JOB_MODE_APPLY) {
+    const sourceJobId = String(body.sourceJobId || '').trim();
+    if (!sourceJobId) {
+      return {
+        ok: false,
+        error: 'sourceJobId_required',
+        mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+        dates: [],
+        weekStart: null,
+      };
+    }
+    return {
+      ok: true,
+      mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+      sourceJobId,
+      dates: [],
+      weekStart: null,
+      anchorIsoDate: null,
+      error: null,
+    };
+  }
+
   const mode = body.mode === THRESHOLD_SCAN_JOB_MODE_WEEK
     ? THRESHOLD_SCAN_JOB_MODE_WEEK
     : THRESHOLD_SCAN_JOB_MODE_DATE;
@@ -12459,8 +12663,17 @@ function buildThresholdWeekWriteResultsJson({
   startedFullScanAt = null,
   completedFullScanAt = null,
   failedAt = null,
+  preparedUpdatesByDate = null,
+  preparedUpdates = null,
+  preparedUpdatesCount = null,
+  preparedScanCompletedAt = null,
+  sourceJobId = null,
 } = {}) {
   const summary = summarizeThresholdScanJobResults(dateResults);
+  const flatPreparedUpdates = preparedUpdates
+    ?? (preparedUpdatesByDate ? Object.values(preparedUpdatesByDate).flat() : []);
+  const preparedCount = preparedUpdatesCount
+    ?? (preparedUpdatesByDate ? countPreparedUpdates(preparedUpdatesByDate) : flatPreparedUpdates.length);
   return {
     mode,
     weekStart,
@@ -12470,6 +12683,13 @@ function buildThresholdWeekWriteResultsJson({
     startedFullScanAt,
     completedFullScanAt,
     failedAt,
+    sourceJobId,
+    preparedUpdatesByDate: preparedUpdatesByDate ?? (flatPreparedUpdates.length
+      ? groupPreparedUpdatesByDate(flatPreparedUpdates)
+      : {}),
+    preparedUpdates: flatPreparedUpdates,
+    preparedUpdatesCount: preparedCount,
+    preparedScanCompletedAt,
     thresholdsScanned: fullScanRun?.thresholdsScanned ?? [],
     visibleTileCountsByThreshold: fullScanRun?.visibleTileCountsByThreshold ?? {},
     fullScanContractOk: fullScanRun?.fullScanContractOk === true,
@@ -12609,6 +12829,7 @@ async function enqueueThresholdScanJob({
   mode = THRESHOLD_SCAN_JOB_MODE_DATE,
   dates,
   weekStart = null,
+  sourceJobId = null,
   minThreshold = 1,
   maxThreshold = THRESHOLD_JOB_MAX_THRESHOLD,
   dryRun = true,
@@ -12625,8 +12846,19 @@ async function enqueueThresholdScanJob({
     minT,
     Math.min(Number(maxThreshold) || THRESHOLD_JOB_MAX_THRESHOLD, maxCap),
   );
-  const initialResults = mode === THRESHOLD_SCAN_JOB_MODE_WEEK
-    ? {
+  let initialResults;
+  if (mode === THRESHOLD_SCAN_JOB_MODE_APPLY) {
+    initialResults = {
+      mode,
+      sourceJobId,
+      stage: 'queued',
+      dateResults: [],
+      totalRowsPrepared: 0,
+      totalRowsWritten: 0,
+      writesPerformed: false,
+    };
+  } else if (mode === THRESHOLD_SCAN_JOB_MODE_WEEK) {
+    initialResults = {
       mode,
       weekStart,
       targetDates: dates,
@@ -12635,8 +12867,12 @@ async function enqueueThresholdScanJob({
       totalRowsWritten: 0,
       writesPerformed: false,
       fullScanContractOk: false,
-    }
-    : {
+      preparedUpdatesByDate: {},
+      preparedUpdates: [],
+      preparedUpdatesCount: 0,
+    };
+  } else {
+    initialResults = {
       mode,
       datesRequested: dates,
       dateResults: [],
@@ -12644,10 +12880,11 @@ async function enqueueThresholdScanJob({
       totalRowsWritten: 0,
       writesPerformed: false,
     };
+  }
   const payload = {
     status: 'queued',
     mode,
-    dates,
+    dates: dates || [],
     min_threshold: minT,
     max_threshold: maxT,
     dry_run: dryRun !== false,
@@ -12744,7 +12981,9 @@ async function claimThresholdScanJobWorker() {
 async function processThresholdScanJobInBackground(job) {
   const mode = job.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
   try {
-    if (mode === THRESHOLD_SCAN_JOB_MODE_WEEK) {
+    if (mode === THRESHOLD_SCAN_JOB_MODE_APPLY) {
+      await executeThresholdWeekApplyPreparedJob(job);
+    } else if (mode === THRESHOLD_SCAN_JOB_MODE_WEEK) {
       await executeThresholdWeekScanJob(job);
     } else {
       await executeThresholdScanJob(job);
@@ -12939,6 +13178,203 @@ async function executeThresholdScanJob(job) {
   };
 }
 
+async function executeThresholdWeekApplyPreparedJob(job) {
+  const sourceJobId = job.results_json?.sourceJobId || job.source_job_id;
+  const dryRun = job.dry_run !== false;
+  const writeEnabled = job.write_enabled === true;
+  const write = writeEnabled && !dryRun;
+  const dateResults = [];
+  let workerError = null;
+  let resultsJson = {
+    ...(job.results_json || {}),
+    mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+    sourceJobId,
+    dateResults: [],
+  };
+
+  try {
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'claimed',
+      claimedAt: new Date().toISOString(),
+    });
+
+    await ensureSessionsForStatus();
+
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'loading_source',
+      sourceJobId,
+    });
+
+    const sourceJob = await loadThresholdScanJobById(sourceJobId);
+    const validation = validatePreparedSourceJob(sourceJob);
+    if (!validation.ok) {
+      workerError = validation.error;
+      resultsJson = buildThresholdWeekWriteResultsJson({
+        mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+        weekStart: sourceJob?.results_json?.weekStart ?? null,
+        targetDates: sourceJob?.results_json?.targetDates ?? [],
+        fullScanRun: null,
+        dateResults: [],
+        writeMode: resolveGate8WriteMode({
+          thresholdWriteSafe: false,
+          writeEnabled: write,
+          dryRun,
+        }),
+        stage: 'failed',
+        claimedAt: resultsJson.claimedAt ?? null,
+        failedAt: new Date().toISOString(),
+        sourceJobId,
+        error: workerError,
+      });
+      await finalizeThresholdScanJob(job.id, {
+        status: 'failed',
+        error: workerError,
+        resultsJson,
+      });
+      return {
+        ok: false,
+        job_id: job.id,
+        status: 'failed',
+        mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+        sourceJobId,
+        stage: 'failed',
+        error: workerError,
+      };
+    }
+
+    const {
+      preparedUpdatesByDate,
+      preparedUpdatesCount,
+      resultsJson: sourceResultsJson,
+      scanAt,
+    } = validation;
+    const weekStart = sourceResultsJson.weekStart ?? null;
+    const targetDates = sourceResultsJson.targetDates
+      || Object.keys(preparedUpdatesByDate).sort();
+    const writeMode = resolveGate8WriteMode({
+      thresholdWriteSafe: true,
+      writeEnabled: write,
+      dryRun,
+    });
+
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'applying_prepared_writes',
+      sourceJobId,
+      weekStart,
+      targetDates,
+      preparedUpdatesCount,
+      sourceScanAt: scanAt,
+      writeMode,
+    });
+
+    for (const isoDate of targetDates) {
+      const preparedForDate = preparedUpdatesByDate[isoDate] || [];
+      let writeResult = null;
+      let dateError = null;
+      let rowsPrepared = 0;
+      let missingSessionKeys = [];
+
+      try {
+        const rehydrated = await rehydrateGate8PreparedRowsForApply(preparedForDate, isoDate);
+        rowsPrepared = rehydrated.rows.length;
+        missingSessionKeys = rehydrated.missingSessionKeys;
+        if (missingSessionKeys.length) {
+          dateError = `missing_sessions:${missingSessionKeys.length}`;
+        }
+        if (writeMode === 'write' && rowsPrepared > 0) {
+          writeResult = await applyGate8ThresholdWriteRows(rehydrated.rows, {
+            writeEnabled: true,
+            dryRun: false,
+          });
+          if (writeResult.upsert?.error) {
+            dateError = writeResult.upsert.error;
+            workerError = dateError;
+          }
+        }
+      } catch (err) {
+        dateError = err.message || String(err);
+        workerError = dateError;
+      }
+
+      dateResults.push({
+        isoDate,
+        currentSessionsFetchedForIsoDateCount: null,
+        inferredForIsoDateCount: preparedForDate.length,
+        rowsPrepared,
+        rowsWritten: writeResult?.rowsWritten ?? 0,
+        unmatchedInferenceSample: missingSessionKeys.slice(0, 12).map((sessionKey) => ({ sessionKey })),
+        writeMode,
+        writesPerformed: writeResult?.writesPerformed === true,
+        error: dateError,
+      });
+
+      resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
+        mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+        weekStart,
+        targetDates,
+        fullScanRun: {
+          fullScanContractOk: true,
+          thresholdsScanned: sourceResultsJson.thresholdsScanned ?? [],
+          thresholdScanMaxReached: sourceResultsJson.thresholdScanMaxReached ?? null,
+        },
+        dateResults,
+        writeMode,
+        stage: 'applying_prepared_writes',
+        claimedAt: resultsJson.claimedAt ?? null,
+        sourceJobId,
+        preparedUpdatesCount,
+        error: null,
+      }));
+    }
+  } catch (err) {
+    workerError = err.message || String(err);
+  }
+
+  const failedDates = dateResults.filter((row) => row.error);
+  const summary = summarizeThresholdScanJobResults(dateResults);
+  const finalStatus = failedDates.length === dateResults.length && dateResults.length
+    ? 'failed'
+    : 'completed';
+  const finalError = failedDates.length > 0 ? 'partial_date_failures' : null;
+  const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
+
+  resultsJson = buildThresholdWeekWriteResultsJson({
+    mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+    weekStart: resultsJson.weekStart ?? null,
+    targetDates: resultsJson.targetDates ?? dateResults.map((row) => row.isoDate),
+    fullScanRun: { fullScanContractOk: true },
+    dateResults,
+    writeMode: resolveGate8WriteMode({
+      thresholdWriteSafe: true,
+      writeEnabled: write,
+      dryRun,
+    }),
+    stage: finalStage,
+    claimedAt: resultsJson.claimedAt ?? null,
+    failedAt: finalStage === 'failed' ? new Date().toISOString() : null,
+    sourceJobId,
+    error: workerError || finalError,
+  });
+
+  await finalizeThresholdScanJob(job.id, {
+    status: finalStatus,
+    error: workerError || finalError,
+    resultsJson,
+  });
+
+  return {
+    ok: finalStatus === 'completed',
+    job_id: job.id,
+    status: finalStatus,
+    mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+    sourceJobId,
+    stage: finalStage,
+    dateResults,
+    ...summary,
+    error: workerError || finalError,
+  };
+}
+
 async function executeThresholdWeekScanJob(job) {
   const anchorIsoDate = Array.isArray(job.dates) && job.dates.length ? job.dates[0] : null;
   const weekStart = job.results_json?.weekStart
@@ -12967,6 +13403,7 @@ async function executeThresholdWeekScanJob(job) {
   };
   let startedFullScanAt = null;
   let finalizedEarly = false;
+  let preparedUpdatesByDate = {};
 
   try {
     resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
@@ -13206,6 +13643,10 @@ async function executeThresholdWeekScanJob(job) {
         let dateError = null;
         try {
           prep = await prepareGate8ThresholdWriteRows(fullScanRun.inferences, isoDate, maxTested);
+          preparedUpdatesByDate = mergePreparedUpdatesByDate(
+            preparedUpdatesByDate,
+            buildPreparedUpdatesByDateFromRows(prep.rowsPrepared),
+          );
           if (writeMode === 'write' && prep.rowsPrepared.length > 0) {
             writeResult = await applyGate8ThresholdWriteRows(prep.rowsPrepared, {
               writeEnabled: true,
@@ -13238,6 +13679,8 @@ async function executeThresholdWeekScanJob(job) {
           claimedAt: resultsJson.claimedAt ?? null,
           startedFullScanAt,
           completedFullScanAt: resultsJson.completedFullScanAt ?? null,
+          preparedUpdatesByDate,
+          preparedUpdatesCount: countPreparedUpdates(preparedUpdatesByDate),
           ...scanMeta,
           error: null,
         }));
@@ -13279,6 +13722,9 @@ async function executeThresholdWeekScanJob(job) {
     ? (workerError || fullScanRun?.error || 'full_scan_contract_failed')
     : (failedDates.length > 0 ? 'partial_date_failures' : null);
   const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
+  const preparedScanCompletedAt = fullScanRun?.fullScanContractOk === true
+    ? (resultsJson.completedFullScanAt || new Date().toISOString())
+    : null;
 
   resultsJson = buildThresholdWeekWriteResultsJson({
     mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
@@ -13296,6 +13742,9 @@ async function executeThresholdWeekScanJob(job) {
     startedFullScanAt,
     completedFullScanAt: resultsJson.completedFullScanAt ?? null,
     failedAt: finalStage === 'failed' ? new Date().toISOString() : null,
+    preparedUpdatesByDate,
+    preparedUpdatesCount: countPreparedUpdates(preparedUpdatesByDate),
+    preparedScanCompletedAt,
     ...scanMeta,
     error: fullScanRun?.fullScanContractOk === true ? finalError : (workerError || fullScanRun?.error || finalError),
   });
@@ -17517,6 +17966,7 @@ app.post('/api/admin/threshold-scan-jobs', async (req, res) => {
       mode: resolved.mode,
       dates: resolved.dates,
       weekStart: resolved.weekStart,
+      sourceJobId: resolved.sourceJobId,
       minThreshold,
       maxThreshold,
       dryRun,
@@ -17530,6 +17980,7 @@ app.post('/api/admin/threshold-scan-jobs', async (req, res) => {
       mode: job.mode || resolved.mode,
       dates: job.dates,
       weekStart: resolved.weekStart,
+      sourceJobId: resolved.sourceJobId ?? null,
       minThreshold: job.min_threshold,
       maxThreshold: job.max_threshold,
       dryRun: job.dry_run,
