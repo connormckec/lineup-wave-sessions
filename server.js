@@ -65,6 +65,7 @@ const THRESHOLD_SCAN_JOB_MODE_WEEK = 'threshold_week_write_contract';
 const THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS || '480000', 10);
 const WEEKLY_BOOKING_WIDGET_TIMEOUT_MS = parseInt(process.env.WEEKLY_BOOKING_WIDGET_TIMEOUT_MS || '45000', 10);
 const WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS = Math.max(1, parseInt(process.env.WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS || '10', 10));
+const THRESHOLD_WEEK_SINGLE_THRESHOLD_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_SINGLE_THRESHOLD_TIMEOUT_MS || '60000', 10);
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -11130,6 +11131,232 @@ async function runDebugEntriesLeftFullScanContract(page, {
   };
 }
 
+function createWeeklyIncrementalScanState() {
+  return {
+    visibleByThreshold: new Map(),
+    tileByIdentity: new Map(),
+    thresholdsScanned: [],
+    thresholdParseDiagnostics: [],
+    thresholdStopReason: null,
+    thresholdScanMaxReached: null,
+    zeroTilesAtThreshold: null,
+    scanFailed: false,
+  };
+}
+
+function buildWeeklyVisibleTileCountsByThreshold(visibleByThreshold) {
+  return Object.fromEntries(
+    [...visibleByThreshold.entries()].map(([t, keys]) => [t, keys.size]),
+  );
+}
+
+function processWeeklyIncrementalThresholdStep(state, threshold, run) {
+  if (!run.thresholdSelection?.filterSetOk) {
+    state.thresholdStopReason = run.thresholdSelection?.filterSetError
+      || 'entries_left_option_unavailable_or_not_selected';
+    return { kind: 'stop' };
+  }
+
+  const gate7Validation = buildGate7ThresholdParseValidation(threshold, {
+    thresholdSelection: run.thresholdSelection,
+    gridSnapshot: run.gridSnapshot,
+    tileParserResult: run.tileParserResult,
+    tileParserValidationRaw: run.tileParserValidationRaw,
+    parseResult: run.parseResult,
+  });
+
+  state.thresholdParseDiagnostics.push({
+    threshold,
+    parsedCount: gate7Validation.parsedCount,
+    gate7ParserOk: gate7Validation.ok,
+    warnings: gate7Validation.warnings,
+    errors: gate7Validation.errors,
+  });
+
+  if (!gate7Validation.ok) {
+    state.thresholdStopReason = resolveGate7ParserError(threshold, gate7Validation, run.tileParserResult)
+      || 'tile_parser_contract_failed';
+    state.scanFailed = true;
+    return { kind: 'failed' };
+  }
+
+  if (gate7Validation.cleanStop) {
+    state.thresholdStopReason = 'no_visible_tiles_at_threshold';
+    state.zeroTilesAtThreshold = threshold;
+    return { kind: 'stop' };
+  }
+
+  state.thresholdsScanned.push(threshold);
+  state.thresholdScanMaxReached = threshold;
+  state.visibleByThreshold.set(threshold, run.identityKeys || new Set());
+  if (run.parseResult) mergeTileByIdentityFromParseResult(state.tileByIdentity, run.parseResult);
+  return { kind: 'ok' };
+}
+
+function buildWeeklyIncrementalFullScanFromState(state) {
+  const visibleTileCountsByThreshold = buildWeeklyVisibleTileCountsByThreshold(state.visibleByThreshold);
+  const maxTested = state.thresholdScanMaxReached || 0;
+  const inferenceSummary = maxTested > 0
+    ? runThresholdPresenceInference(state.visibleByThreshold, maxTested, state.tileByIdentity)
+    : { inferences: [], exactCount: 0, atLeastCount: 0, noMatchCount: 0 };
+  const { inferences, exactCount, atLeastCount, noMatchCount } = inferenceSummary;
+  const countsNonIncreasing = thresholdCountsNonIncreasing(
+    visibleTileCountsByThreshold,
+    state.thresholdsScanned,
+  );
+  const fullScanContractOk = !state.scanFailed
+    && state.thresholdsScanned.length > 0
+    && countsNonIncreasing
+    && exactCount > 0;
+
+  let error = null;
+  if (state.scanFailed) {
+    error = state.thresholdStopReason;
+  } else if (!state.thresholdsScanned.length) {
+    error = state.thresholdStopReason || 'no_thresholds_scanned';
+  } else if (!countsNonIncreasing) {
+    error = 'visible_tile_counts_increased';
+  } else if (exactCount <= 0) {
+    error = 'no_exact_inferences';
+  }
+
+  return {
+    thresholdsScanned: state.thresholdsScanned,
+    visibleTileCountsByThreshold,
+    exactCount,
+    atLeastCount,
+    noMatchCount,
+    thresholdStopReason: state.thresholdStopReason,
+    thresholdScanMaxReached: state.thresholdScanMaxReached,
+    zeroTilesAtThreshold: state.zeroTilesAtThreshold,
+    thresholdParseDiagnostics: state.thresholdParseDiagnostics,
+    fullScanContractOk,
+    inferences,
+    maxTested,
+    error,
+  };
+}
+
+function isWeeklySingleThresholdTimeoutError(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('weekly_single_threshold_timeout');
+}
+
+async function reloadWeeklyTargetWeekOnPage(page, { targetWeekStart, validateIsoDate } = {}) {
+  await openWeeklyThresholdBookingPage(page);
+  const navResult = await navigateWeeklyJobToTargetWeek(page, {
+    targetWeekStart,
+    validateIsoDate,
+    maxNavClicks: WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS,
+  });
+  if (!navResult.ok) {
+    throw new Error(navResult.error || 'weekly_target_week_navigation_failed');
+  }
+  return navResult.navigation;
+}
+
+async function runWeeklyThresholdFixtureParseWithTimeout(page, threshold, ctx, timeoutMs) {
+  return withTimeout(
+    runDebugEntriesLeftThresholdFixtureParse(page, threshold, ctx),
+    timeoutMs,
+    'weekly_single_threshold',
+  );
+}
+
+async function runWeeklyIncrementalThresholdFullScan(page, {
+  isoDate,
+  navigation: initialNavigation,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  targetWeekStart,
+  validateIsoDate,
+  onProgress = null,
+} = {}) {
+  const minT = Math.max(1, Number(minThreshold) || 1);
+  const maxT = Math.max(
+    minT,
+    Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+  );
+  let navigation = initialNavigation;
+  const state = createWeeklyIncrementalScanState();
+
+  const emitProgress = async (patch) => {
+    if (typeof onProgress === 'function') {
+      await onProgress({
+        stage: 'scanning_thresholds',
+        thresholdsCompleted: [...state.thresholdsScanned],
+        visibleTileCountsByThreshold: buildWeeklyVisibleTileCountsByThreshold(state.visibleByThreshold),
+        ...patch,
+      });
+    }
+  };
+
+  for (let threshold = minT; threshold <= maxT; threshold += 1) {
+    const lastThresholdStartedAt = new Date().toISOString();
+    await emitProgress({
+      currentThreshold: threshold,
+      lastThresholdStartedAt,
+      lastThresholdCompletedAt: null,
+    });
+
+    let run = null;
+    let timedOut = false;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        run = await runWeeklyThresholdFixtureParseWithTimeout(
+          page,
+          threshold,
+          { isoDate, navigation },
+          THRESHOLD_WEEK_SINGLE_THRESHOLD_TIMEOUT_MS,
+        );
+        timedOut = false;
+        break;
+      } catch (err) {
+        if (!isWeeklySingleThresholdTimeoutError(err)) throw err;
+        timedOut = true;
+        if (attempt >= 2) break;
+        navigation = await reloadWeeklyTargetWeekOnPage(page, { targetWeekStart, validateIsoDate });
+      }
+    }
+
+    if (timedOut || !run) {
+      return {
+        ok: false,
+        error: 'weekly_threshold_timeout',
+        failedThreshold: threshold,
+        thresholdsCompleted: [...state.thresholdsScanned],
+        visibleTileCountsByThreshold: buildWeeklyVisibleTileCountsByThreshold(state.visibleByThreshold),
+        fullScanRun: buildWeeklyIncrementalFullScanFromState(state),
+        navigation,
+      };
+    }
+
+    const step = processWeeklyIncrementalThresholdStep(state, threshold, run);
+    const lastThresholdCompletedAt = new Date().toISOString();
+    await emitProgress({
+      currentThreshold: threshold,
+      lastThresholdStartedAt,
+      lastThresholdCompletedAt,
+    });
+
+    if (step.kind === 'stop' || step.kind === 'failed') {
+      break;
+    }
+
+    await page.waitForTimeout(400);
+  }
+
+  return {
+    ok: true,
+    error: null,
+    failedThreshold: null,
+    thresholdsCompleted: [...state.thresholdsScanned],
+    visibleTileCountsByThreshold: buildWeeklyVisibleTileCountsByThreshold(state.visibleByThreshold),
+    fullScanRun: buildWeeklyIncrementalFullScanFromState(state),
+    navigation,
+  };
+}
+
 function buildGate8ThresholdTileFromInferenceRow(row, isoDate) {
   const tileMeta = enrichTileMetadataFromIdentityKey(row.identityKey, row.tile);
   return {
@@ -12834,79 +13061,90 @@ async function executeThresholdWeekScanJob(job) {
       navigation: preflightNavigation,
     });
 
-    let recovery;
+    let incrementalScan;
     try {
-      recovery = await withTimeout(
-        runGate8FullScanWithCrashRecovery({
-          isoDate: validateIsoDate,
-          weekMode: true,
-          minThreshold: job.min_threshold,
-          maxThreshold: job.max_threshold,
-          launched: preflight.launched,
-          navigation: preflightNavigation,
-          launchedRef,
-        }),
-        THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS,
-        'weekly_full_scan',
-      );
+      incrementalScan = await runWeeklyIncrementalThresholdFullScan(launched.page, {
+        isoDate: validateIsoDate,
+        navigation: preflightNavigation,
+        minThreshold: job.min_threshold,
+        maxThreshold: job.max_threshold,
+        targetWeekStart: weekStart,
+        validateIsoDate,
+        onProgress: async (patch) => {
+          resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+            mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+            weekStart,
+            targetWeekStart: weekStart,
+            validateIsoDate,
+            startedFullScanAt,
+            dateResults: [],
+            navigation: preflightNavigation,
+            ...patch,
+          });
+        },
+      });
     } catch (scanErr) {
-      if (isWeeklyFullScanTimeoutError(scanErr)) {
-        launched = launchedRef.current;
-        workerError = 'weekly_full_scan_timeout';
-        resultsJson = buildThresholdWeekWriteResultsJson({
-          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
-          weekStart,
-          targetDates: storedTargetDates,
-          fullScanRun: null,
-          dateResults: [],
-          writeMode: resolveGate8WriteMode({
-            thresholdWriteSafe: false,
-            writeEnabled: write,
-            dryRun,
-          }),
-          stage: 'failed',
-          claimedAt: resultsJson.claimedAt ?? null,
-          startedFullScanAt,
-          failedAt: new Date().toISOString(),
-          error: workerError,
-        });
-        await finalizeThresholdScanJob(job.id, {
-          status: 'failed',
-          error: workerError,
-          resultsJson,
-        });
-        finalizedEarly = true;
-        return {
-          ok: false,
-          job_id: job.id,
-          status: 'failed',
-          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
-          weekStart,
-          stage: 'failed',
-          error: workerError,
-        };
-      }
       throw scanErr;
     }
 
-    launched = recovery.launched;
-    fullScanRun = recovery.fullScanRun;
-    scanMeta = {
-      scanAttemptCount: recovery.scanAttemptCount,
-      recoveredFromCrash: recovery.recoveredFromCrash,
-      crashReason: recovery.crashReason,
-      crashed: recovery.crashed,
-    };
-
-    if (recovery.error && !fullScanRun) {
-      workerError = recovery.error;
+    if (!incrementalScan.ok) {
+      launched = preflight.launched || launchedRef.current;
+      workerError = incrementalScan.error || 'weekly_threshold_timeout';
+      resultsJson = buildThresholdWeekWriteResultsJson({
+        mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+        weekStart,
+        targetDates: storedTargetDates,
+        fullScanRun: incrementalScan.fullScanRun,
+        dateResults: [],
+        writeMode: resolveGate8WriteMode({
+          thresholdWriteSafe: false,
+          writeEnabled: write,
+          dryRun,
+        }),
+        stage: 'failed',
+        claimedAt: resultsJson.claimedAt ?? null,
+        startedFullScanAt,
+        failedAt: new Date().toISOString(),
+        error: workerError,
+      });
+      Object.assign(resultsJson, {
+        failedThreshold: incrementalScan.failedThreshold ?? null,
+        thresholdsCompleted: incrementalScan.thresholdsCompleted ?? [],
+        visibleTileCountsByThreshold: incrementalScan.visibleTileCountsByThreshold ?? {},
+        currentThreshold: incrementalScan.failedThreshold ?? null,
+      });
+      await finalizeThresholdScanJob(job.id, {
+        status: 'failed',
+        error: workerError,
+        resultsJson,
+      });
+      finalizedEarly = true;
+      return {
+        ok: false,
+        job_id: job.id,
+        status: 'failed',
+        mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+        weekStart,
+        stage: 'failed',
+        error: workerError,
+        failedThreshold: incrementalScan.failedThreshold ?? null,
+      };
     }
+
+    if (incrementalScan.navigation) {
+      preflightNavigation = incrementalScan.navigation;
+    }
+    fullScanRun = incrementalScan.fullScanRun;
+    scanMeta = {
+      scanAttemptCount: 1,
+      recoveredFromCrash: false,
+      crashReason: null,
+      crashed: false,
+    };
 
     targetDates = resolveThresholdWeekTargetDates(
       weekStart,
-      recovery.navigation?.visibleIsoDatesFromHeaders
-        || preflightNavigation?.visibleIsoDatesFromHeaders
-        || [],
+      preflightNavigation?.visibleIsoDatesFromHeaders || [],
       THRESHOLD_JOB_MAX_DATES,
     );
 
@@ -12921,7 +13159,8 @@ async function executeThresholdWeekScanJob(job) {
       atLeastCount: fullScanRun?.atLeastCount ?? 0,
       thresholdStopReason: fullScanRun?.thresholdStopReason ?? null,
       thresholdScanMaxReached: fullScanRun?.thresholdScanMaxReached ?? null,
-      error: fullScanRun?.error ?? recovery.error ?? null,
+      error: fullScanRun?.error ?? null,
+      thresholdsCompleted: incrementalScan.thresholdsCompleted ?? fullScanRun?.thresholdsScanned ?? [],
       ...scanMeta,
     });
 
