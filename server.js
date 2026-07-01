@@ -13193,6 +13193,193 @@ async function buildThresholdCoverageForRange(startDate, endDate) {
   return { ok: true, startDate, endDate, dates };
 }
 
+function getThresholdStaleMaxAgeMs(isoDate) {
+  const daysAhead = daysFromToday(isoDate);
+  if (daysAhead <= 7) return 6 * 60 * 60 * 1000;
+  if (daysAhead <= 21) return 24 * 60 * 60 * 1000;
+  return 72 * 60 * 60 * 1000;
+}
+
+function computeThresholdAgeHours(latestThresholdScannedAt) {
+  if (!latestThresholdScannedAt) return null;
+  const ageMs = Date.now() - new Date(latestThresholdScannedAt).getTime();
+  return Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10;
+}
+
+function isThresholdCountStale(isoDate, latestThresholdScannedAt) {
+  if (!latestThresholdScannedAt) return false;
+  const ageMs = Date.now() - new Date(latestThresholdScannedAt).getTime();
+  return ageMs > getThresholdStaleMaxAgeMs(isoDate);
+}
+
+function classifyMaintenanceDateStatus(row) {
+  if (!row.hasSavedSessions || row.sessionsCount === 0) {
+    return 'missing_base_sessions';
+  }
+  if (row.thresholdRows === 0) {
+    return 'missing_threshold_counts';
+  }
+  if (isThresholdCountStale(row.isoDate, row.latestThresholdScannedAt)) {
+    return 'stale_threshold_counts';
+  }
+  return 'covered';
+}
+
+function buildWeeklyThresholdDryScanReason(week) {
+  if (week.missingCount && week.staleCount) {
+    return `${week.missingCount} date(s) missing threshold counts, ${week.staleCount} stale`;
+  }
+  if (week.missingCount) {
+    return `${week.missingCount} date(s) missing threshold counts`;
+  }
+  return `${week.staleCount} date(s) with stale threshold counts`;
+}
+
+async function fetchCompletedDryScansReadyToApply() {
+  if (!supabase) return [];
+
+  const now = Date.now();
+  const [dryResult, applyResult] = await Promise.all([
+    supabase
+      .from('threshold_scan_jobs')
+      .select('id, status, mode, dry_run, error, completed_at, results_json')
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_WEEK)
+      .eq('status', 'completed')
+      .eq('dry_run', true)
+      .is('error', null)
+      .order('completed_at', { ascending: false })
+      .limit(200),
+    supabase
+      .from('threshold_scan_jobs')
+      .select('id, status, mode, error, completed_at, results_json')
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
+      .eq('status', 'completed')
+      .is('error', null)
+      .order('completed_at', { ascending: false })
+      .limit(200),
+  ]);
+  if (dryResult.error) throw new Error(dryResult.error.message);
+  if (applyResult.error) throw new Error(applyResult.error.message);
+
+  const appliedWeekAfter = new Map();
+  for (const job of applyResult.data || []) {
+    const weekStart = job.results_json?.weekStart;
+    const completedAt = job.completed_at;
+    if (!weekStart || !completedAt) continue;
+    const ts = new Date(completedAt).getTime();
+    const prev = appliedWeekAfter.get(weekStart);
+    if (!prev || ts > prev) appliedWeekAfter.set(weekStart, ts);
+  }
+
+  const ready = [];
+  for (const job of dryResult.data || []) {
+    const resultsJson = job.results_json || {};
+    if (resultsJson.fullScanContractOk !== true) continue;
+    if (resultsJson.error) continue;
+    const preparedUpdatesCount = resultsJson.preparedUpdatesCount ?? 0;
+    if (!preparedUpdatesCount) continue;
+    const preparedScanCompletedAt = getPreparedScanTimestamp(job);
+    if (!preparedScanCompletedAt) continue;
+    const ageMs = now - new Date(preparedScanCompletedAt).getTime();
+    if (ageMs > THRESHOLD_PREPARED_SCAN_MAX_AGE_MS) continue;
+
+    const weekStart = resultsJson.weekStart ?? null;
+    if (weekStart) {
+      const applyTs = appliedWeekAfter.get(weekStart);
+      if (applyTs && applyTs > new Date(preparedScanCompletedAt).getTime()) continue;
+    }
+
+    ready.push({
+      sourceJobId: job.id,
+      weekStart,
+      preparedUpdatesCount,
+      preparedScanCompletedAt,
+      ageHours: Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10,
+      recommendedApplyBody: {
+        mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+        sourceJobId: job.id,
+        dryRun: false,
+        write: true,
+      },
+    });
+  }
+
+  return ready.sort((a, b) => (a.weekStart || '').localeCompare(b.weekStart || ''));
+}
+
+async function buildMaintenanceRecommendations(startDate, endDate) {
+  const coverage = await buildThresholdCoverageForRange(startDate, endDate);
+  if (!coverage.ok) return coverage;
+
+  const generatedAt = new Date().toISOString();
+  const dates = coverage.dates.map((row) => {
+    const weekStart = getMondayWeekStartIso(row.isoDate);
+    const status = classifyMaintenanceDateStatus({ ...row, isoDate: row.isoDate });
+    return {
+      isoDate: row.isoDate,
+      weekStart,
+      sessionsCount: row.sessionsCount,
+      thresholdRows: row.thresholdRows,
+      hasSavedSessions: row.hasSavedSessions,
+      hasThresholdCounts: row.hasThresholdCounts,
+      latestThresholdScannedAt: row.latestThresholdScannedAt,
+      thresholdAgeHours: computeThresholdAgeHours(row.latestThresholdScannedAt),
+      status,
+    };
+  });
+
+  const weeksNeedingScan = new Map();
+  for (const dateRow of dates) {
+    if (dateRow.status !== 'missing_threshold_counts' && dateRow.status !== 'stale_threshold_counts') {
+      continue;
+    }
+    const existing = weeksNeedingScan.get(dateRow.weekStart) || {
+      weekStart: dateRow.weekStart,
+      dates: [],
+      missingCount: 0,
+      staleCount: 0,
+    };
+    existing.dates.push(dateRow.isoDate);
+    if (dateRow.status === 'missing_threshold_counts') existing.missingCount += 1;
+    if (dateRow.status === 'stale_threshold_counts') existing.staleCount += 1;
+    weeksNeedingScan.set(dateRow.weekStart, existing);
+  }
+
+  const recommendedJobs = [...weeksNeedingScan.values()]
+    .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
+    .map((week) => ({
+      type: 'weekly_threshold_dry_scan',
+      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+      isoDate: week.weekStart,
+      weekStart: week.weekStart,
+      reason: buildWeeklyThresholdDryScanReason(week),
+      dates: week.dates.sort(),
+      dryRun: true,
+      write: false,
+    }));
+
+  const completedDryScansReadyToApply = await fetchCompletedDryScansReadyToApply();
+
+  return {
+    ok: true,
+    startDate,
+    endDate,
+    generatedAt,
+    summary: {
+      totalDates: dates.length,
+      datesWithSessions: dates.filter((d) => d.hasSavedSessions).length,
+      datesMissingBaseSessions: dates.filter((d) => d.status === 'missing_base_sessions').length,
+      datesMissingThresholdCounts: dates.filter((d) => d.status === 'missing_threshold_counts').length,
+      datesWithStaleThresholdCounts: dates.filter((d) => d.status === 'stale_threshold_counts').length,
+      weeksNeedingThresholdScan: recommendedJobs.length,
+      weeksReadyToApply: completedDryScansReadyToApply.length,
+    },
+    dates,
+    recommendedJobs,
+    completedDryScansReadyToApply,
+  };
+}
+
 function resolveThresholdScanJobDates(body = {}) {
   if (Array.isArray(body.dates) && body.dates.length) {
     const dates = body.dates
@@ -13757,10 +13944,16 @@ async function executeThresholdWeekApplyPreparedJob(job) {
 
   const failedDates = dateResults.filter((row) => row.error);
   const summary = summarizeThresholdScanJobResults(dateResults);
-  const finalStatus = failedDates.length === dateResults.length && dateResults.length
-    ? 'failed'
-    : 'completed';
-  const finalError = failedDates.length > 0 ? 'partial_date_failures' : null;
+  const hasError = Boolean(workerError)
+    || failedDates.length > 0
+    || dateResults.length === 0;
+  const finalStatus = hasError ? 'failed' : 'completed';
+  const finalError = workerError
+    || (dateResults.length === 0 ? 'no_date_results' : null)
+    || (failedDates.length === dateResults.length && dateResults.length
+      ? failedDates[0]?.error || 'all_dates_failed'
+      : null)
+    || (failedDates.length > 0 ? 'partial_date_failures' : null);
   const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
 
   resultsJson = buildThresholdWeekWriteResultsJson({
@@ -18432,6 +18625,23 @@ app.get('/api/admin/threshold-coverage', async (req, res) => {
     return res.json(coverage);
   } catch (err) {
     console.error('threshold-coverage error:', err.message);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.get('/api/admin/maintenance-recommendations', async (req, res) => {
+  try {
+    const today = getParkTodayIso();
+    const startDate = normalizeIsoDateParam(req.query.startDate || req.query.start_date) || today;
+    const endDate = normalizeIsoDateParam(req.query.endDate || req.query.end_date)
+      || addDaysToParkIso(today, 60);
+    const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
+    if (!recommendations.ok) {
+      return res.status(400).json(recommendations);
+    }
+    return res.json(recommendations);
+  } catch (err) {
+    console.error('maintenance-recommendations error:', err.message);
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
