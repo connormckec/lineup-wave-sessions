@@ -241,6 +241,25 @@ alter table notification_events add column if not exists previous_slots integer;
 alter table notification_events add column if not exists current_slots integer;
 alter table notification_events add column if not exists event_reason text;
 
+-- Queued Gate 8 threshold micro-update jobs (async worker, max 5 dates per job)
+create table if not exists threshold_scan_jobs (
+  id uuid primary key default gen_random_uuid(),
+  status text not null default 'queued',
+  dates jsonb not null default '[]'::jsonb,
+  min_threshold integer not null default 1,
+  max_threshold integer not null default 20,
+  dry_run boolean not null default true,
+  write_enabled boolean not null default false,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  error text,
+  results_json jsonb
+);
+
+create index if not exists threshold_scan_jobs_status_created_idx
+  on threshold_scan_jobs (status, created_at);
+
 -- scrape_meta jsonb in scrape_snapshots may include:
 --   datesCheckedDuringScrape text[] — ISO dates the scraper has visited
 --   datesCheckedEmpty text[] — ISO dates checked with zero sessions

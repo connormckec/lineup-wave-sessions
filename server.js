@@ -11876,6 +11876,324 @@ function buildGate8BatchDateRange(startDate, endDate, maxDates = GATE8_BATCH_MAX
   return { ok: true, dates, error: null };
 }
 
+function resolveThresholdScanJobDates(body = {}) {
+  if (Array.isArray(body.dates) && body.dates.length) {
+    const dates = body.dates
+      .map((d) => String(d || '').trim())
+      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+      .sort();
+    if (!dates.length) return { ok: false, error: 'invalid_dates', dates: [] };
+    if (dates.length > GATE8_BATCH_MAX_DATES) {
+      return { ok: false, error: 'date_range_exceeds_max', dates, maxDates: GATE8_BATCH_MAX_DATES };
+    }
+    return { ok: true, dates, error: null };
+  }
+
+  const startDate = body.startDate;
+  const endDate = body.endDate;
+  if (startDate && endDate) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      return { ok: false, error: 'invalid_start_or_end_date', dates: [] };
+    }
+    return buildGate8BatchDateRange(startDate, endDate, GATE8_BATCH_MAX_DATES);
+  }
+
+  return { ok: false, error: 'dates_or_start_end_required', dates: [] };
+}
+
+function buildThresholdScanJobDateResult(isoDate, writeRun, extra = {}) {
+  return {
+    isoDate,
+    fullScanContractOk: writeRun?.fullScanContractOk === true,
+    rowsPrepared: writeRun?.rowsPrepared ?? 0,
+    rowsWritten: writeRun?.rowsWritten ?? 0,
+    writeMode: writeRun?.writeMode ?? null,
+    writesPerformed: writeRun?.writesPerformed === true,
+    exactCount: writeRun?.exactCount ?? 0,
+    atLeastCount: writeRun?.atLeastCount ?? 0,
+    thresholdStopReason: writeRun?.thresholdStopReason ?? null,
+    scanAttemptCount: writeRun?.scanAttemptCount ?? null,
+    recoveredFromCrash: writeRun?.recoveredFromCrash === true,
+    crashReason: writeRun?.crashReason ?? null,
+    crashed: writeRun?.crashed === true,
+    error: writeRun?.error ?? null,
+    durationMs: extra.durationMs ?? null,
+  };
+}
+
+function summarizeThresholdScanJobResults(dateResults) {
+  const totalRowsPrepared = dateResults.reduce((sum, row) => sum + (row.rowsPrepared || 0), 0);
+  const totalRowsWritten = dateResults.reduce((sum, row) => sum + (row.rowsWritten || 0), 0);
+  const failedDates = dateResults.filter((row) => row.error);
+  return {
+    totalRowsPrepared,
+    totalRowsWritten,
+    writesPerformed: totalRowsWritten > 0,
+    failedDateCount: failedDates.length,
+  };
+}
+
+async function enqueueThresholdScanJob({
+  dates,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
+  dryRun = true,
+  writeEnabled = false,
+} = {}) {
+  if (!supabase) {
+    throw new Error('supabase_not_configured');
+  }
+  const minT = Math.max(1, Number(minThreshold) || 1);
+  const maxT = Math.max(
+    minT,
+    Math.min(Number(maxThreshold) || THRESHOLD_SCAN_MAX_DEFAULT, THRESHOLD_SCAN_MAX_THRESHOLDS_PER_PAGE),
+  );
+  const payload = {
+    status: 'queued',
+    dates,
+    min_threshold: minT,
+    max_threshold: maxT,
+    dry_run: dryRun !== false,
+    write_enabled: writeEnabled === true,
+    results_json: {
+      datesRequested: dates,
+      dateResults: [],
+      totalRowsPrepared: 0,
+      totalRowsWritten: 0,
+      writesPerformed: false,
+    },
+  };
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .insert(payload)
+    .select('id, status, dates, min_threshold, max_threshold, dry_run, write_enabled, created_at')
+    .single();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+async function claimNextThresholdScanJob() {
+  if (!supabase) {
+    return { claimed: null, reason: 'supabase_not_configured' };
+  }
+
+  const { count: runningCount, error: runningError } = await supabase
+    .from('threshold_scan_jobs')
+    .select('*', { count: 'exact', head: true })
+    .eq('status', 'running');
+  if (runningError) {
+    return { claimed: null, reason: runningError.message };
+  }
+  if ((runningCount || 0) > 0) {
+    return { claimed: null, reason: 'job_already_running' };
+  }
+
+  const { data: nextJob, error: nextError } = await supabase
+    .from('threshold_scan_jobs')
+    .select('*')
+    .eq('status', 'queued')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (nextError) {
+    return { claimed: null, reason: nextError.message };
+  }
+  if (!nextJob) {
+    return { claimed: null, reason: 'no_queued_jobs' };
+  }
+
+  const { data: claimed, error: claimError } = await supabase
+    .from('threshold_scan_jobs')
+    .update({
+      status: 'running',
+      started_at: new Date().toISOString(),
+    })
+    .eq('id', nextJob.id)
+    .eq('status', 'queued')
+    .select('*')
+    .maybeSingle();
+  if (claimError) {
+    return { claimed: null, reason: claimError.message };
+  }
+  if (!claimed) {
+    return { claimed: null, reason: 'claim_race_lost' };
+  }
+  return { claimed, reason: null };
+}
+
+async function persistThresholdScanJobProgress(jobId, resultsJson) {
+  if (!supabase || !jobId) return;
+  const { error } = await supabase
+    .from('threshold_scan_jobs')
+    .update({ results_json: resultsJson })
+    .eq('id', jobId);
+  if (error) throw new Error(error.message);
+}
+
+async function finalizeThresholdScanJob(jobId, {
+  status,
+  error = null,
+  resultsJson,
+} = {}) {
+  if (!supabase || !jobId) return;
+  const { error: updateError } = await supabase
+    .from('threshold_scan_jobs')
+    .update({
+      status,
+      completed_at: new Date().toISOString(),
+      error,
+      results_json: resultsJson,
+    })
+    .eq('id', jobId);
+  if (updateError) throw new Error(updateError.message);
+}
+
+async function executeThresholdScanJob(job) {
+  const dates = Array.isArray(job.dates) ? job.dates : [];
+  const dryRun = job.dry_run !== false;
+  const writeEnabled = job.write_enabled === true;
+  const write = writeEnabled && !dryRun;
+  const dateResults = [];
+  let workerError = null;
+
+  for (const isoDate of dates) {
+    const dateStarted = Date.now();
+    let launched = null;
+    try {
+      await ensureSessionsForStatus();
+      const recovery = await runGate8DateWriteContractWithRecovery({
+        isoDate,
+        weekMode: true,
+        minThreshold: job.min_threshold,
+        maxThreshold: job.max_threshold,
+        dryRun,
+        write,
+        launched: null,
+      });
+      launched = recovery.launched;
+      const dateResult = buildThresholdScanJobDateResult(isoDate, recovery.writeRun, {
+        durationMs: Date.now() - dateStarted,
+      });
+      dateResults.push(dateResult);
+    } catch (err) {
+      dateResults.push({
+        isoDate,
+        fullScanContractOk: false,
+        rowsPrepared: 0,
+        rowsWritten: 0,
+        writeMode: resolveGate8WriteMode({
+          thresholdWriteSafe: false,
+          writeEnabled,
+          dryRun,
+        }),
+        writesPerformed: false,
+        exactCount: 0,
+        atLeastCount: 0,
+        thresholdStopReason: null,
+        scanAttemptCount: 1,
+        recoveredFromCrash: false,
+        crashReason: err.message || String(err),
+        crashed: isPlaywrightCrashError(err),
+        error: err.message || String(err),
+        durationMs: Date.now() - dateStarted,
+      });
+      workerError = err.message || String(err);
+    } finally {
+      await safeCloseBrowser(launched);
+    }
+
+    const summary = summarizeThresholdScanJobResults(dateResults);
+    await persistThresholdScanJobProgress(job.id, {
+      datesRequested: dates,
+      dateResults,
+      ...summary,
+      lastCompletedIsoDate: isoDate,
+    });
+  }
+
+  const summary = summarizeThresholdScanJobResults(dateResults);
+  const resultsJson = {
+    datesRequested: dates,
+    dateResults,
+    ...summary,
+  };
+  const allFailed = dateResults.length > 0 && dateResults.every((row) => row.error);
+  const finalStatus = allFailed ? 'failed' : 'completed';
+  const finalError = allFailed
+    ? (workerError || 'all_dates_failed')
+    : (summary.failedDateCount > 0 ? 'partial_date_failures' : null);
+
+  await finalizeThresholdScanJob(job.id, {
+    status: finalStatus,
+    error: finalError,
+    resultsJson,
+  });
+
+  return {
+    ok: finalStatus === 'completed',
+    job_id: job.id,
+    status: finalStatus,
+    datesRequested: dates,
+    dateResults,
+    ...summary,
+    error: finalError,
+  };
+}
+
+async function runThresholdScanJobWorker() {
+  if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'scrape_in_progress',
+    };
+  }
+
+  let claimedJob = null;
+  try {
+    const claim = await claimNextThresholdScanJob();
+    if (!claim.claimed) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: claim.reason,
+      };
+    }
+
+    claimedJob = claim.claimed;
+    const result = await executeThresholdScanJob(claimedJob);
+    return {
+      ok: result.ok,
+      skipped: false,
+      ...result,
+    };
+  } catch (err) {
+    if (claimedJob?.id) {
+      try {
+        await finalizeThresholdScanJob(claimedJob.id, {
+          status: 'failed',
+          error: err.message || String(err),
+          resultsJson: claimedJob.results_json || {
+            datesRequested: claimedJob.dates || [],
+            dateResults: [],
+          },
+        });
+      } catch (finalizeErr) {
+        console.error('threshold scan job finalize on worker error:', finalizeErr.message);
+      }
+    }
+    return {
+      ok: false,
+      skipped: false,
+      job_id: claimedJob?.id ?? null,
+      error: err.message || String(err),
+      crashed: isPlaywrightCrashError(err),
+    };
+  } finally {
+    releaseScrapeLock();
+  }
+}
+
 async function runDebugEntriesLeftThresholdWriteBatchContract({
   startDate,
   endDate,
@@ -16038,6 +16356,72 @@ app.post('/api/admin/backfill-available-dates', async (req, res) => {
       error: e.message,
       errors: [{ error: e.message }],
       mode,
+    });
+  }
+});
+
+app.post('/api/admin/threshold-scan-jobs', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ error: 'supabase_not_configured' });
+    }
+
+    const resolved = resolveThresholdScanJobDates(req.body || {});
+    if (!resolved.ok) {
+      return res.status(400).json({
+        error: resolved.error,
+        maxDates: resolved.maxDates ?? GATE8_BATCH_MAX_DATES,
+      });
+    }
+
+    const minThreshold = req.body?.minThreshold != null
+      ? Math.max(1, parseInt(req.body.minThreshold, 10) || 1)
+      : 1;
+    const maxThreshold = req.body?.maxThreshold != null
+      ? Math.max(1, parseInt(req.body.maxThreshold, 10) || THRESHOLD_SCAN_MAX_DEFAULT)
+      : THRESHOLD_SCAN_MAX_DEFAULT;
+    const dryRun = req.body?.dryRun !== false;
+    const writeEnabled = req.body?.write === true || req.body?.writeEnabled === true;
+
+    const job = await enqueueThresholdScanJob({
+      dates: resolved.dates,
+      minThreshold,
+      maxThreshold,
+      dryRun,
+      writeEnabled,
+    });
+
+    return res.json({
+      ok: true,
+      job_id: job.id,
+      status: job.status,
+      dates: job.dates,
+      minThreshold: job.min_threshold,
+      maxThreshold: job.max_threshold,
+      dryRun: job.dry_run,
+      writeEnabled: job.write_enabled,
+      createdAt: job.created_at,
+    });
+  } catch (err) {
+    console.error('threshold-scan-jobs enqueue error:', err.message);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ error: 'supabase_not_configured' });
+    }
+
+    const result = await runThresholdScanJobWorker();
+    return res.json(result);
+  } catch (err) {
+    console.error('run-threshold-scan-job error:', err.message);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || String(err),
+      crashed: isPlaywrightCrashError(err),
     });
   }
 });
