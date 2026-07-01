@@ -62,6 +62,7 @@ const THRESHOLD_JOB_MAX_DATES = Math.max(1, parseInt(process.env.THRESHOLD_JOB_M
 const THRESHOLD_JOB_MAX_THRESHOLD = Math.max(1, parseInt(process.env.THRESHOLD_JOB_MAX_THRESHOLD || '20', 10));
 const THRESHOLD_SCAN_JOB_MODE_DATE = 'date_threshold_write';
 const THRESHOLD_SCAN_JOB_MODE_WEEK = 'threshold_week_write_contract';
+const THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS || '480000', 10);
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -11784,6 +11785,7 @@ async function runGate8FullScanWithCrashRecovery({
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
   launched: initialLaunched = null,
   navigation: initialNavigation = null,
+  launchedRef = null,
 } = {}) {
   let launched = initialLaunched;
   let navigation = initialNavigation;
@@ -11791,6 +11793,7 @@ async function runGate8FullScanWithCrashRecovery({
   const recovery = await withGate8PlaywrightCrashRecovery(async () => {
     if (!launched) {
       launched = await openGate8ThresholdBrowserSession();
+      if (launchedRef) launchedRef.current = launched;
     }
     if (!navigation) {
       const navResult = await navigateGate8ThresholdDate(launched.page, isoDate, weekMode);
@@ -11810,6 +11813,7 @@ async function runGate8FullScanWithCrashRecovery({
     relaunch: async () => {
       await safeCloseBrowser(launched);
       launched = await openGate8ThresholdBrowserSession();
+      if (launchedRef) launchedRef.current = launched;
       navigation = null;
     },
   });
@@ -11957,12 +11961,22 @@ function buildThresholdWeekWriteResultsJson({
   crashReason,
   crashed,
   error,
+  stage = null,
+  claimedAt = null,
+  startedFullScanAt = null,
+  completedFullScanAt = null,
+  failedAt = null,
 } = {}) {
   const summary = summarizeThresholdScanJobResults(dateResults);
   return {
     mode,
     weekStart,
     targetDates,
+    stage,
+    claimedAt,
+    startedFullScanAt,
+    completedFullScanAt,
+    failedAt,
     thresholdsScanned: fullScanRun?.thresholdsScanned ?? [],
     visibleTileCountsByThreshold: fullScanRun?.visibleTileCountsByThreshold ?? {},
     fullScanContractOk: fullScanRun?.fullScanContractOk === true,
@@ -11975,10 +11989,25 @@ function buildThresholdWeekWriteResultsJson({
     crashReason: crashReason ?? null,
     crashed: crashed === true,
     writeMode,
-    dateResults,
+    dateResults: dateResults ?? [],
     ...summary,
     error: error ?? fullScanRun?.error ?? null,
   };
+}
+
+function isWeeklyFullScanTimeoutError(err) {
+  const msg = String(err?.message || err || '');
+  return msg.includes('weekly_full_scan_timeout');
+}
+
+async function persistThresholdWeekJobStage(jobId, baseJson, patch = {}) {
+  const resultsJson = {
+    ...(baseJson || {}),
+    ...patch,
+    dateResults: patch.dateResults ?? baseJson?.dateResults ?? [],
+  };
+  await persistThresholdScanJobProgress(jobId, resultsJson);
+  return resultsJson;
 }
 
 async function buildThresholdCoverageForRange(startDate, endDate) {
@@ -12436,16 +12465,87 @@ async function executeThresholdWeekScanJob(job) {
     crashed: false,
   };
   let workerError = null;
+  let resultsJson = {
+    ...(job.results_json || {}),
+    mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+    weekStart,
+    targetDates: storedTargetDates,
+    dateResults: [],
+  };
+  let startedFullScanAt = null;
+  let finalizedEarly = false;
 
   try {
-    await ensureSessionsForStatus();
-    const recovery = await runGate8FullScanWithCrashRecovery({
-      isoDate: anchorIsoDate || weekStart,
-      weekMode: true,
-      minThreshold: job.min_threshold,
-      maxThreshold: job.max_threshold,
-      launched: null,
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'claimed',
+      claimedAt: new Date().toISOString(),
     });
+
+    startedFullScanAt = new Date().toISOString();
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+      weekStart,
+      stage: 'starting_full_scan',
+      startedFullScanAt,
+      dateResults: [],
+    });
+
+    await ensureSessionsForStatus();
+    const launchedRef = { current: null };
+    let recovery;
+    try {
+      recovery = await withTimeout(
+        runGate8FullScanWithCrashRecovery({
+          isoDate: anchorIsoDate || weekStart,
+          weekMode: true,
+          minThreshold: job.min_threshold,
+          maxThreshold: job.max_threshold,
+          launched: null,
+          launchedRef,
+        }),
+        THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS,
+        'weekly_full_scan',
+      );
+    } catch (scanErr) {
+      if (isWeeklyFullScanTimeoutError(scanErr)) {
+        launched = launchedRef.current;
+        workerError = 'weekly_full_scan_timeout';
+        resultsJson = buildThresholdWeekWriteResultsJson({
+          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+          weekStart,
+          targetDates: storedTargetDates,
+          fullScanRun: null,
+          dateResults: [],
+          writeMode: resolveGate8WriteMode({
+            thresholdWriteSafe: false,
+            writeEnabled: write,
+            dryRun,
+          }),
+          stage: 'failed',
+          claimedAt: resultsJson.claimedAt ?? null,
+          startedFullScanAt,
+          failedAt: new Date().toISOString(),
+          error: workerError,
+        });
+        await finalizeThresholdScanJob(job.id, {
+          status: 'failed',
+          error: workerError,
+          resultsJson,
+        });
+        finalizedEarly = true;
+        return {
+          ok: false,
+          job_id: job.id,
+          status: 'failed',
+          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+          weekStart,
+          stage: 'failed',
+          error: workerError,
+        };
+      }
+      throw scanErr;
+    }
+
     launched = recovery.launched;
     fullScanRun = recovery.fullScanRun;
     scanMeta = {
@@ -12465,11 +12565,31 @@ async function executeThresholdWeekScanJob(job) {
       THRESHOLD_JOB_MAX_DATES,
     );
 
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'full_scan_complete',
+      completedFullScanAt: new Date().toISOString(),
+      targetDates,
+      fullScanContractOk: fullScanRun?.fullScanContractOk === true,
+      thresholdsScanned: fullScanRun?.thresholdsScanned ?? [],
+      visibleTileCountsByThreshold: fullScanRun?.visibleTileCountsByThreshold ?? {},
+      exactCount: fullScanRun?.exactCount ?? 0,
+      atLeastCount: fullScanRun?.atLeastCount ?? 0,
+      thresholdStopReason: fullScanRun?.thresholdStopReason ?? null,
+      thresholdScanMaxReached: fullScanRun?.thresholdScanMaxReached ?? null,
+      error: fullScanRun?.error ?? recovery.error ?? null,
+      ...scanMeta,
+    });
+
     const thresholdWriteSafe = fullScanRun?.fullScanContractOk === true;
     const writeMode = resolveGate8WriteMode({
       thresholdWriteSafe,
       writeEnabled: write,
       dryRun,
+    });
+
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+      stage: 'processing_dates',
+      writeMode,
     });
 
     if (!thresholdWriteSafe) {
@@ -12479,13 +12599,17 @@ async function executeThresholdWeekScanJob(job) {
           writeMode,
           error: workerError,
         }));
-        await persistThresholdScanJobProgress(job.id, buildThresholdWeekWriteResultsJson({
+        resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
           mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
           weekStart,
           targetDates,
           fullScanRun,
           dateResults,
           writeMode,
+          stage: 'processing_dates',
+          claimedAt: resultsJson.claimedAt ?? null,
+          startedFullScanAt,
+          completedFullScanAt: resultsJson.completedFullScanAt ?? null,
           ...scanMeta,
           error: workerError,
         }));
@@ -12519,13 +12643,17 @@ async function executeThresholdWeekScanJob(job) {
           error: dateError,
         }));
 
-        await persistThresholdScanJobProgress(job.id, buildThresholdWeekWriteResultsJson({
+        resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
           mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
           weekStart,
           targetDates,
           fullScanRun,
           dateResults,
           writeMode,
+          stage: 'processing_dates',
+          claimedAt: resultsJson.claimedAt ?? null,
+          startedFullScanAt,
+          completedFullScanAt: resultsJson.completedFullScanAt ?? null,
           ...scanMeta,
           error: null,
         }));
@@ -12548,7 +12676,27 @@ async function executeThresholdWeekScanJob(job) {
     await safeCloseBrowser(launched);
   }
 
-  const resultsJson = buildThresholdWeekWriteResultsJson({
+  if (finalizedEarly) {
+    return {
+      ok: false,
+      job_id: job.id,
+      status: 'failed',
+      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+      weekStart,
+      stage: 'failed',
+      error: workerError,
+    };
+  }
+
+  const scanFailed = fullScanRun?.fullScanContractOk !== true;
+  const failedDates = dateResults.filter((row) => row.error);
+  const finalStatus = scanFailed ? 'failed' : 'completed';
+  const finalError = scanFailed
+    ? (workerError || fullScanRun?.error || 'full_scan_contract_failed')
+    : (failedDates.length > 0 ? 'partial_date_failures' : null);
+  const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
+
+  resultsJson = buildThresholdWeekWriteResultsJson({
     mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
     weekStart,
     targetDates,
@@ -12559,16 +12707,14 @@ async function executeThresholdWeekScanJob(job) {
       writeEnabled: write,
       dryRun,
     }),
+    stage: finalStage,
+    claimedAt: resultsJson.claimedAt ?? null,
+    startedFullScanAt,
+    completedFullScanAt: resultsJson.completedFullScanAt ?? null,
+    failedAt: finalStage === 'failed' ? new Date().toISOString() : null,
     ...scanMeta,
-    error: fullScanRun?.fullScanContractOk === true ? null : (workerError || fullScanRun?.error || null),
+    error: fullScanRun?.fullScanContractOk === true ? finalError : (workerError || fullScanRun?.error || finalError),
   });
-
-  const scanFailed = fullScanRun?.fullScanContractOk !== true;
-  const failedDates = dateResults.filter((row) => row.error);
-  const finalStatus = scanFailed ? 'failed' : 'completed';
-  const finalError = scanFailed
-    ? (workerError || fullScanRun?.error || 'full_scan_contract_failed')
-    : (failedDates.length > 0 ? 'partial_date_failures' : null);
 
   await finalizeThresholdScanJob(job.id, {
     status: finalStatus,
@@ -12584,6 +12730,7 @@ async function executeThresholdWeekScanJob(job) {
     weekStart,
     targetDates,
     dateResults,
+    stage: finalStage,
     ...summarizeThresholdScanJobResults(dateResults),
     fullScanContractOk: fullScanRun?.fullScanContractOk === true,
     error: finalError,
