@@ -12099,6 +12099,411 @@ function buildWeeklyPreflightNavigation(headerState, navClicks, navSteps) {
   };
 }
 
+function formatWeeklyVisibleHeaderLabel(headerState, fingerprint = null) {
+  if (headerState?.rawMonthLabel) return headerState.rawMonthLabel;
+  if (headerState?.visibleWeekStart && headerState?.visibleWeekEnd) {
+    return `${headerState.visibleWeekStart}..${headerState.visibleWeekEnd}`;
+  }
+  const headers = headerState?.visibleIsoDatesFromHeaders || [];
+  if (headers.length) return `${headers[0]}..${headers[headers.length - 1]}`;
+  if (fingerprint?.label) return fingerprint.label;
+  return null;
+}
+
+async function collectWeeklyNavButtonCandidates(page, direction = 'next') {
+  return page.evaluate(({ direction: dir }) => {
+    function isVisible(el) {
+      if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      const style = window.getComputedStyle(el);
+      if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') {
+        return false;
+      }
+      return true;
+    }
+
+    function normText(el) {
+      return String(el.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    const nextPatterns = [
+      /next/i, /forward/i, /right/i, /chevron-right/i, /arrow-right/i, /glyphicon-chevron-right/,
+      /[›→»]/,
+    ];
+    const prevPatterns = [
+      /prev/i, /previous/i, /back/i, /left/i, /chevron-left/i, /arrow-left/i, /glyphicon-chevron-left/,
+      /[‹←«]/,
+    ];
+    const patterns = dir === 'prev' ? prevPatterns : nextPatterns;
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '.btn',
+      'span.glyphicon',
+      'i.glyphicon',
+      '[class*="chevron"]',
+      '[class*="arrow"]',
+    ];
+    const seen = new Set();
+    const candidates = [];
+
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const text = normText(el);
+        const ariaLabel = String(el.getAttribute('aria-label') || '').trim();
+        const title = String(el.getAttribute('title') || '').trim();
+        const className = typeof el.className === 'string' ? el.className : '';
+        const classLower = className.toLowerCase();
+        const disabled = el.disabled === true
+          || el.getAttribute('aria-disabled') === 'true'
+          || el.classList.contains('disabled')
+          || !!el.closest('.disabled');
+        const haystack = `${text} ${ariaLabel} ${title} ${classLower}`.toLowerCase();
+
+        let score = 0;
+        for (const pattern of patterns) {
+          if (pattern.test(haystack)) score += 10;
+        }
+        if (dir === 'next' && classLower.includes('chevron-right')) score += 50;
+        if (dir === 'prev' && classLower.includes('chevron-left')) score += 50;
+        if (dir === 'next' && classLower.includes('glyphicon-chevron-right')) score += 60;
+        if (dir === 'prev' && classLower.includes('glyphicon-chevron-left')) score += 60;
+        if (score <= 0) continue;
+
+        const key = `${sel}|${Math.round(rect.x)}|${Math.round(rect.y)}|${text.slice(0, 24)}|${classLower.slice(0, 40)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        let selector = sel;
+        if (el.id) selector = `#${el.id}`;
+        else if (className) {
+          const primary = className.split(/\s+/).find((cls) => cls && !cls.startsWith('ng-'));
+          if (primary) selector = `${el.tagName.toLowerCase()}.${primary}`;
+        }
+
+        candidates.push({
+          direction: dir,
+          text: text.slice(0, 120) || null,
+          ariaLabel: ariaLabel || null,
+          title: title || null,
+          className: className.slice(0, 200) || null,
+          tagName: el.tagName.toLowerCase(),
+          disabled,
+          visible: true,
+          score,
+          selector,
+          boundingBox: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+        });
+      }
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.slice(0, 25);
+  }, { direction });
+}
+
+async function waitForWeeklyCalendarGridChange(page, beforeSig, timeoutMs = 12000) {
+  try {
+    await page.waitForFunction(
+      (prevSig) => {
+        const timestamps = [];
+        document.querySelectorAll('div.dynamic-cal-booking-ts').forEach((el) => {
+          const m = el.className.match(/booking-agenda-clickable_(\d+)_/);
+          if (m) timestamps.push(+m[1]);
+        });
+        timestamps.sort((a, b) => a - b);
+        const sig = timestamps.slice(0, 8).join(',');
+        return sig !== prevSig || timestamps.length === 0;
+      },
+      beforeSig,
+      { timeout: timeoutMs },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function weeklyCalendarGridChanged(beforeFingerprint, afterFingerprint) {
+  if (!beforeFingerprint || !afterFingerprint) return false;
+  if (afterFingerprint.sig !== beforeFingerprint.sig) return true;
+  if (afterFingerprint.firstTs !== beforeFingerprint.firstTs) return true;
+  return afterFingerprint.count === 0;
+}
+
+async function clickWeeklyNavCandidateElement(page, candidate) {
+  return page.evaluate(({ candidate: c }) => {
+    function isVisible(el) {
+      if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      const style = window.getComputedStyle(el);
+      return style.visibility !== 'hidden' && style.display !== 'none' && style.pointerEvents !== 'none';
+    }
+
+    const selectors = [
+      'button', 'a', '[role="button"]', '.btn', 'span.glyphicon', 'i.glyphicon',
+      '[class*="chevron"]', '[class*="arrow"]',
+    ];
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const text = String(el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const ariaLabel = String(el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const title = String(el.getAttribute('title') || '').trim().toLowerCase();
+        const className = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+        const bb = c.boundingBox || {};
+        const posMatch = bb.x == null || (
+          Math.abs(Math.round(rect.x) - bb.x) <= 2
+          && Math.abs(Math.round(rect.y) - bb.y) <= 2
+        );
+        const textMatch = !c.text || text.includes(String(c.text).slice(0, 20).toLowerCase());
+        const metaMatch = (!c.ariaLabel || ariaLabel === String(c.ariaLabel).toLowerCase())
+          && (!c.className || className.includes(String(c.className).slice(0, 40).toLowerCase()));
+        if (posMatch && textMatch && metaMatch) {
+          const target = el.closest('a, button, [role="button"]') || el;
+          target.click();
+          return { ok: true, tagName: target.tagName.toLowerCase(), selector: sel };
+        }
+      }
+    }
+    return { ok: false };
+  }, { candidate });
+}
+
+async function tryWeeklyGateChevronClick(page, direction) {
+  const selector = direction === 'next' ? '.glyphicon-chevron-right' : '.glyphicon-chevron-left';
+  const chevron = page.locator(selector).first();
+  if (!await chevron.count()) {
+    return { clickAttempted: false, clickSucceeded: false, selectorUsed: selector };
+  }
+
+  const clickable = await chevron.evaluate((el) =>
+    !el.classList.contains('disabled')
+    && !el.closest('.disabled')
+    && window.getComputedStyle(el).visibility !== 'hidden'
+    && window.getComputedStyle(el).display !== 'none').catch(() => false);
+  if (!clickable) {
+    return {
+      clickAttempted: true,
+      clickSucceeded: false,
+      selectorUsed: selector,
+      reason: 'gate_chevron_not_clickable',
+    };
+  }
+
+  try {
+    await chevron.click({ timeout: 5000 });
+    return {
+      clickAttempted: true,
+      clickSucceeded: true,
+      selectorUsed: selector,
+      clickMethod: 'gate_playwright_click',
+    };
+  } catch {
+    try {
+      await chevron.evaluate((el) => {
+        const target = el.closest('a, button, [role="button"]') || el;
+        target.click();
+      });
+      return {
+        clickAttempted: true,
+        clickSucceeded: true,
+        selectorUsed: selector,
+        clickMethod: 'gate_js_click_fallback',
+      };
+    } catch (err) {
+      return {
+        clickAttempted: true,
+        clickSucceeded: false,
+        selectorUsed: selector,
+        reason: err.message || String(err),
+      };
+    }
+  }
+}
+
+async function tryWeeklyPlaywrightLabelNavClick(page, direction) {
+  const namePatterns = direction === 'next'
+    ? [/next/i, /forward/i, /right/i, /›/]
+    : [/prev/i, /previous/i, /back/i, /left/i, /‹/];
+  const locators = [];
+  for (const pattern of namePatterns) {
+    locators.push(page.getByRole('button', { name: pattern }).first());
+    locators.push(page.getByRole('link', { name: pattern }).first());
+  }
+  if (direction === 'next') {
+    locators.push(page.locator('[aria-label*="next" i]').first());
+    locators.push(page.locator('[title*="next" i]').first());
+  } else {
+    locators.push(page.locator('[aria-label*="prev" i]').first());
+    locators.push(page.locator('[title*="prev" i]').first());
+  }
+
+  for (const locator of locators) {
+    try {
+      if (!await locator.count()) continue;
+      if (!await locator.isVisible().catch(() => false)) continue;
+      await locator.click({ timeout: 5000 });
+      return {
+        clickAttempted: true,
+        clickSucceeded: true,
+        selectorUsed: 'playwright_label_or_aria',
+        clickMethod: 'label_playwright_click',
+      };
+    } catch {
+      try {
+        if (!await locator.count()) continue;
+        await locator.evaluate((el) => {
+          const target = el.closest('a, button, [role="button"]') || el;
+          target.click();
+        });
+        return {
+          clickAttempted: true,
+          clickSucceeded: true,
+          selectorUsed: 'playwright_label_or_aria',
+          clickMethod: 'label_js_click_fallback',
+        };
+      } catch {
+        // try next locator
+      }
+    }
+  }
+  return { clickAttempted: false, clickSucceeded: false, selectorUsed: 'playwright_label_or_aria' };
+}
+
+async function tryWeeklyCalendarNavClick(page, direction, headerState) {
+  const beforeFingerprint = await getCalendarFingerprint(page);
+  const beforeHeader = formatWeeklyVisibleHeaderLabel(headerState, beforeFingerprint);
+  const beforeTileCount = beforeFingerprint.count;
+  const beforeSig = beforeFingerprint.sig;
+
+  const navButtonCandidates = await collectWeeklyNavButtonCandidates(page, direction);
+  const enabledCandidates = navButtonCandidates.filter((c) => !c.disabled);
+  const attempts = [{ kind: 'gate_chevron' }, { kind: 'label_aria' }];
+  for (const candidate of enabledCandidates) {
+    attempts.push({ kind: 'candidate', candidate });
+  }
+
+  let anyClickSucceeded = false;
+  let anyClickAttempted = false;
+  let lastClickMethod = null;
+  let lastSelectorUsed = null;
+  const clickAttempts = [];
+
+  for (const attempt of attempts) {
+    let clickResult = { clickAttempted: false, clickSucceeded: false };
+    if (attempt.kind === 'gate_chevron') {
+      clickResult = await tryWeeklyGateChevronClick(page, direction);
+    } else if (attempt.kind === 'label_aria') {
+      clickResult = await tryWeeklyPlaywrightLabelNavClick(page, direction);
+    } else {
+      const candidate = attempt.candidate;
+      clickResult = { clickAttempted: true, clickSucceeded: false, selectorUsed: candidate.selector };
+      try {
+        const locator = page.locator(candidate.selector).first();
+        if (await locator.count()) {
+          await locator.click({ timeout: 5000 });
+          clickResult.clickSucceeded = true;
+          clickResult.clickMethod = 'candidate_playwright_click';
+        }
+      } catch {
+        // fall through to JS click
+      }
+      if (!clickResult.clickSucceeded) {
+        const jsClick = await clickWeeklyNavCandidateElement(page, candidate);
+        if (jsClick?.ok) {
+          clickResult.clickSucceeded = true;
+          clickResult.clickMethod = 'candidate_js_click_fallback';
+          clickResult.selectorUsed = jsClick.selector || candidate.selector;
+        }
+      }
+    }
+
+    if (clickResult.clickAttempted) anyClickAttempted = true;
+
+    clickAttempts.push({
+      kind: attempt.kind,
+      selectorUsed: clickResult.selectorUsed || attempt.candidate?.selector || null,
+      clickAttempted: clickResult.clickAttempted,
+      clickSucceeded: clickResult.clickSucceeded,
+      clickMethod: clickResult.clickMethod || null,
+      reason: clickResult.reason || null,
+    });
+
+    if (!clickResult.clickAttempted || !clickResult.clickSucceeded) continue;
+
+    anyClickSucceeded = true;
+    lastClickMethod = clickResult.clickMethod || null;
+    lastSelectorUsed = clickResult.selectorUsed || null;
+
+    await page.waitForTimeout(2000);
+    const gridChanged = await waitForWeeklyCalendarGridChange(page, beforeSig);
+    const afterFingerprint = await getCalendarFingerprint(page);
+    const afterHeader = formatWeeklyVisibleHeaderLabel(null, afterFingerprint);
+    const changed = gridChanged && weeklyCalendarGridChanged(beforeFingerprint, afterFingerprint);
+
+    if (changed) {
+      return {
+        clicked: true,
+        beforeHeader,
+        beforeTileCount,
+        afterHeader,
+        afterTileCount: afterFingerprint.count,
+        gridChanged: true,
+        navButtonCandidates,
+        navClickFailureReason: null,
+        selectorUsed: lastSelectorUsed,
+        clickMethod: lastClickMethod,
+        clickAttempts,
+      };
+    }
+  }
+
+  const afterFingerprint = await getCalendarFingerprint(page);
+  const gateAttempt = clickAttempts.find((a) => a.kind === 'gate_chevron');
+  const gateChevronPresent = gateAttempt?.clickAttempted === true
+    || navButtonCandidates.some((c) => (c.className || '').includes('chevron'));
+  let navClickFailureReason;
+  if (!navButtonCandidates.length && !gateChevronPresent && !anyClickAttempted) {
+    navClickFailureReason = direction === 'next'
+      ? 'no_next_button_candidate_found'
+      : 'no_previous_button_candidate_found';
+  } else if (!anyClickSucceeded) {
+    navClickFailureReason = direction === 'next'
+      ? 'next_button_click_failed'
+      : 'previous_button_click_failed';
+  } else {
+    navClickFailureReason = direction === 'next'
+      ? 'next_button_clicked_but_grid_did_not_change'
+      : 'previous_button_clicked_but_grid_did_not_change';
+  }
+
+  return {
+    clicked: false,
+    beforeHeader,
+    beforeTileCount,
+    afterHeader: formatWeeklyVisibleHeaderLabel(null, afterFingerprint),
+    afterTileCount: afterFingerprint.count,
+    gridChanged: false,
+    navButtonCandidates,
+    navClickFailureReason,
+    selectorUsed: lastSelectorUsed,
+    clickMethod: lastClickMethod,
+    clickAttempts,
+  };
+}
+
 async function navigateWeeklyJobToTargetWeek(page, {
   targetWeekStart,
   validateIsoDate,
@@ -12130,27 +12535,44 @@ async function navigateWeeklyJobToTargetWeek(page, {
 
     if (!direction || direction === 'stop') break;
 
-    const before = await getCalendarFingerprint(page);
-    const clicked = direction === 'next'
-      ? await advanceCalendarWeek(page)
-      : await retreatCalendarWeek(page);
+    const navClick = direction === 'next'
+      ? await tryWeeklyCalendarNavClick(page, 'next', headerState)
+      : await tryWeeklyCalendarNavClick(page, 'prev', headerState);
 
     const stepRecord = {
       step: step + 1,
       direction,
-      clicked,
-      beforeHeader: before.label || null,
-      beforeTileCount: before.count,
+      clicked: navClick.clicked === true,
+      beforeHeader: navClick.beforeHeader,
+      beforeTileCount: navClick.beforeTileCount,
+      afterHeader: navClick.afterHeader ?? null,
+      afterTileCount: navClick.afterTileCount ?? null,
+      gridChanged: navClick.gridChanged === true,
+      selectorUsed: navClick.selectorUsed ?? null,
+      clickMethod: navClick.clickMethod ?? null,
+      navClickFailureReason: navClick.clicked ? null : (navClick.navClickFailureReason ?? null),
+      navButtonCandidates: navClick.clicked ? undefined : (navClick.navButtonCandidates ?? []),
+      clickAttempts: navClick.clickAttempts ?? [],
+      visibleIsoDatesFromHeaders: headerState.visibleIsoDatesFromHeaders || [],
     };
 
-    if (!clicked) {
+    if (!navClick.clicked) {
       navSteps.push(stepRecord);
+      if (typeof onNavStep === 'function') {
+        await onNavStep({
+          navClicks,
+          lastVisibleHeader: headerState,
+          navSteps: [...navSteps],
+          navButtonCandidates: navClick.navButtonCandidates ?? [],
+          navClickFailureReason: navClick.navClickFailureReason ?? null,
+        });
+      }
       break;
     }
 
     navClicks += 1;
     headerState = await readWeeklyJobHeaderState(page);
-    stepRecord.afterHeader = headerState.rawMonthLabel ?? null;
+    stepRecord.afterHeader = formatWeeklyVisibleHeaderLabel(headerState, null) ?? stepRecord.afterHeader;
     stepRecord.visibleIsoDatesFromHeaders = headerState.visibleIsoDatesFromHeaders || [];
     navSteps.push(stepRecord);
 
@@ -12176,6 +12598,7 @@ async function navigateWeeklyJobToTargetWeek(page, {
   }
 
   const pageDiag = await collectPageDiagnostics(page, 'weekly_target_week_nav_failed');
+  const lastStep = navSteps[navSteps.length - 1] || null;
   return {
     ok: false,
     error: 'weekly_target_week_navigation_failed',
@@ -12184,6 +12607,8 @@ async function navigateWeeklyJobToTargetWeek(page, {
     navClicks,
     lastVisibleHeader: headerState,
     navSteps,
+    navButtonCandidates: lastStep?.navButtonCandidates ?? [],
+    navClickFailureReason: lastStep?.navClickFailureReason ?? null,
     currentUrl: pageDiag.currentUrl ?? headerState.currentUrl ?? null,
     pageTitle: pageDiag.pageTitle ?? headerState.pageTitle ?? null,
   };
