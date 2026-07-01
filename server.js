@@ -55,6 +55,7 @@ const THRESHOLD_FILTER_TIMEOUT_MS = parseInt(process.env.THRESHOLD_FILTER_TIMEOU
 const THRESHOLD_TILE_SCRAPE_TIMEOUT_MS = parseInt(process.env.THRESHOLD_TILE_SCRAPE_TIMEOUT_MS || '15000', 10);
 const BOOKING_PAGE_TIMEOUT_MS = parseInt(process.env.BOOKING_PAGE_TIMEOUT_MS || '45000', 10);
 const SCRAPE_LOCK_MAX_MS = parseInt(process.env.SCRAPE_LOCK_MAX_MS || '900000', 10);
+const THRESHOLD_SCAN_JOB_STALE_MS = parseInt(process.env.THRESHOLD_SCAN_JOB_STALE_MS || String(20 * 60 * 1000), 10);
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -11972,6 +11973,108 @@ async function enqueueThresholdScanJob({
   return data;
 }
 
+async function recoverStaleThresholdScanJobs() {
+  if (!supabase) {
+    return { recovered: 0, jobIds: [] };
+  }
+
+  const cutoff = new Date(Date.now() - THRESHOLD_SCAN_JOB_STALE_MS).toISOString();
+  const now = new Date().toISOString();
+  const recoveredIds = [];
+
+  const markStale = async (query) => {
+    const { data, error } = await query.select('id');
+    if (error) throw new Error(error.message);
+    for (const row of data || []) {
+      if (row?.id) recoveredIds.push(row.id);
+    }
+  };
+
+  await markStale(
+    supabase
+      .from('threshold_scan_jobs')
+      .update({
+        status: 'failed',
+        completed_at: now,
+        error: 'stale_running_recovery',
+      })
+      .eq('status', 'running')
+      .not('started_at', 'is', null)
+      .lt('started_at', cutoff),
+  );
+
+  await markStale(
+    supabase
+      .from('threshold_scan_jobs')
+      .update({
+        status: 'failed',
+        completed_at: now,
+        error: 'stale_running_recovery',
+      })
+      .eq('status', 'running')
+      .is('started_at', null)
+      .lt('created_at', cutoff),
+  );
+
+  if (recoveredIds.length) {
+    console.warn(`  recovered ${recoveredIds.length} stale threshold scan job(s): ${recoveredIds.join(', ')}`);
+  }
+
+  return { recovered: recoveredIds.length, jobIds: recoveredIds };
+}
+
+async function claimThresholdScanJobWorker() {
+  if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
+    return {
+      claimed: null,
+      reason: 'scrape_in_progress',
+    };
+  }
+
+  try {
+    await recoverStaleThresholdScanJobs();
+    const claim = await claimNextThresholdScanJob();
+    if (!claim.claimed) {
+      releaseScrapeLock();
+      return {
+        claimed: null,
+        reason: claim.reason,
+      };
+    }
+    return {
+      claimed: claim.claimed,
+      reason: null,
+    };
+  } catch (err) {
+    releaseScrapeLock();
+    throw err;
+  }
+}
+
+async function processThresholdScanJobInBackground(job) {
+  try {
+    await executeThresholdScanJob(job);
+  } catch (err) {
+    console.error(`threshold scan job ${job?.id} background error:`, err.message);
+    if (job?.id) {
+      try {
+        await finalizeThresholdScanJob(job.id, {
+          status: 'failed',
+          error: err.message || String(err),
+          resultsJson: job.results_json || {
+            datesRequested: job.dates || [],
+            dateResults: [],
+          },
+        });
+      } catch (finalizeErr) {
+        console.error('threshold scan job finalize on background error:', finalizeErr.message);
+      }
+    }
+  } finally {
+    releaseScrapeLock();
+  }
+}
+
 async function claimNextThresholdScanJob() {
   if (!supabase) {
     return { claimed: null, reason: 'supabase_not_configured' };
@@ -12138,60 +12241,6 @@ async function executeThresholdScanJob(job) {
     ...summary,
     error: finalError,
   };
-}
-
-async function runThresholdScanJobWorker() {
-  if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
-    return {
-      ok: false,
-      skipped: true,
-      reason: 'scrape_in_progress',
-    };
-  }
-
-  let claimedJob = null;
-  try {
-    const claim = await claimNextThresholdScanJob();
-    if (!claim.claimed) {
-      return {
-        ok: false,
-        skipped: true,
-        reason: claim.reason,
-      };
-    }
-
-    claimedJob = claim.claimed;
-    const result = await executeThresholdScanJob(claimedJob);
-    return {
-      ok: result.ok,
-      skipped: false,
-      ...result,
-    };
-  } catch (err) {
-    if (claimedJob?.id) {
-      try {
-        await finalizeThresholdScanJob(claimedJob.id, {
-          status: 'failed',
-          error: err.message || String(err),
-          resultsJson: claimedJob.results_json || {
-            datesRequested: claimedJob.dates || [],
-            dateResults: [],
-          },
-        });
-      } catch (finalizeErr) {
-        console.error('threshold scan job finalize on worker error:', finalizeErr.message);
-      }
-    }
-    return {
-      ok: false,
-      skipped: false,
-      job_id: claimedJob?.id ?? null,
-      error: err.message || String(err),
-      crashed: isPlaywrightCrashError(err),
-    };
-  } finally {
-    releaseScrapeLock();
-  }
 }
 
 async function runDebugEntriesLeftThresholdWriteBatchContract({
@@ -16414,8 +16463,27 @@ app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
       return res.status(503).json({ error: 'supabase_not_configured' });
     }
 
-    const result = await runThresholdScanJobWorker();
-    return res.json(result);
+    const claim = await claimThresholdScanJobWorker();
+    if (!claim.claimed) {
+      return res.json({
+        ok: false,
+        skipped: true,
+        reason: claim.reason,
+      });
+    }
+
+    const job = claim.claimed;
+    setImmediate(() => {
+      processThresholdScanJobInBackground(job).catch((err) => {
+        console.error('threshold scan job unhandled background error:', err.message);
+      });
+    });
+
+    return res.json({
+      ok: true,
+      job_id: job.id,
+      status: 'running',
+    });
   } catch (err) {
     console.error('run-threshold-scan-job error:', err.message);
     return res.status(500).json({
