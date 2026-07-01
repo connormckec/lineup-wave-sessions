@@ -13458,7 +13458,7 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
 
   const completedDryScansReadyToApply = await fetchCompletedDryScansReadyToApply();
 
-  return {
+  const base = {
     ok: true,
     startDate,
     endDate,
@@ -13475,7 +13475,274 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
     dates,
     recommendedJobs,
     completedDryScansReadyToApply,
+    staleCoverageRules: {
+      days0to7AheadMaxAgeHours: 6,
+      days8to21AheadMaxAgeHours: 24,
+      days22to60AheadMaxAgeHours: 72,
+    },
   };
+
+  const prioritizedRecommendedJobs = prioritizeDryScanRecommendations(base);
+  return {
+    ...base,
+    recommendedJobs: prioritizedRecommendedJobs,
+  };
+}
+
+function resolveMaintenanceDateRange({ startDate, endDate } = {}) {
+  const today = getParkTodayIso();
+  return {
+    startDate: normalizeIsoDateParam(startDate) || today,
+    endDate: normalizeIsoDateParam(endDate) || addDaysToParkIso(today, 60),
+  };
+}
+
+function enrichDryScanRecommendations(recommendations) {
+  return recommendations.recommendedJobs.map((job) => {
+    const weekDates = recommendations.dates.filter((row) => (
+      row.weekStart === job.weekStart
+      && (row.status === 'missing_threshold_counts' || row.status === 'stale_threshold_counts')
+    ));
+    const missingCount = weekDates.filter((row) => row.status === 'missing_threshold_counts').length;
+    const staleCount = weekDates.filter((row) => row.status === 'stale_threshold_counts').length;
+    const earliestAffectedIsoDate = weekDates.map((row) => row.isoDate).sort()[0] || job.weekStart;
+    return {
+      ...job,
+      missingCount,
+      staleCount,
+      earliestAffectedIsoDate,
+    };
+  });
+}
+
+function prioritizeDryScanRecommendations(recommendations, { includeStale = true } = {}) {
+  return enrichDryScanRecommendations(recommendations)
+    .filter((job) => includeStale || job.missingCount > 0)
+    .sort((a, b) => {
+      const aMissing = a.missingCount > 0;
+      const bMissing = b.missingCount > 0;
+      if (aMissing !== bMissing) return aMissing ? -1 : 1;
+      return a.earliestAffectedIsoDate.localeCompare(b.earliestAffectedIsoDate);
+    });
+}
+
+async function fetchActiveWeeklyDryScanWeekStarts() {
+  if (!supabase) return new Set();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, dry_run, dates, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_WEEK)
+    .eq('dry_run', true)
+    .in('status', ['queued', 'running']);
+  if (error) throw new Error(error.message);
+  const weekStarts = new Set();
+  for (const job of data || []) {
+    const weekStart = job.results_json?.weekStart
+      || (Array.isArray(job.dates) && job.dates.length ? getMondayWeekStartIso(job.dates[0]) : null);
+    if (weekStart) weekStarts.add(weekStart);
+  }
+  return weekStarts;
+}
+
+async function fetchActiveApplyPreparedSourceJobIds() {
+  if (!supabase) return new Set();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
+    .in('status', ['queued', 'running']);
+  if (error) throw new Error(error.message);
+  return new Set((data || [])
+    .map((job) => job.results_json?.sourceJobId)
+    .filter(Boolean));
+}
+
+async function filterEligibleDryScanRecommendations(recommendations, { includeStale = true } = {}) {
+  const prioritized = prioritizeDryScanRecommendations(recommendations, { includeStale });
+  const activeWeekStarts = await fetchActiveWeeklyDryScanWeekStarts();
+  const readyWeekStarts = new Set(
+    recommendations.completedDryScansReadyToApply.map((row) => row.weekStart).filter(Boolean),
+  );
+  return prioritized.filter((job) => (
+    !activeWeekStarts.has(job.weekStart)
+    && !readyWeekStarts.has(job.weekStart)
+  ));
+}
+
+function compactMaintenanceJob(job) {
+  const resultsJson = job.results_json || {};
+  return {
+    jobId: job.id,
+    status: job.status,
+    mode: job.mode,
+    weekStart: resultsJson.weekStart ?? null,
+    sourceJobId: resultsJson.sourceJobId ?? null,
+    dryRun: job.dry_run,
+    writeEnabled: job.write_enabled,
+    error: job.error ?? null,
+    stage: resultsJson.stage ?? null,
+    preparedUpdatesCount: resultsJson.preparedUpdatesCount ?? null,
+    createdAt: job.created_at,
+    startedAt: job.started_at ?? null,
+    completedAt: job.completed_at ?? null,
+  };
+}
+
+async function fetchMaintenanceThresholdScanJobs({ statuses, limit = 20, orderBy = 'created_at' } = {}) {
+  if (!supabase) return [];
+  let query = supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, dry_run, write_enabled, error, created_at, started_at, completed_at, results_json')
+    .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_APPLY]);
+  if (statuses?.length) query = query.in('status', statuses);
+  query = query.order(orderBy, { ascending: false }).limit(limit);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+async function buildMaintenanceStatus(startDate, endDate) {
+  const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
+  if (!recommendations.ok) return recommendations;
+
+  const eligibleDryScans = await filterEligibleDryScanRecommendations(recommendations, { includeStale: true });
+  const [queuedRows, runningRows, failedRows, completedRows] = await Promise.all([
+    fetchMaintenanceThresholdScanJobs({ statuses: ['queued'], limit: 20 }),
+    fetchMaintenanceThresholdScanJobs({ statuses: ['running'], limit: 10 }),
+    fetchMaintenanceThresholdScanJobs({ statuses: ['failed'], limit: 10, orderBy: 'completed_at' }),
+    fetchMaintenanceThresholdScanJobs({ statuses: ['completed'], limit: 10, orderBy: 'completed_at' }),
+  ]);
+
+  const nextRecommendedDryScan = eligibleDryScans[0] || null;
+
+  return {
+    ok: true,
+    startDate,
+    endDate,
+    generatedAt: recommendations.generatedAt,
+    summary: recommendations.summary,
+    staleCoverageRules: recommendations.staleCoverageRules,
+    nextRecommendedDryScan,
+    readyToApplyCount: recommendations.completedDryScansReadyToApply.length,
+    queuedJobs: queuedRows.map(compactMaintenanceJob),
+    runningJobs: runningRows.map(compactMaintenanceJob),
+    recentFailures: failedRows.map(compactMaintenanceJob),
+    recentCompletedJobs: completedRows.map(compactMaintenanceJob),
+  };
+}
+
+async function enqueueNextMaintenanceDryScan({
+  startDate,
+  endDate,
+  maxWeeks = 1,
+  includeStale = true,
+  minThreshold = 1,
+  maxThreshold = THRESHOLD_JOB_MAX_THRESHOLD,
+} = {}) {
+  if (!supabase) {
+    return { ok: false, error: 'supabase_not_configured', enqueuedJobs: [] };
+  }
+
+  const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
+  if (!recommendations.ok) return recommendations;
+
+  const maxWeeksLimit = Math.max(1, Math.min(parseInt(maxWeeks, 10) || 1, 10));
+  const prioritized = prioritizeDryScanRecommendations(recommendations, { includeStale });
+  const eligible = await filterEligibleDryScanRecommendations(recommendations, { includeStale });
+  const enqueuedJobs = [];
+
+  for (const job of eligible.slice(0, maxWeeksLimit)) {
+    const { weekStart, dates } = buildThresholdWeekDates(job.isoDate || job.weekStart);
+    const minT = Math.max(1, parseInt(minThreshold, 10) || 1);
+    const maxT = Math.max(minT, parseInt(maxThreshold, 10) || THRESHOLD_JOB_MAX_THRESHOLD);
+    const enqueued = await enqueueThresholdScanJob({
+      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+      dates,
+      weekStart,
+      minThreshold: minT,
+      maxThreshold: maxT,
+      dryRun: true,
+      writeEnabled: false,
+    });
+    enqueuedJobs.push({
+      jobId: enqueued.id,
+      mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+      weekStart,
+      isoDate: job.isoDate || weekStart,
+      dates,
+      reason: job.reason,
+    });
+  }
+
+  if (!enqueuedJobs.length) {
+    return {
+      ok: true,
+      enqueuedJobs,
+      skippedReason: prioritized.length === 0
+        ? 'no_recommended_dry_scans'
+        : 'all_recommended_weeks_already_queued_or_ready_to_apply',
+    };
+  }
+
+  return { ok: true, enqueuedJobs };
+}
+
+async function enqueueReadyMaintenancePrepared({
+  startDate,
+  endDate,
+  maxJobs = 1,
+  write,
+  dryRun,
+} = {}) {
+  if (!supabase) {
+    return { ok: false, error: 'supabase_not_configured', enqueuedJobs: [] };
+  }
+  if (write !== true || dryRun !== false) {
+    return {
+      ok: false,
+      error: 'write_true_and_dryRun_false_required',
+      enqueuedJobs: [],
+    };
+  }
+
+  const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
+  if (!recommendations.ok) return recommendations;
+
+  const activeSourceJobIds = await fetchActiveApplyPreparedSourceJobIds();
+  const maxJobsLimit = Math.max(1, Math.min(parseInt(maxJobs, 10) || 1, 10));
+  const eligible = recommendations.completedDryScansReadyToApply.filter(
+    (row) => !activeSourceJobIds.has(row.sourceJobId),
+  );
+  const enqueuedJobs = [];
+
+  for (const row of eligible.slice(0, maxJobsLimit)) {
+    const enqueued = await enqueueThresholdScanJob({
+      mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+      dates: [],
+      sourceJobId: row.sourceJobId,
+      dryRun: false,
+      writeEnabled: true,
+    });
+    enqueuedJobs.push({
+      jobId: enqueued.id,
+      mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
+      sourceJobId: row.sourceJobId,
+      weekStart: row.weekStart,
+      preparedUpdatesCount: row.preparedUpdatesCount,
+    });
+  }
+
+  if (!enqueuedJobs.length) {
+    return {
+      ok: true,
+      enqueuedJobs,
+      skippedReason: recommendations.completedDryScansReadyToApply.length === 0
+        ? 'no_ready_prepared_scans'
+        : 'all_ready_scans_already_queued_or_applied',
+    };
+  }
+
+  return { ok: true, enqueuedJobs };
 }
 
 function resolveThresholdScanJobDates(body = {}) {
@@ -18778,10 +19045,7 @@ app.get('/api/admin/threshold-coverage', async (req, res) => {
 
 app.get('/api/admin/maintenance-recommendations', async (req, res) => {
   try {
-    const today = getParkTodayIso();
-    const startDate = normalizeIsoDateParam(req.query.startDate || req.query.start_date) || today;
-    const endDate = normalizeIsoDateParam(req.query.endDate || req.query.end_date)
-      || addDaysToParkIso(today, 60);
+    const { startDate, endDate } = resolveMaintenanceDateRange(req.query || {});
     const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
     if (!recommendations.ok) {
       return res.status(400).json(recommendations);
@@ -18790,6 +19054,73 @@ app.get('/api/admin/maintenance-recommendations', async (req, res) => {
   } catch (err) {
     console.error('maintenance-recommendations error:', err.message);
     return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.get('/api/admin/maintenance/status', async (req, res) => {
+  try {
+    const { startDate, endDate } = resolveMaintenanceDateRange(req.query || {});
+    const status = await buildMaintenanceStatus(startDate, endDate);
+    if (!status.ok) {
+      return res.status(400).json(status);
+    }
+    return res.json(status);
+  } catch (err) {
+    console.error('maintenance-status error:', err.message);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.post('/api/admin/maintenance/enqueue-next-dry-scan', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured', enqueuedJobs: [] });
+    }
+    const body = req.body || {};
+    const { startDate, endDate } = resolveMaintenanceDateRange(body);
+    const includeStale = body.includeStale !== false;
+    const result = await enqueueNextMaintenanceDryScan({
+      startDate,
+      endDate,
+      maxWeeks: body.maxWeeks ?? 1,
+      includeStale,
+      minThreshold: body.minThreshold ?? 1,
+      maxThreshold: body.maxThreshold ?? THRESHOLD_JOB_MAX_THRESHOLD,
+    });
+    if (!result.ok && result.error && !result.enqueuedJobs) {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('maintenance-enqueue-next-dry-scan error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err), enqueuedJobs: [] });
+  }
+});
+
+app.post('/api/admin/maintenance/apply-ready-prepared', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured', enqueuedJobs: [] });
+    }
+    const body = req.body || {};
+    const { startDate, endDate } = resolveMaintenanceDateRange(body);
+    const result = await enqueueReadyMaintenancePrepared({
+      startDate,
+      endDate,
+      maxJobs: body.maxJobs ?? 1,
+      write: body.write,
+      dryRun: body.dryRun,
+    });
+    if (!result.ok && result.error === 'write_true_and_dryRun_false_required') {
+      return res.status(400).json(result);
+    }
+    if (!result.ok && result.error && !result.enqueuedJobs) {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('maintenance-apply-ready-prepared error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err), enqueuedJobs: [] });
   }
 });
 
