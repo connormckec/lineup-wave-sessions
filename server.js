@@ -12040,23 +12040,34 @@ function weeklyTargetWeekContains(headers, targetWeekStart, validateIsoDate) {
 }
 
 function isWeeklyBookingWidgetTimeoutError(err) {
-  const msg = String(err?.message || err || '');
+  const msg = weeklyBrowserCrashErrorText(err);
   return msg.includes('weekly_booking_widget_timeout')
     || (msg.includes('waitForSelector') && msg.includes('dynamic-cal-booking-ts'));
 }
 
+function weeklyBrowserCrashErrorText(err) {
+  if (typeof err === 'string') return err;
+  const parts = [];
+  const seen = new Set();
+  let cur = err;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    if (cur.message) parts.push(String(cur.message));
+    parts.push(String(cur));
+    if (cur.stack) parts.push(String(cur.stack));
+    cur = cur.cause;
+  }
+  return parts.join('\n');
+}
+
 function isWeeklyBrowserCrashError(err) {
-  const msg = (err?.message || String(err || '')).toLowerCase();
+  const msg = weeklyBrowserCrashErrorText(err).toLowerCase();
   return msg.includes('page crashed')
     || msg.includes('target crashed')
     || msg.includes('target page, context or browser has been closed')
     || msg.includes('browser has been closed')
-    || msg.includes('browser closed')
-    || msg.includes('browser disconnected')
-    || msg.includes('target closed')
-    || msg.includes('context disposed')
-    || (msg.includes('page') && msg.includes('closed'))
-    || (msg.includes('context') && msg.includes('closed'));
+    || msg.includes('context has been closed')
+    || msg.includes('page has been closed');
 }
 
 async function waitForWeeklyBookingWidgetVisible(page, { timeoutMs = WEEKLY_BOOKING_WIDGET_TIMEOUT_MS } = {}) {
@@ -12066,8 +12077,17 @@ async function waitForWeeklyBookingWidgetVisible(page, { timeoutMs = WEEKLY_BOOK
       timeout: timeoutMs,
     });
   } catch (err) {
+    if (isWeeklyBrowserCrashError(err)) throw err;
     throw new Error('weekly_booking_widget_timeout');
   }
+}
+
+async function loadWeeklyThresholdBookingPageForPreflight(page) {
+  await dismissCookieBanner(page).catch(() => {});
+  await page.goto(BOOKING, { waitUntil: 'domcontentloaded', timeout: THRESHOLD_SCAN_PAGE_TIMEOUT_MS });
+  await dismissCookieBanner(page);
+  await waitForCookieBannerGone(page, 6000).catch(() => {});
+  await waitForWeeklyBookingWidgetVisible(page);
 }
 
 async function openWeeklyThresholdBookingPage(page) {
@@ -12643,28 +12663,13 @@ async function runWeeklyThresholdWeekPreflight({
   let lastBrowserCrashError = null;
   let retryStartedAt = null;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+  while (true) {
     let launched = null;
     try {
-      if (attempt > 0) {
-        browserCrashRetries = attempt;
-        retryStartedAt = new Date().toISOString();
-        if (typeof onStageUpdate === 'function') {
-          await onStageUpdate({
-            stage: 'retrying_after_browser_crash',
-            browserCrashRetries,
-            lastBrowserCrashError,
-            retryStartedAt,
-            targetWeekStart,
-            validateIsoDate: validateIsoDate || targetWeekStart,
-          });
-        }
-      }
-
       launched = await launchBrowser();
       if (launchedRef) launchedRef.current = launched;
 
-      await openWeeklyThresholdBookingPage(launched.page);
+      await loadWeeklyThresholdBookingPageForPreflight(launched.page);
       const widgetDiag = await collectPageDiagnostics(launched.page, 'weekly_booking_widget_visible');
       if (typeof onStageUpdate === 'function') {
         await onStageUpdate({
@@ -12754,25 +12759,37 @@ async function runWeeklyThresholdWeekPreflight({
         retryStartedAt,
       };
     } catch (err) {
-      lastBrowserCrashError = err.message || String(err);
+      lastBrowserCrashError = weeklyBrowserCrashErrorText(err) || null;
       await safeCloseBrowser(launched);
       if (launchedRef) launchedRef.current = null;
 
-      if (isWeeklyBrowserCrashError(err) && attempt < maxRetries) {
+      if (isWeeklyBrowserCrashError(err) && browserCrashRetries < maxRetries) {
+        browserCrashRetries += 1;
+        retryStartedAt = new Date().toISOString();
+        if (typeof onStageUpdate === 'function') {
+          await onStageUpdate({
+            stage: 'retrying_after_browser_crash',
+            browserCrashRetries,
+            lastBrowserCrashError,
+            retryStartedAt,
+            targetWeekStart,
+            validateIsoDate: validateIsoDate || targetWeekStart,
+          });
+        }
         continue;
       }
 
-      const error = isWeeklyBrowserCrashError(err) && attempt >= maxRetries
+      const error = isWeeklyBrowserCrashError(err)
         ? 'weekly_browser_crash_retries_exhausted'
         : (isWeeklyBookingWidgetTimeoutError(err)
           ? 'weekly_booking_widget_timeout'
-          : lastBrowserCrashError);
+          : (err?.message || String(err)));
 
       return {
         ok: false,
         launched: null,
         error,
-        browserCrashRetries: isWeeklyBrowserCrashError(err) ? maxRetries : browserCrashRetries,
+        browserCrashRetries,
         lastBrowserCrashError,
         retryStartedAt,
         currentUrl: null,
@@ -12781,16 +12798,15 @@ async function runWeeklyThresholdWeekPreflight({
       };
     }
   }
+}
 
+function normalizeWeeklyJobBrowserCrashFailure(err, resultsJson = {}) {
+  if (!isWeeklyBrowserCrashError(err)) return null;
+  const crashText = weeklyBrowserCrashErrorText(err) || resultsJson.lastBrowserCrashError || null;
   return {
-    ok: false,
-    launched: null,
     error: 'weekly_browser_crash_retries_exhausted',
-    browserCrashRetries: maxRetries,
-    lastBrowserCrashError,
-    retryStartedAt,
-    currentUrl: null,
-    pageTitle: null,
+    browserCrashRetries: resultsJson.browserCrashRetries ?? THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES,
+    lastBrowserCrashError: crashText,
     stage: 'failed',
   };
 }
@@ -13686,13 +13702,20 @@ async function processThresholdScanJobInBackground(job) {
     console.error(`threshold scan job ${job?.id} background error:`, err.message);
     if (job?.id) {
       try {
+        const crashNorm = mode === THRESHOLD_SCAN_JOB_MODE_WEEK
+          ? normalizeWeeklyJobBrowserCrashFailure(err, job.results_json || {})
+          : null;
         await finalizeThresholdScanJob(job.id, {
           status: 'failed',
-          error: err.message || String(err),
-          resultsJson: job.results_json || {
-            mode,
-            datesRequested: job.dates || [],
-            dateResults: [],
+          error: crashNorm?.error || err.message || String(err),
+          resultsJson: {
+            ...(job.results_json || {
+              mode,
+              datesRequested: job.dates || [],
+              dateResults: [],
+            }),
+            ...(crashNorm || {}),
+            stage: 'failed',
           },
         });
       } catch (finalizeErr) {
@@ -14122,27 +14145,54 @@ async function executeThresholdWeekScanJob(job) {
     const launchedRef = { current: null };
     const validateIsoDate = anchorIsoDate || weekStart;
     let preflightNavigation = null;
+    let preflight;
 
-    const preflight = await runWeeklyThresholdWeekPreflight({
-      targetWeekStart: weekStart,
-      validateIsoDate,
-      launchedRef,
-      onStageUpdate: async (patch) => {
-        resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
-          mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
-          weekStart,
-          targetWeekStart: weekStart,
-          validateIsoDate,
-          dateResults: [],
-          ...patch,
-        });
-      },
-    });
+    try {
+      preflight = await runWeeklyThresholdWeekPreflight({
+        targetWeekStart: weekStart,
+        validateIsoDate,
+        launchedRef,
+        onStageUpdate: async (patch) => {
+          resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+            mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
+            weekStart,
+            targetWeekStart: weekStart,
+            validateIsoDate,
+            dateResults: [],
+            ...patch,
+          });
+        },
+      });
+    } catch (err) {
+      const crashNorm = normalizeWeeklyJobBrowserCrashFailure(err, resultsJson);
+      preflight = {
+        ok: false,
+        launched: null,
+        error: crashNorm?.error || err.message || String(err),
+        browserCrashRetries: crashNorm?.browserCrashRetries ?? 0,
+        lastBrowserCrashError: crashNorm?.lastBrowserCrashError
+          ?? weeklyBrowserCrashErrorText(err)
+          ?? null,
+        retryStartedAt: resultsJson.retryStartedAt ?? null,
+        stage: 'failed',
+      };
+    }
 
     launched = preflight.launched || launchedRef.current;
 
     if (!preflight.ok) {
-      workerError = preflight.error;
+      const crashNorm = normalizeWeeklyJobBrowserCrashFailure(preflight.error, {
+        ...resultsJson,
+        browserCrashRetries: preflight.browserCrashRetries,
+        lastBrowserCrashError: preflight.lastBrowserCrashError,
+      });
+      workerError = crashNorm?.error || preflight.error;
+      const browserCrashRetries = crashNorm?.browserCrashRetries
+        ?? preflight.browserCrashRetries
+        ?? 0;
+      const lastBrowserCrashError = crashNorm?.lastBrowserCrashError
+        ?? preflight.lastBrowserCrashError
+        ?? null;
       resultsJson = buildThresholdWeekWriteResultsJson({
         mode: THRESHOLD_SCAN_JOB_MODE_WEEK,
         weekStart,
@@ -14168,8 +14218,8 @@ async function executeThresholdWeekScanJob(job) {
         lastVisibleHeader: preflight.lastVisibleHeader ?? null,
         navClicks: preflight.navClicks ?? 0,
         navSteps: preflight.navSteps ?? [],
-        browserCrashRetries: preflight.browserCrashRetries ?? 0,
-        lastBrowserCrashError: preflight.lastBrowserCrashError ?? null,
+        browserCrashRetries,
+        lastBrowserCrashError,
         retryStartedAt: preflight.retryStartedAt ?? null,
       });
       await finalizeThresholdScanJob(job.id, {
@@ -14393,7 +14443,11 @@ async function executeThresholdWeekScanJob(job) {
       }
     }
   } catch (err) {
-    workerError = err.message || String(err);
+    const crashNorm = normalizeWeeklyJobBrowserCrashFailure(err, resultsJson);
+    workerError = crashNorm?.error || err.message || String(err);
+    if (crashNorm) {
+      Object.assign(resultsJson, crashNorm);
+    }
     if (!dateResults.length && targetDates.length) {
       for (const isoDate of targetDates) {
         dateResults.push(buildThresholdWeekWriteDateResult(isoDate, {
@@ -14424,9 +14478,14 @@ async function executeThresholdWeekScanJob(job) {
   const scanFailed = fullScanRun?.fullScanContractOk !== true;
   const failedDates = dateResults.filter((row) => row.error);
   const finalStatus = scanFailed ? 'failed' : 'completed';
-  const finalError = scanFailed
+  let finalError = scanFailed
     ? (workerError || fullScanRun?.error || 'full_scan_contract_failed')
     : (failedDates.length > 0 ? 'partial_date_failures' : null);
+  const finalCrashNorm = normalizeWeeklyJobBrowserCrashFailure(finalError, resultsJson);
+  if (finalCrashNorm) {
+    finalError = finalCrashNorm.error;
+    Object.assign(resultsJson, finalCrashNorm);
+  }
   const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
   const preparedScanCompletedAt = fullScanRun?.fullScanContractOk === true
     ? (resultsJson.completedFullScanAt || new Date().toISOString())
