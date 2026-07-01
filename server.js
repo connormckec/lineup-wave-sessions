@@ -68,6 +68,10 @@ const THRESHOLD_WEEK_FULL_SCAN_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_
 const WEEKLY_BOOKING_WIDGET_TIMEOUT_MS = parseInt(process.env.WEEKLY_BOOKING_WIDGET_TIMEOUT_MS || '45000', 10);
 const WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS = Math.max(1, parseInt(process.env.WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS || '10', 10));
 const THRESHOLD_WEEK_SINGLE_THRESHOLD_TIMEOUT_MS = parseInt(process.env.THRESHOLD_WEEK_SINGLE_THRESHOLD_TIMEOUT_MS || '60000', 10);
+const THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES = Math.max(
+  0,
+  parseInt(process.env.THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES || '2', 10),
+);
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -12041,6 +12045,20 @@ function isWeeklyBookingWidgetTimeoutError(err) {
     || (msg.includes('waitForSelector') && msg.includes('dynamic-cal-booking-ts'));
 }
 
+function isWeeklyBrowserCrashError(err) {
+  const msg = (err?.message || String(err || '')).toLowerCase();
+  return msg.includes('page crashed')
+    || msg.includes('target crashed')
+    || msg.includes('target page, context or browser has been closed')
+    || msg.includes('browser has been closed')
+    || msg.includes('browser closed')
+    || msg.includes('browser disconnected')
+    || msg.includes('target closed')
+    || msg.includes('context disposed')
+    || (msg.includes('page') && msg.includes('closed'))
+    || (msg.includes('context') && msg.includes('closed'));
+}
+
 async function waitForWeeklyBookingWidgetVisible(page, { timeoutMs = WEEKLY_BOOKING_WIDGET_TIMEOUT_MS } = {}) {
   try {
     await page.waitForSelector('.dynamic-cal-booking-ts', {
@@ -12620,97 +12638,161 @@ async function runWeeklyThresholdWeekPreflight({
   launchedRef = null,
   onStageUpdate = null,
 } = {}) {
-  const launched = await launchBrowser();
-  if (launchedRef) launchedRef.current = launched;
+  const maxRetries = THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES;
+  let browserCrashRetries = 0;
+  let lastBrowserCrashError = null;
+  let retryStartedAt = null;
 
-  try {
-    await openWeeklyThresholdBookingPage(launched.page);
-    const widgetDiag = await collectPageDiagnostics(launched.page, 'weekly_booking_widget_visible');
-    if (typeof onStageUpdate === 'function') {
-      await onStageUpdate({
-        stage: 'booking_widget_visible',
-        currentUrl: widgetDiag.currentUrl ?? null,
-        pageTitle: widgetDiag.pageTitle ?? null,
-      });
-    }
-
-    if (typeof onStageUpdate === 'function') {
-      await onStageUpdate({
-        stage: 'navigating_to_week',
-        targetWeekStart,
-        validateIsoDate: validateIsoDate || targetWeekStart,
-        navClicks: 0,
-      });
-    }
-
-    const navResult = await navigateWeeklyJobToTargetWeek(launched.page, {
-      targetWeekStart,
-      validateIsoDate,
-      maxNavClicks: WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS,
-      onNavStep: async (stepPatch) => {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    let launched = null;
+    try {
+      if (attempt > 0) {
+        browserCrashRetries = attempt;
+        retryStartedAt = new Date().toISOString();
         if (typeof onStageUpdate === 'function') {
           await onStageUpdate({
-            stage: 'navigating_to_week',
+            stage: 'retrying_after_browser_crash',
+            browserCrashRetries,
+            lastBrowserCrashError,
+            retryStartedAt,
             targetWeekStart,
             validateIsoDate: validateIsoDate || targetWeekStart,
-            ...stepPatch,
           });
         }
-      },
-    });
+      }
 
-    if (!navResult.ok) {
-      return {
-        ok: false,
-        launched,
-        error: navResult.error,
+      launched = await launchBrowser();
+      if (launchedRef) launchedRef.current = launched;
+
+      await openWeeklyThresholdBookingPage(launched.page);
+      const widgetDiag = await collectPageDiagnostics(launched.page, 'weekly_booking_widget_visible');
+      if (typeof onStageUpdate === 'function') {
+        await onStageUpdate({
+          stage: 'booking_widget_visible',
+          browserCrashRetries,
+          lastBrowserCrashError,
+          retryStartedAt,
+          currentUrl: widgetDiag.currentUrl ?? null,
+          pageTitle: widgetDiag.pageTitle ?? null,
+        });
+      }
+
+      if (typeof onStageUpdate === 'function') {
+        await onStageUpdate({
+          stage: 'navigating_to_week',
+          targetWeekStart,
+          validateIsoDate: validateIsoDate || targetWeekStart,
+          navClicks: 0,
+          browserCrashRetries,
+          lastBrowserCrashError,
+          retryStartedAt,
+        });
+      }
+
+      const navResult = await navigateWeeklyJobToTargetWeek(launched.page, {
         targetWeekStart,
-        validateIsoDate: validateIsoDate || targetWeekStart,
+        validateIsoDate,
+        maxNavClicks: WEEKLY_TARGET_WEEK_MAX_NAV_CLICKS,
+        onNavStep: async (stepPatch) => {
+          if (typeof onStageUpdate === 'function') {
+            await onStageUpdate({
+              stage: 'navigating_to_week',
+              targetWeekStart,
+              validateIsoDate: validateIsoDate || targetWeekStart,
+              browserCrashRetries,
+              lastBrowserCrashError,
+              retryStartedAt,
+              ...stepPatch,
+            });
+          }
+        },
+      });
+
+      if (!navResult.ok) {
+        return {
+          ok: false,
+          launched,
+          error: navResult.error,
+          targetWeekStart,
+          validateIsoDate: validateIsoDate || targetWeekStart,
+          navClicks: navResult.navClicks,
+          lastVisibleHeader: navResult.lastVisibleHeader,
+          navSteps: navResult.navSteps,
+          currentUrl: navResult.currentUrl,
+          pageTitle: navResult.pageTitle,
+          browserCrashRetries,
+          lastBrowserCrashError,
+          retryStartedAt,
+        };
+      }
+
+      if (typeof onStageUpdate === 'function') {
+        await onStageUpdate({
+          stage: 'target_week_visible',
+          targetWeekStart,
+          validateIsoDate: validateIsoDate || targetWeekStart,
+          navClicks: navResult.navClicks,
+          lastVisibleHeader: navResult.lastVisibleHeader,
+          navigation: navResult.navigation,
+          browserCrashRetries,
+          lastBrowserCrashError,
+          retryStartedAt,
+        });
+      }
+
+      return {
+        ok: true,
+        launched,
+        navigation: navResult.navigation,
         navClicks: navResult.navClicks,
         lastVisibleHeader: navResult.lastVisibleHeader,
         navSteps: navResult.navSteps,
-        currentUrl: navResult.currentUrl,
-        pageTitle: navResult.pageTitle,
+        currentUrl: navResult.navigation?.currentUrl ?? null,
+        pageTitle: navResult.navigation?.pageTitle ?? null,
+        browserCrashRetries,
+        lastBrowserCrashError,
+        retryStartedAt,
+      };
+    } catch (err) {
+      lastBrowserCrashError = err.message || String(err);
+      await safeCloseBrowser(launched);
+      if (launchedRef) launchedRef.current = null;
+
+      if (isWeeklyBrowserCrashError(err) && attempt < maxRetries) {
+        continue;
+      }
+
+      const error = isWeeklyBrowserCrashError(err) && attempt >= maxRetries
+        ? 'weekly_browser_crash_retries_exhausted'
+        : (isWeeklyBookingWidgetTimeoutError(err)
+          ? 'weekly_booking_widget_timeout'
+          : lastBrowserCrashError);
+
+      return {
+        ok: false,
+        launched: null,
+        error,
+        browserCrashRetries: isWeeklyBrowserCrashError(err) ? maxRetries : browserCrashRetries,
+        lastBrowserCrashError,
+        retryStartedAt,
+        currentUrl: null,
+        pageTitle: null,
+        stage: 'failed',
       };
     }
-
-    if (typeof onStageUpdate === 'function') {
-      await onStageUpdate({
-        stage: 'target_week_visible',
-        targetWeekStart,
-        validateIsoDate: validateIsoDate || targetWeekStart,
-        navClicks: navResult.navClicks,
-        lastVisibleHeader: navResult.lastVisibleHeader,
-        navigation: navResult.navigation,
-      });
-    }
-
-    return {
-      ok: true,
-      launched,
-      navigation: navResult.navigation,
-      navClicks: navResult.navClicks,
-      lastVisibleHeader: navResult.lastVisibleHeader,
-      navSteps: navResult.navSteps,
-      currentUrl: navResult.navigation?.currentUrl ?? null,
-      pageTitle: navResult.navigation?.pageTitle ?? null,
-    };
-  } catch (err) {
-    const pageDiag = launched?.page
-      ? await collectPageDiagnostics(launched.page, 'weekly_preflight_error').catch(() => ({}))
-      : {};
-    const error = isWeeklyBookingWidgetTimeoutError(err)
-      ? 'weekly_booking_widget_timeout'
-      : (err.message || String(err));
-    return {
-      ok: false,
-      launched,
-      error,
-      currentUrl: pageDiag.currentUrl ?? null,
-      pageTitle: pageDiag.pageTitle ?? null,
-      stage: isWeeklyBookingWidgetTimeoutError(err) ? 'failed' : 'failed',
-    };
   }
+
+  return {
+    ok: false,
+    launched: null,
+    error: 'weekly_browser_crash_retries_exhausted',
+    browserCrashRetries: maxRetries,
+    lastBrowserCrashError,
+    retryStartedAt,
+    currentUrl: null,
+    pageTitle: null,
+    stage: 'failed',
+  };
 }
 
 function buildGate8NavFailureWriteRun(error, meta = {}) {
@@ -14086,6 +14168,9 @@ async function executeThresholdWeekScanJob(job) {
         lastVisibleHeader: preflight.lastVisibleHeader ?? null,
         navClicks: preflight.navClicks ?? 0,
         navSteps: preflight.navSteps ?? [],
+        browserCrashRetries: preflight.browserCrashRetries ?? 0,
+        lastBrowserCrashError: preflight.lastBrowserCrashError ?? null,
+        retryStartedAt: preflight.retryStartedAt ?? null,
       });
       await finalizeThresholdScanJob(job.id, {
         status: 'failed',
@@ -14114,6 +14199,9 @@ async function executeThresholdWeekScanJob(job) {
       navClicks: preflight.navClicks ?? 0,
       lastVisibleHeader: preflight.lastVisibleHeader ?? null,
       navigation: preflightNavigation,
+      browserCrashRetries: preflight.browserCrashRetries ?? 0,
+      lastBrowserCrashError: preflight.lastBrowserCrashError ?? null,
+      retryStartedAt: preflight.retryStartedAt ?? null,
     });
 
     let incrementalScan;
