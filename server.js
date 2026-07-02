@@ -72,6 +72,7 @@ const THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES = Math.max(
   0,
   parseInt(process.env.THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES || '2', 10),
 );
+const MAINTENANCE_TICK_ENABLED = process.env.MAINTENANCE_TICK_ENABLED === 'true';
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -13802,6 +13803,91 @@ async function enqueueNextMaintenanceDryScan({
   return { ok: true, enqueuedJobs };
 }
 
+async function hasQueuedOrRunningThresholdScanJob() {
+  if (!supabase) return false;
+  const { count, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('*', { count: 'exact', head: true })
+    .in('status', ['queued', 'running']);
+  if (error) throw new Error(error.message);
+  return (count || 0) > 0;
+}
+
+function isMaintenanceTickAllowed(body = {}) {
+  if (MAINTENANCE_TICK_ENABLED) return true;
+  return body.adminOverride === true;
+}
+
+async function runMaintenanceTick({
+  startDate,
+  endDate,
+  includeStale = true,
+} = {}) {
+  if (!supabase) {
+    return { ok: false, error: 'supabase_not_configured' };
+  }
+
+  if (await hasQueuedOrRunningThresholdScanJob()) {
+    return {
+      ok: true,
+      action: 'skipped',
+      reason: 'job_already_running_or_queued',
+      startDate,
+      endDate,
+    };
+  }
+
+  const status = await buildMaintenanceStatus(startDate, endDate);
+  if (!status.ok) return status;
+
+  if (!status.nextRecommendedDryScan) {
+    return {
+      ok: true,
+      action: 'none_needed',
+      startDate,
+      endDate,
+      summary: status.summary,
+    };
+  }
+
+  const enqueueResult = await enqueueNextMaintenanceDryScan({
+    startDate,
+    endDate,
+    maxWeeks: 1,
+    includeStale,
+    minThreshold: 1,
+    maxThreshold: THRESHOLD_JOB_MAX_THRESHOLD,
+  });
+
+  if (!enqueueResult.ok) return enqueueResult;
+
+  const enqueued = enqueueResult.enqueuedJobs?.[0];
+  if (!enqueued) {
+    return {
+      ok: true,
+      action: 'skipped',
+      reason: enqueueResult.skippedReason || 'no_eligible_dry_scan',
+      startDate,
+      endDate,
+      nextRecommendedDryScan: status.nextRecommendedDryScan,
+    };
+  }
+
+  return {
+    ok: true,
+    action: 'enqueued_dry_scan',
+    job_id: enqueued.jobId,
+    weekStart: enqueued.weekStart,
+    isoDate: enqueued.isoDate,
+    dates: enqueued.dates,
+    reason: enqueued.reason,
+    dryRun: true,
+    write: false,
+    startDate,
+    endDate,
+  };
+}
+
 async function enqueueReadyMaintenancePrepared({
   startDate,
   endDate,
@@ -19236,6 +19322,36 @@ app.post('/api/admin/maintenance/apply-ready-prepared', async (req, res) => {
   } catch (err) {
     console.error('maintenance-apply-ready-prepared error:', err.message);
     return res.status(500).json({ ok: false, error: err.message || String(err), enqueuedJobs: [] });
+  }
+});
+
+app.post('/api/admin/maintenance/tick', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!isMaintenanceTickAllowed(body)) {
+      return res.status(403).json({
+        ok: true,
+        action: 'skipped',
+        reason: 'maintenance_tick_disabled',
+        hint: 'Set MAINTENANCE_TICK_ENABLED=true or pass adminOverride: true',
+      });
+    }
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const { startDate, endDate } = resolveMaintenanceDateRange(body);
+    const result = await runMaintenanceTick({
+      startDate,
+      endDate,
+      includeStale: body.includeStale !== false,
+    });
+    if (!result.ok && result.error) {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('maintenance-tick error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
