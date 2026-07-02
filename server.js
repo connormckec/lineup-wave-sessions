@@ -13333,18 +13333,91 @@ function buildWeeklyThresholdDryScanReason(week) {
   return `${week.staleCount} date(s) with stale threshold counts`;
 }
 
-async function fetchCompletedDryScansReadyToApply() {
-  if (!supabase) return [];
+function extractPreparedIsoDatesFromDryScanJob(job) {
+  const resultsJson = job?.results_json || {};
+  const isoDates = new Set();
+  for (const isoDate of resultsJson.targetDates || job?.dates || []) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(isoDate))) isoDates.add(String(isoDate));
+  }
+  for (const row of resultsJson.dateResults || []) {
+    if (row?.isoDate && /^\d{4}-\d{2}-\d{2}$/.test(row.isoDate)) isoDates.add(row.isoDate);
+  }
+  if (resultsJson.preparedUpdatesByDate && typeof resultsJson.preparedUpdatesByDate === 'object') {
+    for (const isoDate of Object.keys(resultsJson.preparedUpdatesByDate)) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) isoDates.add(isoDate);
+    }
+  }
+  for (const prep of flattenPreparedUpdatesFromResults(resultsJson)) {
+    if (prep?.isoDate && /^\d{4}-\d{2}-\d{2}$/.test(prep.isoDate)) isoDates.add(prep.isoDate);
+  }
+  return [...isoDates].sort();
+}
+
+function preparedIsoDatesOverlapRange(preparedIsoDates, startDate, endDate) {
+  if (!startDate || !endDate || !preparedIsoDates.length) return true;
+  return preparedIsoDates.some((isoDate) => isoDate >= startDate && isoDate <= endDate);
+}
+
+function resolvePreparedUpdatesCountFromResults(resultsJson = {}) {
+  const explicit = resultsJson.preparedUpdatesCount;
+  if (explicit != null && explicit > 0) return explicit;
+  const fromByDate = resultsJson.preparedUpdatesByDate
+    ? countPreparedUpdates(resultsJson.preparedUpdatesByDate)
+    : 0;
+  if (fromByDate > 0) return fromByDate;
+  return flattenPreparedUpdatesFromResults(resultsJson).length;
+}
+
+function resolvePreparedScanCompletedAtFromJob(job) {
+  const resultsJson = job?.results_json || {};
+  return resultsJson.preparedScanCompletedAt
+    || resultsJson.completedFullScanAt
+    || job?.completed_at
+    || null;
+}
+
+function isDryScanSourceAlreadyApplied(sourceJobId, preparedScanCompletedAt, applyJobs = []) {
+  if (!sourceJobId || !preparedScanCompletedAt) return false;
+  const scanTs = new Date(preparedScanCompletedAt).getTime();
+  if (!Number.isFinite(scanTs)) return false;
+  return applyJobs.some((job) => {
+    if (job.results_json?.sourceJobId !== sourceJobId) return false;
+    if (job.status !== 'completed' || job.error) return false;
+    const applyTs = job.completed_at ? new Date(job.completed_at).getTime() : NaN;
+    return Number.isFinite(applyTs) && applyTs > scanTs;
+  });
+}
+
+function compactReadyToApplyCandidate(job) {
+  const resultsJson = job?.results_json || {};
+  const preparedIsoDates = extractPreparedIsoDatesFromDryScanJob(job);
+  const preparedScanCompletedAt = resolvePreparedScanCompletedAtFromJob(job);
+  return {
+    sourceJobId: job.id,
+    weekStart: resultsJson.weekStart ?? null,
+    preparedUpdatesCount: resolvePreparedUpdatesCountFromResults(resultsJson),
+    preparedScanCompletedAt,
+    preparedIsoDates,
+    dryRun: job.dry_run,
+    completedAt: job.completed_at ?? null,
+    fullScanContractOk: resultsJson.fullScanContractOk === true,
+    jobError: job.error ?? null,
+    resultsError: resultsJson.error ?? null,
+  };
+}
+
+async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate = null) {
+  if (!supabase) {
+    return { ready: [], candidatesRaw: [], excluded: [] };
+  }
 
   const now = Date.now();
   const [dryResult, applyResult] = await Promise.all([
     supabase
       .from('threshold_scan_jobs')
-      .select('id, status, mode, dry_run, error, completed_at, results_json')
+      .select('id, status, mode, dry_run, error, completed_at, dates, results_json')
       .eq('mode', THRESHOLD_SCAN_JOB_MODE_WEEK)
       .eq('status', 'completed')
-      .eq('dry_run', true)
-      .is('error', null)
       .order('completed_at', { ascending: false })
       .limit(200),
     supabase
@@ -13352,46 +13425,76 @@ async function fetchCompletedDryScansReadyToApply() {
       .select('id, status, mode, error, completed_at, results_json')
       .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
       .eq('status', 'completed')
-      .is('error', null)
       .order('completed_at', { ascending: false })
       .limit(200),
   ]);
   if (dryResult.error) throw new Error(dryResult.error.message);
   if (applyResult.error) throw new Error(applyResult.error.message);
 
-  const appliedWeekAfter = new Map();
-  for (const job of applyResult.data || []) {
-    const weekStart = job.results_json?.weekStart;
-    const completedAt = job.completed_at;
-    if (!weekStart || !completedAt) continue;
-    const ts = new Date(completedAt).getTime();
-    const prev = appliedWeekAfter.get(weekStart);
-    if (!prev || ts > prev) appliedWeekAfter.set(weekStart, ts);
-  }
-
+  const applyJobs = (applyResult.data || []).filter((job) => !job.error);
+  const candidatesRaw = [];
+  const excluded = [];
   const ready = [];
+
   for (const job of dryResult.data || []) {
     const resultsJson = job.results_json || {};
-    if (resultsJson.fullScanContractOk !== true) continue;
-    if (resultsJson.error) continue;
-    const preparedUpdatesCount = resultsJson.preparedUpdatesCount ?? 0;
-    if (!preparedUpdatesCount) continue;
-    const preparedScanCompletedAt = getPreparedScanTimestamp(job);
-    if (!preparedScanCompletedAt) continue;
-    const ageMs = now - new Date(preparedScanCompletedAt).getTime();
-    if (ageMs > THRESHOLD_PREPARED_SCAN_MAX_AGE_MS) continue;
+    const candidate = compactReadyToApplyCandidate(job);
+    candidatesRaw.push(candidate);
 
-    const weekStart = resultsJson.weekStart ?? null;
-    if (weekStart) {
-      const applyTs = appliedWeekAfter.get(weekStart);
-      if (applyTs && applyTs > new Date(preparedScanCompletedAt).getTime()) continue;
+    if (job.error) {
+      excluded.push({ ...candidate, reason: 'job_error_not_null' });
+      continue;
+    }
+    if (resultsJson.fullScanContractOk !== true) {
+      excluded.push({ ...candidate, reason: 'full_scan_contract_not_ok' });
+      continue;
+    }
+
+    const preparedUpdatesCount = resolvePreparedUpdatesCountFromResults(resultsJson);
+    if (!preparedUpdatesCount) {
+      excluded.push({ ...candidate, reason: 'prepared_updates_empty' });
+      continue;
+    }
+
+    const preparedScanCompletedAt = resolvePreparedScanCompletedAtFromJob(job);
+    if (!preparedScanCompletedAt) {
+      excluded.push({ ...candidate, reason: 'prepared_scan_completed_at_missing' });
+      continue;
+    }
+
+    const ageMs = now - new Date(preparedScanCompletedAt).getTime();
+    if (ageMs > THRESHOLD_PREPARED_SCAN_MAX_AGE_MS) {
+      excluded.push({
+        ...candidate,
+        reason: 'prepared_scan_stale',
+        ageHours: Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10,
+        maxAgeHours: Math.round(THRESHOLD_PREPARED_SCAN_MAX_AGE_MS / (60 * 60 * 1000)),
+      });
+      continue;
+    }
+
+    const preparedIsoDates = candidate.preparedIsoDates;
+    if (startDate && endDate && !preparedIsoDatesOverlapRange(preparedIsoDates, startDate, endDate)) {
+      excluded.push({
+        ...candidate,
+        reason: 'outside_requested_date_range',
+        requestedStartDate: startDate,
+        requestedEndDate: endDate,
+      });
+      continue;
+    }
+
+    if (isDryScanSourceAlreadyApplied(job.id, preparedScanCompletedAt, applyJobs)) {
+      excluded.push({ ...candidate, reason: 'already_applied_after_scan' });
+      continue;
     }
 
     ready.push({
       sourceJobId: job.id,
-      weekStart,
+      weekStart: resultsJson.weekStart ?? null,
       preparedUpdatesCount,
       preparedScanCompletedAt,
+      preparedIsoDates,
       ageHours: Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10,
       recommendedApplyBody: {
         mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
@@ -13402,7 +13505,14 @@ async function fetchCompletedDryScansReadyToApply() {
     });
   }
 
-  return ready.sort((a, b) => (a.weekStart || '').localeCompare(b.weekStart || ''));
+  ready.sort((a, b) => (a.weekStart || '').localeCompare(b.weekStart || ''));
+
+  return { ready, candidatesRaw, excluded };
+}
+
+async function fetchCompletedDryScansReadyToApply(startDate = null, endDate = null) {
+  const evaluation = await evaluateCompletedDryScansReadyToApply(startDate, endDate);
+  return evaluation.ready;
 }
 
 async function buildMaintenanceRecommendations(startDate, endDate) {
@@ -13456,7 +13566,8 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
       write: false,
     }));
 
-  const completedDryScansReadyToApply = await fetchCompletedDryScansReadyToApply();
+  const readyToApplyEvaluation = await evaluateCompletedDryScansReadyToApply(startDate, endDate);
+  const completedDryScansReadyToApply = readyToApplyEvaluation.ready;
 
   const base = {
     ok: true,
@@ -13475,6 +13586,8 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
     dates,
     recommendedJobs,
     completedDryScansReadyToApply,
+    readyToApplyCandidatesRaw: readyToApplyEvaluation.candidatesRaw,
+    readyToApplyExcluded: readyToApplyEvaluation.excluded,
     staleCoverageRules: {
       days0to7AheadMaxAgeHours: 6,
       days8to21AheadMaxAgeHours: 24,
@@ -13624,6 +13737,8 @@ async function buildMaintenanceStatus(startDate, endDate) {
     staleCoverageRules: recommendations.staleCoverageRules,
     nextRecommendedDryScan,
     readyToApplyCount: recommendations.completedDryScansReadyToApply.length,
+    readyToApplyCandidatesRaw: recommendations.readyToApplyCandidatesRaw,
+    readyToApplyExcluded: recommendations.readyToApplyExcluded,
     queuedJobs: queuedRows.map(compactMaintenanceJob),
     runningJobs: runningRows.map(compactMaintenanceJob),
     recentFailures: failedRows.map(compactMaintenanceJob),
