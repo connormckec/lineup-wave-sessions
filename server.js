@@ -73,6 +73,7 @@ const THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES = Math.max(
   parseInt(process.env.THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES || '2', 10),
 );
 const MAINTENANCE_TICK_ENABLED = process.env.MAINTENANCE_TICK_ENABLED === 'true';
+const THRESHOLD_MAINTENANCE_STALE_LOCK_MS = 10 * 60 * 1000;
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -3408,6 +3409,60 @@ function releaseScrapeLockIfStale() {
     return true;
   }
   return false;
+}
+
+async function releaseThresholdJobScrapeLockIfStale() {
+  if (!scrapeInProgress) return false;
+  const ageMs = getScrapeLockAgeMs();
+  if (ageMs == null || ageMs <= THRESHOLD_MAINTENANCE_STALE_LOCK_MS) return false;
+  if (!supabase) return false;
+
+  const { count, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('*', { count: 'exact', head: true })
+    .eq('status', 'running');
+  if (error || (count || 0) > 0) return false;
+
+  console.warn(
+    `  releasing stale threshold maintenance scrape lock (age ${Math.round(ageMs / 1000)}s, no running threshold_scan_jobs)`,
+  );
+  releaseScrapeLock();
+  collectorState.scrapeLockReleasedReason = 'threshold_no_running_jobs_stale_lock';
+  collectorState.scrapeLockReleasedAt = new Date().toISOString();
+  return true;
+}
+
+function thresholdScanJobNeedsScrapeLock(job) {
+  const mode = job?.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
+  return mode !== THRESHOLD_SCAN_JOB_MODE_APPLY;
+}
+
+function getThresholdScanJobPriorityBucket(job) {
+  const mode = job?.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
+  if (mode === THRESHOLD_SCAN_JOB_MODE_APPLY) return 0;
+
+  const dates = job?.results_json?.targetDates || job?.dates || [];
+  const weekStart = job?.results_json?.weekStart
+    || (dates[0] ? getMondayWeekStartIso(String(dates[0])) : null);
+  const anchor = dates.length ? [...dates].map(String).sort()[0] : weekStart;
+  const daysAhead = anchor ? daysFromToday(anchor) : 999;
+  return daysAhead <= 21 ? 1 : 2;
+}
+
+function compareThresholdScanJobPriority(a, b) {
+  const bucketA = getThresholdScanJobPriorityBucket(a);
+  const bucketB = getThresholdScanJobPriorityBucket(b);
+  if (bucketA !== bucketB) return bucketA - bucketB;
+
+  const datesA = a?.results_json?.targetDates || a?.dates || [];
+  const datesB = b?.results_json?.targetDates || b?.dates || [];
+  const anchorA = datesA.length ? [...datesA].map(String).sort()[0] : (a?.results_json?.weekStart || '');
+  const anchorB = datesB.length ? [...datesB].map(String).sort()[0] : (b?.results_json?.weekStart || '');
+  const daysA = anchorA ? daysFromToday(anchorA) : 999;
+  const daysB = anchorB ? daysFromToday(anchorB) : 999;
+  if (daysA !== daysB) return daysA - daysB;
+
+  return String(a.created_at || '').localeCompare(String(b.created_at || ''));
 }
 
 function recordPageCrash(stage, err, { weekKey = null, failureReason = 'failed_page_crash', tier = null } = {}) {
@@ -14129,34 +14184,11 @@ async function recoverStaleThresholdScanJobs() {
 }
 
 async function claimThresholdScanJobWorker() {
-  if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
-    return {
-      claimed: null,
-      reason: 'scrape_in_progress',
-    };
-  }
-
-  try {
-    await recoverStaleThresholdScanJobs();
-    const claim = await claimNextThresholdScanJob();
-    if (!claim.claimed) {
-      releaseScrapeLock();
-      return {
-        claimed: null,
-        reason: claim.reason,
-      };
-    }
-    return {
-      claimed: claim.claimed,
-      reason: null,
-    };
-  } catch (err) {
-    releaseScrapeLock();
-    throw err;
-  }
+  await recoverStaleThresholdScanJobs();
+  return claimNextThresholdScanJob();
 }
 
-async function processThresholdScanJobInBackground(job) {
+async function processThresholdScanJobInBackground(job, { lockAcquired = false } = {}) {
   const mode = job.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
   try {
     if (mode === THRESHOLD_SCAN_JOB_MODE_APPLY) {
@@ -14191,57 +14223,82 @@ async function processThresholdScanJobInBackground(job) {
       }
     }
   } finally {
-    releaseScrapeLock();
+    if (lockAcquired === true) {
+      releaseScrapeLock();
+    }
   }
 }
 
 async function claimNextThresholdScanJob() {
   if (!supabase) {
-    return { claimed: null, reason: 'supabase_not_configured' };
+    return { claimed: null, reason: 'supabase_not_configured', lockAcquired: false };
   }
+
+  await releaseThresholdJobScrapeLockIfStale();
 
   const { count: runningCount, error: runningError } = await supabase
     .from('threshold_scan_jobs')
     .select('*', { count: 'exact', head: true })
     .eq('status', 'running');
   if (runningError) {
-    return { claimed: null, reason: runningError.message };
+    return { claimed: null, reason: runningError.message, lockAcquired: false };
   }
   if ((runningCount || 0) > 0) {
-    return { claimed: null, reason: 'job_already_running' };
+    return { claimed: null, reason: 'job_already_running', lockAcquired: false };
   }
 
-  const { data: nextJob, error: nextError } = await supabase
+  const { data: queuedJobs, error: nextError } = await supabase
     .from('threshold_scan_jobs')
     .select('*')
     .eq('status', 'queued')
     .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .limit(50);
   if (nextError) {
-    return { claimed: null, reason: nextError.message };
+    return { claimed: null, reason: nextError.message, lockAcquired: false };
   }
-  if (!nextJob) {
-    return { claimed: null, reason: 'no_queued_jobs' };
+  if (!queuedJobs?.length) {
+    return { claimed: null, reason: 'no_queued_jobs', lockAcquired: false };
   }
 
-  const { data: claimed, error: claimError } = await supabase
-    .from('threshold_scan_jobs')
-    .update({
-      status: 'running',
-      started_at: new Date().toISOString(),
-    })
-    .eq('id', nextJob.id)
-    .eq('status', 'queued')
-    .select('*')
-    .maybeSingle();
-  if (claimError) {
-    return { claimed: null, reason: claimError.message };
+  const sortedJobs = [...queuedJobs].sort(compareThresholdScanJobPriority);
+  for (const nextJob of sortedJobs) {
+    const needsScrapeLock = thresholdScanJobNeedsScrapeLock(nextJob);
+    let lockAcquired = false;
+
+    if (needsScrapeLock) {
+      if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
+        continue;
+      }
+      lockAcquired = true;
+    }
+
+    try {
+      const { data: claimed, error: claimError } = await supabase
+        .from('threshold_scan_jobs')
+        .update({
+          status: 'running',
+          started_at: new Date().toISOString(),
+        })
+        .eq('id', nextJob.id)
+        .eq('status', 'queued')
+        .select('*')
+        .maybeSingle();
+      if (claimError) {
+        if (lockAcquired) releaseScrapeLock();
+        return { claimed: null, reason: claimError.message, lockAcquired: false };
+      }
+      if (!claimed) {
+        if (lockAcquired) releaseScrapeLock();
+        continue;
+      }
+      return { claimed, reason: null, lockAcquired };
+    } catch (err) {
+      if (lockAcquired) releaseScrapeLock();
+      throw err;
+    }
   }
-  if (!claimed) {
-    return { claimed: null, reason: 'claim_race_lost' };
-  }
-  return { claimed, reason: null };
+
+  return { claimed: null, reason: 'scrape_in_progress', lockAcquired: false };
 }
 
 async function persistThresholdScanJobProgress(jobId, resultsJson) {
@@ -19371,8 +19428,9 @@ app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
     }
 
     const job = claim.claimed;
+    const lockAcquired = claim.lockAcquired === true;
     setImmediate(() => {
-      processThresholdScanJobInBackground(job).catch((err) => {
+      processThresholdScanJobInBackground(job, { lockAcquired }).catch((err) => {
         console.error('threshold scan job unhandled background error:', err.message);
       });
     });
