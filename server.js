@@ -54,6 +54,10 @@ app.get('/session-data-status.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'session-data-status.js'));
 });
+app.get('/browse-session-filters.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'browse-session-filters.js'));
+});
 
 const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';

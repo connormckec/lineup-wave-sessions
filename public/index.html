@@ -436,6 +436,7 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
+<script src="/browse-session-filters.js"></script>
 <div id="app">
 
   <header id="header">
@@ -585,6 +586,7 @@ const STORAGE = {
   ntfyTopic: 'ap_ntfy_topic',
   watchlist: 'ap_watchlist',
   statusCache: 'ap_status_cache',
+  showLessons: 'ap_show_lessons',
 };
 
 const SW_CACHE_VERSION = '6';
@@ -1518,8 +1520,8 @@ const WAVE_FILTERS = [
   { wave: 1, label: 'Left Wave' },
   { wave: 2, label: 'Right Wave' },
 ];
-const LESSON_WAVES = [3, 4];
 const BOOKING_TZ = 'America/New_York';
+const BSF = () => window.BrowseSessionFilters;
 
 function getParkTodayIso() {
   return todayKey();
@@ -1613,13 +1615,22 @@ function surfSessions(list) {
 }
 
 function isLessonSession(s) {
-  return LESSON_WAVES.includes(s.wave);
+  return BSF().isLessonSession(s);
 }
 
 function matchesWaveFilter(s) {
-  if (activeWave != null) return s.wave === activeWave;
-  if (!showLessons && isLessonSession(s)) return false;
-  return true;
+  return BSF().matchesWaveFilter(s, { showLessons, activeWave });
+}
+
+function loadShowLessonsPreference() {
+  const raw = localStorage.getItem(STORAGE.showLessons);
+  if (raw === '1' || raw === 'true') return true;
+  if (raw === '0' || raw === 'false') return false;
+  return false;
+}
+
+function saveShowLessonsPreference(value) {
+  localStorage.setItem(STORAGE.showLessons, value ? '1' : '0');
 }
 
 function sessionCapacity(level, session) {
@@ -2240,7 +2251,7 @@ let data          = {
 };
 let activeDayKey  = todayKey();
 let activeWave    = null;
-let showLessons   = false;
+let showLessons   = loadShowLessonsPreference();
 let filterFromH   = null;
 let filterToH     = null;
 let activeLevels  = new Set();
@@ -2888,6 +2899,7 @@ function setWave(wave) {
 
 function toggleLessons() {
   showLessons = !showLessons;
+  saveShowLessonsPreference(showLessons);
   renderAll();
 }
 
