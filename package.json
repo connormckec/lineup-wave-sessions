@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-threshold-maintenance-regression.js && node scripts/test-apply-prepared-completion-regression.js && node scripts/test-route-auth-regression.js && node scripts/test-scheduler-mode-regression.js && node scripts/test-session-date-coverage-regression.js && node scripts/test-session-date-coverage-truncation-regression.js && node scripts/test-session-data-status-regression.js && node scripts/test-notification-pipeline-regression.js && node scripts/test-notification-hardening-regression.js",
+    "test": "node scripts/test-threshold-maintenance-regression.js && node scripts/test-apply-prepared-completion-regression.js && node scripts/test-route-auth-regression.js && node scripts/test-scheduler-mode-regression.js && node scripts/test-session-date-coverage-regression.js && node scripts/test-session-date-coverage-truncation-regression.js && node scripts/test-session-data-status-regression.js && node scripts/test-notification-pipeline-regression.js && node scripts/test-notification-hardening-regression.js && node scripts/test-profile-auth-frontend-regression.js",
     "postinstall": "npx playwright install chromium"
   },
   "dependencies": {

@@ -1,5 +1,5 @@
-/* Lineup service worker v3 — never cache API or index.html */
-const CACHE_VERSION = '3';
+/* Lineup service worker v4 — never cache API or index.html */
+const CACHE_VERSION = '4';
 const STATIC_CACHE = `lineup-static-v${CACHE_VERSION}`;
 
 const STATIC_ASSETS = [

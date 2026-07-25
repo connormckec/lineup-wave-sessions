@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
@@ -571,8 +573,10 @@ input.field:focus{border-color:var(--accent)}
 
 </div>
 
+<script src="/profile-auth-client.js?v=2"></script>
 <script>
 const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
+const PAC = () => window.ProfileAuthClient;
 
 const STORAGE = {
   userKey: 'ap_user_key',
@@ -583,8 +587,10 @@ const STORAGE = {
   statusCache: 'ap_status_cache',
 };
 
-const SW_CACHE_VERSION = '5';
+const SW_CACHE_VERSION = '6';
+const APP_SHELL_BUILD = '2026-07-25-profile-auth-v2';
 let cachedUserKey = null;
+let cachedProfileCode = null;
 let lastFocusRefreshAt = 0;
 let serverWatchlistCount = null;
 let uiLoading = true;
@@ -654,18 +660,47 @@ async function fetchApi(url, options = {}, timeoutMs = 45000) {
   }
 }
 
+function getSavedNormalizedProfileCode() {
+  if (cachedProfileCode) return cachedProfileCode;
+  const stored = PAC().normalizeProfileCode(localStorage.getItem(STORAGE.profileCode) || '');
+  if (stored) {
+    cachedProfileCode = stored;
+    return stored;
+  }
+  const input = document.getElementById('profile-code-input');
+  const fromInput = PAC().normalizeProfileCode(input?.value || '');
+  return fromInput || '';
+}
+
 function getProfileAuthHeaders(extraHeaders = {}) {
-  const code = getSavedProfileCode() || getProfileCodeForInput();
-  if (!code) return { ...extraHeaders };
-  return {
-    ...extraHeaders,
-    Authorization: `Bearer ${code}`,
-  };
+  return PAC().buildProfileAuthHeaders(getSavedNormalizedProfileCode(), extraHeaders);
+}
+
+function formatProfileAuthError(code) {
+  return PAC().formatProfileAuthError(code);
+}
+
+function getProfileAuthDiagnostic() {
+  return PAC().buildProfileAuthDiagnostic(getSavedNormalizedProfileCode(), cachedUserKey || getUserKey());
 }
 
 async function fetchProfileApi(url, options = {}, timeoutMs = 45000) {
-  const headers = getProfileAuthHeaders(options.headers || {});
-  return fetchApi(url, { ...options, headers }, timeoutMs);
+  const auth = getProfileAuthHeaders(options.headers || {});
+  if (!auth.ok) {
+    const err = new Error(formatProfileAuthError(auth.error));
+    err.code = auth.error;
+    throw err;
+  }
+  const res = await fetchApi(url, { ...options, headers: auth.headers }, timeoutMs);
+  if (res.status === 401) {
+    const body = await res.json().catch(() => ({}));
+    if (body.error === 'profile_auth_required' || body.error === 'invalid_profile_secret') {
+      const err = new Error(formatProfileAuthError(body.error));
+      err.code = body.error;
+      throw err;
+    }
+  }
+  return res;
 }
 
 function extractSessionsFromPayload(payload) {
@@ -1080,37 +1115,30 @@ let bootState = 'loading';
 startBootFailsafe();
 
 function normalizeProfileCode(code) {
-  return (code || '').trim().toLowerCase().replace(/\s+/g, '-');
+  return PAC().normalizeProfileCode(code);
 }
 
 function getSavedProfileCode() {
-  return (localStorage.getItem(STORAGE.profileCode) || '').trim();
+  return getSavedNormalizedProfileCode();
 }
 
 function setProfileCode(value) {
   const normalized = normalizeProfileCode(value);
+  cachedProfileCode = normalized || null;
   if (normalized) {
     localStorage.setItem(STORAGE.profileCode, normalized);
   } else {
     localStorage.removeItem(STORAGE.profileCode);
+    cachedProfileCode = null;
   }
 }
 
 function getProfileCodeForInput() {
-  return getSavedProfileCode() || '';
+  return getSavedNormalizedProfileCode();
 }
 
 async function deriveUserKeyFromProfileCode(code) {
-  const normalized = normalizeProfileCode(code);
-  if (!normalized) return null;
-  try {
-    const bytes = new TextEncoder().encode(`lineup-profile-v1:${normalized}`);
-    const buf = await crypto.subtle.digest('SHA-256', bytes);
-    const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-    return `profile:${hex.slice(0, 32)}`;
-  } catch {
-    return `profile:${normalized}`;
-  }
+  return PAC().deriveUserKeyFromProfileCodeAsync(code);
 }
 
 async function applyProfileUserKey(code) {
@@ -1122,10 +1150,10 @@ async function applyProfileUserKey(code) {
 }
 
 async function initProfileUserKey() {
-  const code = getSavedProfileCode();
+  const code = getSavedNormalizedProfileCode();
   if (code) {
     await applyProfileUserKey(code);
-    console.log(`[lineup] profile user_key=${cachedUserKey}`);
+    console.log(`[lineup] profile user_key=${cachedUserKey?.slice(0, 16)}…`);
   }
   return cachedUserKey;
 }
@@ -1137,33 +1165,38 @@ function getUserKey() {
     cachedUserKey = stored;
     return stored;
   }
-  if (getSavedProfileCode()) {
-    console.warn('[lineup] user_key missing but profile code exists — wait for initProfileUserKey');
+  if (getSavedNormalizedProfileCode()) {
+    console.warn('[lineup] user_key pending — profile code saved, waiting for initProfileUserKey');
     return '';
   }
-  cachedUserKey = crypto.randomUUID();
-  localStorage.setItem(STORAGE.userKey, cachedUserKey);
-  return cachedUserKey;
+  return '';
 }
 
 let watchlistLoadState = 'idle';
 
 async function loadWatchlistFromServer() {
-  const userKey = getUserKey();
-  if (!userKey) return localWatchlist;
+  if (!getSavedNormalizedProfileCode()) {
+    watchlistLoadState = localWatchlist.length ? 'ready' : 'idle';
+    return localWatchlist;
+  }
   watchlistLoadState = 'loading';
   renderWatching();
   try {
-    const res = await fetchProfileApi(`/api/watchlist`);
+    const res = await fetchProfileApi('/api/watchlist');
     const body = await res.json();
-    if (!res.ok) throw new Error(body.error || body.watchlistLastError || res.statusText);
+    if (!res.ok) throw new Error(formatProfileAuthError(body.error) || body.watchlistLastError || res.statusText);
+    if (body.user_key) {
+      cachedUserKey = body.user_key;
+      localStorage.setItem(STORAGE.userKey, body.user_key);
+    }
     mergeWatchlistFromServer(asSessionArray(body.items));
     if (body.watchlistLastError) {
       console.warn('[loadWatchlist] server warning:', body.watchlistLastError);
     }
     serverWatchlistCount = body.watchlistCount ?? asSessionArray(body.items).length;
     watchlistLoadState = 'ready';
-    console.log(`[lineup] loaded ${watchlistForUi().length} watchlist row(s) for ${userKey.slice(0, 16)}…`);
+    const keyLabel = (cachedUserKey || body.user_key || '').slice(0, 16);
+    console.log(`[lineup] loaded ${watchlistForUi().length} watchlist row(s) for ${keyLabel}…`);
     return watchlistForUi();
   } catch (e) {
     console.warn('[loadWatchlist]', e);
@@ -1178,6 +1211,13 @@ async function fetchWatchlistFromServer() {
 
 async function syncProfileNow() {
   const msgEl = document.getElementById('profile-code-msg');
+  if (!getSavedNormalizedProfileCode()) {
+    if (msgEl) {
+      msgEl.textContent = formatProfileAuthError('profile_code_missing');
+      msgEl.style.color = '#ff6b35';
+    }
+    return;
+  }
   try {
     await loadWatchlistFromServer();
     await pushLocalWatchlistToServer();
@@ -1189,7 +1229,7 @@ async function syncProfileNow() {
     renderSetup();
   } catch (e) {
     if (msgEl) {
-      msgEl.textContent = `Sync failed: ${e.message}`;
+      msgEl.textContent = e.code ? formatProfileAuthError(e.code) : `Sync failed: ${e.message}`;
       msgEl.style.color = '#ff6b35';
     }
   }
@@ -1302,13 +1342,12 @@ function isWatched(sessionKey) {
 }
 
 async function pushLocalWatchlistToServer() {
-  if (!localWatchlist.length) return;
+  if (!localWatchlist.length || !getSavedNormalizedProfileCode()) return;
   try {
     const res = await fetchProfileApi('/api/watchlist/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_key: getUserKey(),
         ntfy_topic: getNtfyTopic(),
         replace: false,
         items: localWatchlist.map(w => ({
@@ -1348,14 +1387,21 @@ function saveNtfyTopic() {
 }
 
 async function saveNtfyTopicToServer(topic) {
+  const msgEl = document.getElementById('ntfy-topic-msg');
+  if (!getSavedNormalizedProfileCode()) {
+    if (msgEl) {
+      msgEl.textContent = formatProfileAuthError('profile_code_missing');
+      msgEl.style.color = '#ff6b35';
+    }
+    throw new Error('profile_code_missing');
+  }
   const res = await fetchProfileApi('/api/notification-profile', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ntfyTopic: topic }),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
-  const msgEl = document.getElementById('ntfy-topic-msg');
+  if (!res.ok) throw new Error(formatProfileAuthError(body.error) || `HTTP ${res.status}`);
   if (msgEl) {
     msgEl.textContent = 'Topic saved to your profile.';
     msgEl.style.color = '#00c9a7';
@@ -1377,11 +1423,18 @@ async function loadNotificationProfileFromServer() {
 
 async function sendTestNotification() {
   if (!alertsEnabled()) return;
-  const topic = getNtfyTopic();
   const msgEl = document.getElementById('ntfy-topic-msg');
+  if (!getSavedNormalizedProfileCode()) {
+    if (msgEl) {
+      msgEl.textContent = formatProfileAuthError('profile_code_missing');
+      msgEl.style.color = '#ff6b35';
+    }
+    return;
+  }
+  const topic = getNtfyTopic();
   if (!topic) {
     if (msgEl) {
-      msgEl.textContent = 'Enter the demo topic first.';
+      msgEl.textContent = 'Enter and save your ntfy topic first.';
       msgEl.style.color = '#ff6b35';
     }
     return;
@@ -1393,14 +1446,14 @@ async function sendTestNotification() {
       body: JSON.stringify({}),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Test failed');
+    if (!res.ok) throw new Error(formatProfileAuthError(body.error) || 'Test failed');
     if (msgEl) {
       msgEl.textContent = 'Test sent — check your ntfy app.';
       msgEl.style.color = '#00c9a7';
     }
   } catch (e) {
     if (msgEl) {
-      msgEl.textContent = `Test failed: ${e.message}`;
+      msgEl.textContent = e.code ? formatProfileAuthError(e.code) : `Test failed: ${e.message}`;
       msgEl.style.color = '#ff6b35';
     }
   }
@@ -2198,10 +2251,9 @@ async function triggerBackgroundDetailRefresh(isoDate) {
 async function refreshStatusInBackground({ silent = true } = {}) {
   try {
     const params = new URLSearchParams({
-      user_key: getUserKey(),
       selected_date: activeDayKey || todayKey(),
     });
-    const profileCode = getSavedProfileCode();
+    const profileCode = getSavedNormalizedProfileCode();
     if (profileCode) params.set('profile_code', profileCode);
     const { payload, sessions: incomingRaw } = await fetchSessionsPayload(params);
     const incoming = normalizeSessions(incomingRaw);
@@ -2612,9 +2664,15 @@ function renderDebugState() {
     }
   };
   const swActive = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+  const profileDiag = getProfileAuthDiagnostic();
   const rows = [
+    ['App shell build', APP_SHELL_BUILD],
     ['App version', data.appVersion || '—'],
     ['Build time', fmtTime(data.buildTime)],
+    ['Profile code present', profileDiag.profileCodePresent ? 'yes' : 'no'],
+    ['Profile code length', String(profileDiag.profileCodeLength || 0)],
+    ['Derived user-key prefix', profileDiag.derivedUserKeyPrefix || '—'],
+    ['Auth header prepared', profileDiag.authHeaderPrepared ? 'yes' : 'no'],
     ['Selected date (park)', activeDayKey || getParkTodayIso()],
     ['Browser local date', browserLocalDateIso()],
     ['App Eastern today', getParkTodayIso()],
@@ -2663,11 +2721,13 @@ function renderSetup() {
   }
   if (profileHint) {
     const key = getUserKey();
-    const code = getSavedProfileCode() || getProfileCodeForInput();
+    const diag = getProfileAuthDiagnostic();
     profileHint.hidden = false;
     profileHint.textContent = key
-      ? `Profile: ${code || '—'} · user_key ${key.slice(0, 24)}… · ${watchlistForUi().length} in Lineup`
-      : '';
+      ? `Profile saved · user_key ${key.slice(0, 24)}… · ${watchlistForUi().length} in Lineup · auth ${diag.authHeaderPrepared ? 'ready' : 'missing'}`
+      : (diag.profileCodePresent
+        ? 'Profile code saved — deriving identity…'
+        : '');
   }
   if (profileMsg && !profileMsg.textContent) {
     profileMsg.textContent = getSavedProfileCode()
@@ -2681,8 +2741,12 @@ function renderSetup() {
     return;
   }
 
-  if (subscribeHint && getNtfyTopic()) {
-    subscribeHint.textContent = `Subscribe to this exact topic in ntfy: ${getNtfyTopic()}`;
+  if (subscribeHint) {
+    const topic = getNtfyTopic();
+    const masked = PAC().maskNtfyTopicForDisplay(topic);
+    subscribeHint.textContent = masked
+      ? `Subscribe to your saved topic in ntfy (${masked}). Use the same value in the Topic field below.`
+      : 'Subscribe to your saved topic in the ntfy app after you save it below.';
   }
 
   if (input && document.activeElement !== input) {
@@ -2705,9 +2769,13 @@ function renderSetup() {
 
 async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
-  const userKey = getUserKey();
   const topic = alertsEnabled() ? getNtfyTopic() : null;
   const existing = localWatchlist.find(w => (w.session_key || w.key) === s.key);
+
+  if (!getSavedNormalizedProfileCode()) {
+    showStatusMessage(`<span class="check-time">${formatProfileAuthError('profile_code_missing')}</span>`);
+    return;
+  }
 
   if (existing) {
     localWatchlist = localWatchlist.filter(w => w.id !== existing.id);
@@ -2722,10 +2790,10 @@ async function toggleWatch(sJson) {
       console.warn('[toggleWatch] remove failed', e);
       localWatchlist.push(existing);
       saveLocalWatchlist(localWatchlist);
+      showStatusMessage(`<span class="check-time">${e.code ? formatProfileAuthError(e.code) : 'Could not remove from Lineup'}</span>`);
     }
   } else {
     const payload = {
-      user_key: userKey,
       ntfy_topic: topic,
       session_key: s.key,
       key: s.key,
@@ -2749,7 +2817,7 @@ async function toggleWatch(sJson) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
       console.warn('[toggleWatch] add failed', body.error || body.watchlistLastError);
-      alert(body.error || 'Could not add to Lineup');
+      showStatusMessage(`<span class="check-time">${formatProfileAuthError(body.error) || 'Could not add to Lineup'}</span>`);
     } else if (body.item) {
       const idx = localWatchlist.findIndex(w => (w.session_key || w.key) === s.key);
       if (idx >= 0) localWatchlist[idx] = body.item;
@@ -2763,8 +2831,11 @@ async function toggleWatch(sJson) {
 }
 
 async function removeWatch(id) {
-  const userKey = getUserKey();
   const existing = localWatchlist.find(w => w.id === id);
+  if (!getSavedNormalizedProfileCode()) {
+    showStatusMessage(`<span class="check-time">${formatProfileAuthError('profile_code_missing')}</span>`);
+    return;
+  }
   localWatchlist = localWatchlist.filter(w => w.id !== id);
   saveLocalWatchlist(localWatchlist);
   try {

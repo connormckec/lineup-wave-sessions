@@ -37,8 +37,9 @@ app.use((req, res, next) => {
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     res.set('Surrogate-Control', 'no-store');
-  } else if (req.path === '/' || req.path === '/index.html') {
-    res.set('Cache-Control', 'no-cache');
+  } else if (req.path === '/' || req.path === '/index.html' || req.path === '/profile-auth-client.js') {
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.set('Pragma', 'no-cache');
   } else if (/\.(png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(req.path)) {
     res.set('Cache-Control', 'public, max-age=86400');
   } else if (/\.(js|css)$/i.test(req.path)) {
