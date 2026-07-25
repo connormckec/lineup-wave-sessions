@@ -740,6 +740,9 @@ let dateCoverageState = {
   endpoint: null,
   rangeKey: null,
   error: null,
+  complete: null,
+  rowCountScanned: null,
+  requestedRange: null,
 };
 let dateCoverageFetchToken = 0;
 
@@ -833,6 +836,18 @@ function coverageStatusFromSelectedDateMeta({ statusReason, sessionsCount = 0 } 
   return null;
 }
 
+function mergeCoverageByDatePreservingConfirmed(prevByDate = {}, nextByDate = {}) {
+  const merged = { ...prevByDate };
+  for (const [isoDate, row] of Object.entries(nextByDate || {})) {
+    const prev = merged[isoDate];
+    if (prev?.status === 'has_sessions' && row?.status !== 'has_sessions') {
+      continue;
+    }
+    merged[isoDate] = row;
+  }
+  return merged;
+}
+
 function pickerClassForCoverageStatus(status) {
   if (status === 'has_sessions') return 'has-sessions';
   if (status === 'checked_empty') return 'no-sessions checked-empty';
@@ -874,8 +889,11 @@ async function loadDateCoverage({ force = false } = {}) {
     for (const row of payload.dates || []) {
       if (row?.isoDate) byDate[row.isoDate] = row;
     }
+    const mergedByDate = payload.complete === false
+      ? mergeCoverageByDatePreservingConfirmed(dateCoverageState.byDate, byDate)
+      : byDate;
     dateCoverageState = {
-      byDate: mergeSelectedDateCoverage(byDate, activeDayKey, {
+      byDate: mergeSelectedDateCoverage(mergedByDate, activeDayKey, {
         statusReason: selectedDateMeta.statusReason,
         sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
         lastCheckedAt: payload.fetchedAt || data.lastSuccessfulScrape || null,
@@ -885,6 +903,11 @@ async function loadDateCoverage({ force = false } = {}) {
       endpoint,
       rangeKey: range.rangeKey,
       error: null,
+      complete: payload.complete ?? true,
+      rowCountScanned: payload.rowCountScanned ?? null,
+      requestedRange: payload.startDate && payload.endDate
+        ? `${payload.startDate}:${payload.endDate}`
+        : range.rangeKey,
     };
   } catch (err) {
     if (token !== dateCoverageFetchToken) return;
@@ -2568,6 +2591,10 @@ function renderDebugState() {
       ? fmtTime(new Date(dateCoverageState.lastFetchedAt).toISOString())
       : '—'],
     ['Coverage fetch error', dateCoverageState.error || '—'],
+    ['Coverage complete', dateCoverageState.complete == null ? '—' : String(dateCoverageState.complete)],
+    ['Coverage rows scanned', dateCoverageState.rowCountScanned == null ? '—' : String(dateCoverageState.rowCountScanned)],
+    ['Coverage date count', String(Object.keys(dateCoverageState.byDate || {}).length)],
+    ['Coverage requested range', dateCoverageState.requestedRange || '—'],
     ['dataSource', selectedDateMeta.dataSource || data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
     ['schemaHealth', data.schemaHealth?.missingTables?.length

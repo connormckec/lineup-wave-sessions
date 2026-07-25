@@ -19019,6 +19019,17 @@ async function buildSessionDateCoveragePayload(startDate, endDate) {
   if (!range.ok) return range;
 
   let rows = [];
+  let queryComplete = true;
+  let rowCountScanned = 0;
+
+  const mapStoredSessionToCoverageRow = (session) => ({
+    iso_date: sessionDateKey(session),
+    session_key: session.key || session.session_key || null,
+    session_type: session.level || session.session_type || null,
+    last_basic_check_at: session.lastBasicCheckAt || session.last_basic_check_at || null,
+    raw: { wave: session.wave ?? session.raw?.wave ?? null },
+  });
+
   if (supabase) {
     if (!supabaseSchemaHealth.checkedAt) {
       auditSupabaseSchema().catch(console.error);
@@ -19029,29 +19040,35 @@ async function buildSessionDateCoveragePayload(startDate, endDate) {
           const dk = sessionDateKey(session);
           return dk && dk >= range.startDate && dk <= range.endDate;
         })
-        .map((session) => ({
-          iso_date: sessionDateKey(session),
-          session_type: session.level || session.session_type || null,
-          last_basic_check_at: session.lastBasicCheckAt || session.last_basic_check_at || null,
-          raw: { wave: session.wave ?? session.raw?.wave ?? null },
-        }));
+        .map(mapStoredSessionToCoverageRow);
+      rowCountScanned = rows.length;
     } else {
-      const { data, error } = await supabase
-        .from('current_sessions')
-        .select('iso_date, session_type, last_basic_check_at, raw')
-        .eq('park', PARK)
-        .gte('iso_date', range.startDate)
-        .lte('iso_date', range.endDate);
-      if (error) {
-        if (isMissingTableError(error)) {
-          supabaseSchemaHealth.currentSessionsAvailable = false;
-        } else {
-          throw error;
-        }
-      } else {
-        rows = data || [];
-        if (rows.length) supabaseSchemaHealth.currentSessionsAvailable = true;
-      }
+      const pageResult = await sessionDateCoverage.fetchAllCoverageRowsPaginated(
+        async ({ offset, limit }) => {
+          const { data, error } = await supabase
+            .from('current_sessions')
+            .select('iso_date, session_type, last_basic_check_at, raw, session_key')
+            .eq('park', PARK)
+            .gte('iso_date', range.startDate)
+            .lte('iso_date', range.endDate)
+            .order('iso_date', { ascending: true })
+            .order('session_key', { ascending: true })
+            .range(offset, offset + limit - 1);
+          if (error) {
+            if (isMissingTableError(error)) {
+              supabaseSchemaHealth.currentSessionsAvailable = false;
+              return [];
+            }
+            throw error;
+          }
+          if (data?.length) supabaseSchemaHealth.currentSessionsAvailable = true;
+          return data || [];
+        },
+        { pageSize: sessionDateCoverage.COVERAGE_QUERY_PAGE_SIZE },
+      );
+      rows = pageResult.rows;
+      queryComplete = pageResult.complete;
+      rowCountScanned = pageResult.rowCountScanned;
     }
   } else {
     rows = allStoredSessions()
@@ -19059,30 +19076,20 @@ async function buildSessionDateCoveragePayload(startDate, endDate) {
         const dk = sessionDateKey(session);
         return dk && dk >= range.startDate && dk <= range.endDate;
       })
-      .map((session) => ({
-        iso_date: sessionDateKey(session),
-        session_type: session.level || session.session_type || null,
-        last_basic_check_at: session.lastBasicCheckAt || session.last_basic_check_at || null,
-        raw: { wave: session.wave ?? session.raw?.wave ?? null },
-      }));
+      .map(mapStoredSessionToCoverageRow);
+    rowCountScanned = rows.length;
   }
 
-  const aggregatedByDate = sessionDateCoverage.aggregateCoverageByDate(rows);
-  const dates = sessionDateCoverage.buildDateCoverageList(
-    range.startDate,
-    range.endDate,
-    aggregatedByDate,
-    datesCheckedEmpty,
-    persistedDatesChecked,
-  );
-
-  return {
-    ok: true,
+  return sessionDateCoverage.buildDateCoveragePayload({
     startDate: range.startDate,
     endDate: range.endDate,
+    rows,
+    queryComplete,
+    rowCountScanned,
+    checkedEmptySet: datesCheckedEmpty,
+    persistedCheckedSet: persistedDatesChecked,
     fetchedAt: new Date().toISOString(),
-    dates,
-  };
+  });
 }
 
 app.get('/api/session-date-coverage', async (req, res) => {
