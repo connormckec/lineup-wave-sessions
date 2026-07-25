@@ -498,7 +498,7 @@ input.field:focus{border-color:var(--accent)}
         <h3>Profile Sync Code</h3>
         <p class="profile-hint">Enter the same code on your phone and computer to share your Lineup and alerts. Internal beta only — not full login.</p>
         <div class="lbl">Sync code</div>
-        <input class="field" type="text" id="profile-code-input" placeholder="ap-surf-connor-2026" autocomplete="off" autocapitalize="none" spellcheck="false">
+        <input class="field" type="text" id="profile-code-input" placeholder="your-profile-sync-code" autocomplete="off" autocapitalize="none" spellcheck="false">
         <div class="setup-actions">
           <button type="button" class="btn btn-outline" onclick="saveProfileCode()">Save code</button>
           <button type="button" class="btn btn-outline" onclick="syncProfileNow()">Sync now</button>
@@ -510,9 +510,9 @@ input.field:focus{border-color:var(--accent)}
       <div class="setup-block" id="demo-alerts-block">
         <h3>Demo Alerts</h3>
         <p class="demo-intro">Internal demo only. For now, alerts use ntfy so we can test the watchlist logic before building native push.</p>
-        <p class="demo-subscribe" id="ntfy-subscribe-hint">Subscribe to this exact topic in ntfy: <strong id="ntfy-default-topic">ap-surf-connor-2026</strong></p>
+        <p class="demo-subscribe" id="ntfy-subscribe-hint">Subscribe to your saved topic in the ntfy app after you save it below.</p>
         <div class="lbl">Topic</div>
-        <input class="field" type="text" id="ntfy-topic-input" placeholder="ap-surf-connor-2026" autocomplete="off">
+        <input class="field" type="text" id="ntfy-topic-input" placeholder="your-ntfy-topic" autocomplete="off">
         <div class="setup-actions">
           <button type="button" class="btn btn-outline" onclick="saveNtfyTopic()">Save</button>
           <button type="button" class="btn btn-outline" onclick="sendTestNotification()">Send test notification</button>
@@ -583,7 +583,6 @@ const STORAGE = {
   statusCache: 'ap_status_cache',
 };
 
-const DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
 const SW_CACHE_VERSION = '5';
 let cachedUserKey = null;
 let lastFocusRefreshAt = 0;
@@ -653,6 +652,20 @@ async function fetchApi(url, options = {}, timeoutMs = 45000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function getProfileAuthHeaders(extraHeaders = {}) {
+  const code = getSavedProfileCode() || getProfileCodeForInput();
+  if (!code) return { ...extraHeaders };
+  return {
+    ...extraHeaders,
+    Authorization: `Bearer ${code}`,
+  };
+}
+
+async function fetchProfileApi(url, options = {}, timeoutMs = 45000) {
+  const headers = getProfileAuthHeaders(options.headers || {});
+  return fetchApi(url, { ...options, headers }, timeoutMs);
 }
 
 function extractSessionsFromPayload(payload) {
@@ -1084,11 +1097,7 @@ function setProfileCode(value) {
 }
 
 function getProfileCodeForInput() {
-  const saved = getSavedProfileCode();
-  if (saved) return saved;
-  if (data?.internalDefaultProfileCode) return data.internalDefaultProfileCode;
-  if (data?.internalBetaNotifications) return DEFAULT_PROFILE_CODE;
-  return '';
+  return getSavedProfileCode() || '';
 }
 
 async function deriveUserKeyFromProfileCode(code) {
@@ -1113,11 +1122,11 @@ async function applyProfileUserKey(code) {
 }
 
 async function initProfileUserKey() {
-  let code = getSavedProfileCode();
-  if (!code) code = DEFAULT_PROFILE_CODE;
-  await applyProfileUserKey(code);
-  if (!getSavedProfileCode()) setProfileCode(code);
-  console.log(`[lineup] profile_code=${code} user_key=${cachedUserKey}`);
+  const code = getSavedProfileCode();
+  if (code) {
+    await applyProfileUserKey(code);
+    console.log(`[lineup] profile user_key=${cachedUserKey}`);
+  }
   return cachedUserKey;
 }
 
@@ -1145,7 +1154,7 @@ async function loadWatchlistFromServer() {
   watchlistLoadState = 'loading';
   renderWatching();
   try {
-    const res = await fetchApi(`/api/watchlist?user_key=${encodeURIComponent(userKey)}`);
+    const res = await fetchProfileApi(`/api/watchlist`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || body.watchlistLastError || res.statusText);
     mergeWatchlistFromServer(asSessionArray(body.items));
@@ -1230,19 +1239,10 @@ function hasSavedNtfyTopic() {
 }
 
 function getNtfyTopic() {
-  const saved = (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
-  if (saved) return saved;
-  if (data.internalBetaNotifications && data.internalDefaultNtfyTopic) {
-    return data.internalDefaultNtfyTopic;
-  }
-  return '';
+  return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
 }
 
 function getNtfyTopicForInput() {
-  if (hasSavedNtfyTopic()) return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
-  if (data.internalBetaNotifications && data.internalDefaultNtfyTopic) {
-    return data.internalDefaultNtfyTopic;
-  }
   return (localStorage.getItem(STORAGE.ntfyTopic) || '').trim();
 }
 
@@ -1304,7 +1304,7 @@ function isWatched(sessionKey) {
 async function pushLocalWatchlistToServer() {
   if (!localWatchlist.length) return;
   try {
-    const res = await fetchApi('/api/watchlist/sync', {
+    const res = await fetchProfileApi('/api/watchlist/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1333,9 +1333,46 @@ async function syncWatchlistToServer() {
 
 function saveNtfyTopic() {
   const input = document.getElementById('ntfy-topic-input');
-  setNtfyTopic(input?.value || '');
+  const topic = input?.value || '';
+  setNtfyTopic(topic);
+  saveNtfyTopicToServer(topic).catch((err) => {
+    console.warn('[notification-profile]', err);
+    const msgEl = document.getElementById('ntfy-topic-msg');
+    if (msgEl) {
+      msgEl.textContent = `Save failed: ${err?.message || err}`;
+      msgEl.style.color = '#ff6b35';
+    }
+  });
   renderSetup();
   renderStatusBar();
+}
+
+async function saveNtfyTopicToServer(topic) {
+  const res = await fetchProfileApi('/api/notification-profile', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ntfyTopic: topic }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  const msgEl = document.getElementById('ntfy-topic-msg');
+  if (msgEl) {
+    msgEl.textContent = 'Topic saved to your profile.';
+    msgEl.style.color = '#00c9a7';
+  }
+}
+
+async function loadNotificationProfileFromServer() {
+  try {
+    const res = await fetchProfileApi('/api/notification-profile');
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return;
+    if (body.hasTopic && !hasSavedNtfyTopic()) {
+      // Server profile has topic; local cache may be empty until user saves again.
+    }
+  } catch (err) {
+    console.warn('[notification-profile load]', err);
+  }
 }
 
 async function sendTestNotification() {
@@ -1350,10 +1387,10 @@ async function sendTestNotification() {
     return;
   }
   try {
-    const res = await fetchApi('/api/notify/test', {
+    const res = await fetchProfileApi('/api/notify/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ntfy_topic: topic, user_key: getUserKey() }),
+      body: JSON.stringify({}),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || 'Test failed');
@@ -2620,8 +2657,6 @@ function renderSetup() {
   const input = document.getElementById('ntfy-topic-input');
   const msgEl = document.getElementById('ntfy-topic-msg');
   const subscribeHint = document.getElementById('ntfy-subscribe-hint');
-  const defaultTopicEl = document.getElementById('ntfy-default-topic');
-  const defaultTopic = data.internalDefaultNtfyTopic || DEFAULT_PROFILE_CODE;
 
   if (profileInput && document.activeElement !== profileInput) {
     profileInput.value = getProfileCodeForInput();
@@ -2637,7 +2672,7 @@ function renderSetup() {
   if (profileMsg && !profileMsg.textContent) {
     profileMsg.textContent = getSavedProfileCode()
       ? 'Same code on every device shares your Lineup.'
-      : 'Default internal code applied — tap Save to confirm.';
+      : 'Enter a profile sync code and tap Save.';
     profileMsg.style.color = 'var(--sub)';
   }
 
@@ -2646,9 +2681,8 @@ function renderSetup() {
     return;
   }
 
-  if (defaultTopicEl) defaultTopicEl.textContent = defaultTopic;
-  if (subscribeHint) {
-    subscribeHint.innerHTML = `Subscribe to this exact topic in ntfy: <strong id="ntfy-default-topic">${defaultTopic}</strong>`;
+  if (subscribeHint && getNtfyTopic()) {
+    subscribeHint.textContent = `Subscribe to this exact topic in ntfy: ${getNtfyTopic()}`;
   }
 
   if (input && document.activeElement !== input) {
@@ -2679,7 +2713,7 @@ async function toggleWatch(sJson) {
     localWatchlist = localWatchlist.filter(w => w.id !== existing.id);
     saveLocalWatchlist(localWatchlist);
     try {
-      const res = await fetchApi(`/api/watchlist/${existing.id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+      const res = await fetchProfileApi(`/api/watchlist/${existing.id}`, { method: 'DELETE' });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || res.statusText);
@@ -2707,7 +2741,7 @@ async function toggleWatch(sJson) {
       date: s.date,
       wave: s.wave,
     };
-    const res = await fetchApi('/api/watchlist', {
+    const res = await fetchProfileApi('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -2734,7 +2768,7 @@ async function removeWatch(id) {
   localWatchlist = localWatchlist.filter(w => w.id !== id);
   saveLocalWatchlist(localWatchlist);
   try {
-    const res = await fetchApi(`/api/watchlist/${id}?user_key=${encodeURIComponent(userKey)}`, { method: 'DELETE' });
+    const res = await fetchProfileApi(`/api/watchlist/${id}`, { method: 'DELETE' });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || res.statusText);

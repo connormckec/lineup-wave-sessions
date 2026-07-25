@@ -177,6 +177,61 @@ create table if not exists notification_events (
 create index if not exists notification_events_session_idx
   on notification_events (session_key, created_at desc);
 
+-- Notification pipeline (profiles, change events, deliveries)
+create table if not exists notification_profiles (
+  user_key text primary key,
+  ntfy_topic text,
+  topic_valid boolean not null default false,
+  topic_updated_at timestamptz,
+  auth_version integer not null default 1,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists session_change_events (
+  id uuid primary key default gen_random_uuid(),
+  park text not null default 'atlantic_park',
+  session_key text not null,
+  iso_date date,
+  event_type text not null,
+  previous_available boolean,
+  new_available boolean,
+  previous_slots integer,
+  new_slots integer,
+  threshold_scanned_at timestamptz not null,
+  source_job_id uuid,
+  dedupe_key text not null unique,
+  test_event boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists notification_deliveries (
+  id uuid primary key default gen_random_uuid(),
+  change_event_id uuid not null references session_change_events(id) on delete cascade,
+  watch_id uuid not null references watchlist_items(id) on delete cascade,
+  user_key text not null,
+  provider text not null default 'ntfy',
+  destination text not null,
+  status text not null default 'pending',
+  attempts integer not null default 0,
+  next_attempt_at timestamptz,
+  claimed_at timestamptz,
+  claimed_by text,
+  last_attempt_at timestamptz,
+  sent_at timestamptz,
+  provider_status integer,
+  last_error text,
+  dedupe_key text not null unique,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists notification_deliveries_status_next_attempt_idx
+  on notification_deliveries (status, next_attempt_at);
+
+create index if not exists session_change_events_session_created_idx
+  on session_change_events (session_key, created_at desc);
+
 -- Background detail enrichment queue (slots/capacity/price for future dates)
 create table if not exists session_enrichment_queue (
   id uuid primary key default gen_random_uuid(),

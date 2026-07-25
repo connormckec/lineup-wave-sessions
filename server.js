@@ -15,6 +15,16 @@ const thresholdMaintenance = require('./lib/threshold-maintenance');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
+const profileAuth = require('./lib/profile-auth');
+const notificationTopic = require('./lib/notification-topic');
+const notificationProfileStore = require('./lib/notification-profile-store');
+const notificationPipeline = require('./lib/notification-pipeline');
+const notificationDeliveriesLib = require('./lib/notification-deliveries');
+const notificationDiagnostics = require('./lib/notification-diagnostics');
+const sessionChangeEventsLib = require('./lib/session-change-events');
+const notificationProvider = require('./lib/notification-provider');
+const notificationConfig = require('./lib/notification-config');
+const notificationProfileMigration = require('./lib/notification-profile-migration');
 const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
 const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
 
@@ -46,9 +56,9 @@ app.get('/session-data-status.js', (_req, res) => {
 const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';
 const INTERNAL_BETA = process.env.INTERNAL_BETA_NOTIFICATIONS === 'true';
-// ntfy is internal demo infrastructure only — public MVP should use native push, web push, SMS, or email after login.
-const INTERNAL_DEFAULT_NTFY_TOPIC = 'ap-surf-connor-2026';
-const INTERNAL_DEFAULT_PROFILE_CODE = 'ap-surf-connor-2026';
+const ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC = process.env.ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC === 'true';
+const LEGACY_INLINE_WATCH_ALERTS_ENABLED = process.env.LEGACY_INLINE_WATCH_ALERTS_ENABLED === 'true';
+const notificationRuntimeConfig = notificationConfig.readNotificationConfig(process.env);
 const THRESH     = parseInt(process.env.LOW_SLOTS_THRESHOLD || '2');
 const THRESHOLD_SCAN_MAX_DEFAULT = parseInt(process.env.THRESHOLD_SCAN_MAX || '20', 10);
 const THRESHOLD_SCAN_MIN_DEFAULT = 1;
@@ -92,6 +102,13 @@ const BACKGROUND_THRESHOLD_SCAN_EVERY_MINS = Math.max(15, parseInt(process.env.B
 const BACKGROUND_DETAIL_ENRICHMENT_ENABLED = process.env.BACKGROUND_DETAIL_ENRICHMENT_ENABLED === 'true';
 const BOOKING    = 'https://booking.atlanticparksurf.com/activity-agenda';
 const APP_URL    = process.env.APP_URL || BOOKING;
+const LINEUP_APP_URL = (
+  process.env.LINEUP_APP_URL
+  || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
+).trim() || APP_URL;
+const NOTIFICATION_TEST_COOLDOWN_MS = parseInt(process.env.NOTIFICATION_TEST_COOLDOWN_MS || '30000', 10);
+const requireProfileAuth = profileAuth.createRequireProfileAuth();
+const notificationTestRateByUser = new Map();
 const CHECK_MINS      = Math.max(1, parseInt(process.env.CHECK_EVERY_MINS || '5', 10) || 5);
 const MAX_SLOT_CHECKS = parseInt(process.env.MAX_SLOT_CHECKS || '50', 10);
 const SLOT_CACHE_STALE_CYCLES = parseInt(process.env.SLOT_CACHE_STALE_CYCLES || '3', 10);
@@ -237,6 +254,9 @@ const REQUIRED_SUPABASE_TABLES = [
   'scrape_runs',
   'watchlist_items',
   'notification_events',
+  'notification_profiles',
+  'session_change_events',
+  'notification_deliveries',
 ];
 
 let supabaseSchemaHealth = {
@@ -6247,7 +6267,6 @@ function watchItemToClient(w) {
     key: w.session_key,
     session_key: w.session_key,
     user_key: w.user_key,
-    ntfy_topic: w.ntfy_topic,
     ts: w.start_ts,
     wave,
     level: w.session_type,
@@ -6650,6 +6669,10 @@ async function maybeSendImmediateWatchAlert(_watch, _session) {
 
 async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false } = {}) {
   await expirePastWatchlistItems();
+  if (!LEGACY_INLINE_WATCH_ALERTS_ENABLED) {
+    return;
+  }
+
   const updatedSet = new Set(updatedKeys);
   const now = new Date().toISOString();
 
@@ -6695,15 +6718,29 @@ async function processWatchAlertsAfterScrape(updatedKeys, { slotsAlerts = false 
 function resolveNtfyTopicForWatch(watch) {
   const userTopic = (watch?.ntfy_topic || '').trim();
   if (userTopic) return userTopic;
-  if (!INTERNAL_BETA) return null;
-  return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
+  if (ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC && TOPIC) return TOPIC.trim();
+  return null;
 }
 
-function resolveNtfyTopicForRequest(requestTopic) {
-  const userTopic = (requestTopic || '').trim();
-  if (userTopic) return userTopic;
-  if (!INTERNAL_BETA) return TOPIC.trim() || null;
-  return (TOPIC || INTERNAL_DEFAULT_NTFY_TOPIC).trim() || null;
+function resolveNtfyTopicForRequest(_requestTopic) {
+  if (ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC && TOPIC) return TOPIC.trim();
+  return null;
+}
+
+async function resolveNotificationDestinationForUser(userKey) {
+  return notificationProfileStore.resolveDestinationForUser(supabase, userKey, {
+    serverFallbackTopic: TOPIC || null,
+    allowServerFallback: ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC,
+  });
+}
+
+function isNotificationTestRateLimited(userKey, now = Date.now()) {
+  const last = notificationTestRateByUser.get(userKey) || 0;
+  return now - last < NOTIFICATION_TEST_COOLDOWN_MS;
+}
+
+function markNotificationTestSent(userKey, now = Date.now()) {
+  notificationTestRateByUser.set(userKey, now);
 }
 
 async function reloadWatchlistFromSupabase(userKey = null) {
@@ -11922,22 +11959,59 @@ function resolveGate8WriteMode({ thresholdWriteSafe, writeEnabled, dryRun }) {
   return 'write';
 }
 
-async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun } = {}) {
+async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun, sourceJobId = null } = {}) {
   if (!writeEnabled || dryRun || !rowsPrepared.length) {
     return {
       rowsWritten: 0,
       writesPerformed: false,
       upsert: null,
+      notificationResults: [],
     };
+  }
+
+  const previousByKey = new Map();
+  for (const row of rowsPrepared) {
+    if (!row?.key) continue;
+    const existing = sessionsByKey.get(row.key);
+    previousByKey.set(row.key, existing ? { ...existing } : null);
   }
 
   mergeBatchIntoStore(rowsPrepared, 2, { preserveSlots: true, scrapeKind: 'basic' });
   const upsert = await upsertCurrentSessionsToSupabase(rowsPrepared, 2, { scrapeKind: 'basic' });
   const rowsWritten = upsert.rowsUpserted || 0;
+  const writeSucceeded = rowsWritten > 0 && !upsert.error;
+  const notificationResults = [];
+
+  if (writeSucceeded) {
+    for (const row of rowsPrepared) {
+      if (!row?.key) continue;
+      try {
+        const result = await notificationPipeline.processThresholdSessionNotifications({
+          supabase,
+          previousSession: previousByKey.get(row.key),
+          nextSession: sessionsByKey.get(row.key),
+          watches: watchItems,
+          resolveDestination: resolveNotificationDestinationForUser,
+          sourceJobId,
+          dryRun: false,
+          writeSucceeded: true,
+        });
+        notificationResults.push({ sessionKey: row.key, ...result });
+        if (result.ok === false) {
+          console.error(`  [notification-pipeline] ${row.key}:`, result.error);
+        }
+      } catch (err) {
+        console.error(`  [notification-pipeline] ${row.key}:`, err.message);
+        notificationResults.push({ sessionKey: row.key, ok: false, error: err.message });
+      }
+    }
+  }
+
   return {
     rowsWritten,
     writesPerformed: rowsWritten > 0,
     upsert,
+    notificationResults,
   };
 }
 
@@ -14717,6 +14791,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
           writeResult = await applyGate8ThresholdWriteRows(rehydrated.rows, {
             writeEnabled: true,
             dryRun: false,
+            sourceJobId: job.id,
           });
           if (writeResult.upsert?.error) {
             dateError = writeResult.upsert.error;
@@ -18944,8 +19019,8 @@ function statusPayload(userKey = null, selectedDate = null, profileCode = null) 
     ntfyOk: !!TOPIC,
     ntfyFallbackConfigured: !!TOPIC,
     internalBetaNotifications: INTERNAL_BETA,
-    internalDefaultNtfyTopic: INTERNAL_BETA ? INTERNAL_DEFAULT_NTFY_TOPIC : null,
-    internalDefaultProfileCode: INTERNAL_DEFAULT_PROFILE_CODE,
+    internalDefaultNtfyTopic: null,
+    internalDefaultProfileCode: null,
     user_key: userKey || null,
     profileCode: profileCode || null,
     watchlistCount: userWatchlist.length,
@@ -19775,6 +19850,137 @@ app.post('/api/admin/maintenance/tick', async (req, res) => {
   } catch (err) {
     console.error('maintenance-tick error:', err.message);
     return res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.post('/api/admin/notifications/process-deliveries', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const batchSize = Math.min(100, Math.max(1, parseInt(req.body?.batchSize || '25', 10) || 25));
+    const workerId = String(req.body?.workerId || `worker-${crypto.randomUUID().slice(0, 8)}`);
+    const result = await notificationPipeline.processDeliveryBatch({
+      supabase,
+      workerId,
+      batchSize,
+      staleClaimSeconds: parseInt(req.body?.staleClaimSeconds || '300', 10) || 300,
+      lineupAppUrl: LINEUP_APP_URL,
+      loadEventById: async (changeEventId) => {
+        const { data, error } = await supabase
+          .from('session_change_events')
+          .select('*')
+          .eq('id', changeEventId)
+          .maybeSingle();
+        if (error) throw error;
+        return data;
+      },
+      loadWatchById: async (watchId) => {
+        if (!watchId) return null;
+        const { data, error } = await supabase
+          .from('watchlist_items')
+          .select('id, active, user_key, session_key, session_type, wave_side, time, iso_date, day_label')
+          .eq('id', watchId)
+          .maybeSingle();
+        if (error) throw error;
+        if (data) return data;
+        return watchItems.find((w) => w.id === watchId) || null;
+      },
+      resolveDestination: resolveNotificationDestinationForUser,
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error('[notifications/process-deliveries]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/notifications/diagnostics', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const payload = await notificationDiagnostics.buildDiagnosticsPayload(supabase, {
+      limit: Math.min(100, parseInt(req.query.limit || '25', 10) || 25),
+    });
+    return res.json({ ok: true, ...payload });
+  } catch (err) {
+    console.error('[notifications/diagnostics]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/notifications/test-pipeline', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const userKey = String(req.body?.userKey || req.body?.user_key || '').trim();
+    const sessionKey = String(req.body?.sessionKey || req.body?.session_key || '').trim();
+    if (!userKey || !sessionKey) {
+      return res.status(400).json({ ok: false, error: 'userKey_and_sessionKey_required' });
+    }
+
+    const watches = await notificationDeliveriesLib.findActiveWatchesForSession(
+      supabase,
+      sessionKey,
+      watchItems,
+    );
+    const watch = watches.find((w) => w.user_key === userKey);
+    if (!watch) {
+      return res.status(404).json({ ok: false, error: 'watch_not_found_for_profile' });
+    }
+
+    const session = sessionsByKey.get(sessionKey) || watch;
+    const nowIso = new Date().toISOString();
+    const eventRow = sessionChangeEventsLib.buildEventRecord({
+      park: 'atlantic_park',
+      sessionKey,
+      isoDate: watch.iso_date || session.isoDate || session.dateKey || getParkTodayIso(),
+      eventType: sessionChangeEventsLib.EVENT_BECAME_AVAILABLE,
+      prev: { trusted: true, available: false, slots: 0, thresholdScannedAt: nowIso },
+      next: { trusted: true, available: true, slots: 1, thresholdScannedAt: nowIso },
+      sourceJobId: null,
+      testEvent: true,
+    });
+
+    const pipelineResult = await notificationDeliveriesLib.recordChangeEventAndDeliveries({
+      supabase,
+      eventRow,
+      watches: [watch],
+      resolveDestination: resolveNotificationDestinationForUser,
+    });
+
+    return res.json({
+      ok: true,
+      testEvent: true,
+      ...pipelineResult,
+    });
+  } catch (err) {
+    console.error('[notifications/test-pipeline]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/admin/notifications/migrate-profile', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const fromUserKey = String(req.body?.fromUserKey || req.body?.from_user_key || '').trim();
+    const toUserKey = String(req.body?.toUserKey || req.body?.to_user_key || '').trim();
+    if (!fromUserKey || !toUserKey) {
+      return res.status(400).json({ ok: false, error: 'fromUserKey_and_toUserKey_required' });
+    }
+    const result = await notificationProfileMigration.migrateProfileData(supabase, fromUserKey, toUserKey);
+    if (!result.ok) {
+      return res.status(400).json(result);
+    }
+    await reloadWatchlistFromSupabase();
+    return res.json(result);
+  } catch (err) {
+    console.error('[notifications/migrate-profile]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -20832,9 +21038,8 @@ app.get('/api/analytics/availability-summary', async (_req, res) => {
   }
 });
 
-app.get('/api/watchlist', async (req, res) => {
-  const userKey = req.query.user_key;
-  if (!userKey) return res.status(400).json({ error: 'user_key required' });
+app.get('/api/watchlist', requireProfileAuth, async (req, res) => {
+  const userKey = req.profileAuth.userKey;
   await ensureWatchlistForUser(userKey);
   const items = watchlistForUser(userKey);
   res.json({
@@ -20848,9 +21053,9 @@ app.get('/api/watchlist', async (req, res) => {
   });
 });
 
-app.post('/api/watchlist', async (req, res) => {
-  const row = buildWatchRow(req.body);
-  if (!row) return res.status(400).json({ error: 'user_key and session_key required' });
+app.post('/api/watchlist', requireProfileAuth, async (req, res) => {
+  const row = buildWatchRow({ ...req.body, user_key: req.profileAuth.userKey });
+  if (!row) return res.status(400).json({ error: 'session_key required' });
   try {
     const isNew = !watchItems.some(
       w => w.user_key === row.user_key && w.session_key === row.session_key
@@ -20867,9 +21072,9 @@ app.post('/api/watchlist', async (req, res) => {
   }
 });
 
-app.post('/api/watchlist/sync', async (req, res) => {
-  const { user_key, ntfy_topic, items, replace = false } = req.body || {};
-  if (!user_key) return res.status(400).json({ error: 'user_key required' });
+app.post('/api/watchlist/sync', requireProfileAuth, async (req, res) => {
+  const user_key = req.profileAuth.userKey;
+  const { ntfy_topic, items, replace = false } = req.body || {};
   const incoming = asSessionArray(items);
 
   if (replace && incoming.length === 0) {
@@ -20907,9 +21112,8 @@ app.post('/api/watchlist/sync', async (req, res) => {
   });
 });
 
-app.delete('/api/watchlist/:id', async (req, res) => {
-  const userKey = req.query.user_key || req.body?.user_key;
-  if (!userKey) return res.status(400).json({ error: 'user_key required' });
+app.delete('/api/watchlist/:id', requireProfileAuth, async (req, res) => {
+  const userKey = req.profileAuth.userKey;
   try {
     await deactivateWatchItem(req.params.id, userKey);
     for (const key of [...lastAlertState.keys()]) {
@@ -20922,17 +21126,84 @@ app.delete('/api/watchlist/:id', async (req, res) => {
   }
 });
 
-app.post('/api/notify/test', async (req, res) => {
-  const topic = resolveNtfyTopicForRequest(req.body?.ntfy_topic);
-  if (!topic) return res.status(400).json({ error: 'ntfy_topic required' });
-  const result = await sendNtfy(
-    topic,
-    'AP Session Alert',
-    'Test notification — your AP Sessions alerts are working.',
-    { clickUrl: APP_URL }
-  );
-  if (!result.ok) return res.status(502).json({ ok: false, error: result.error });
-  res.json({ ok: true });
+app.get('/api/notification-profile', requireProfileAuth, async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.json({
+        ok: true,
+        ...notificationProfileStore.profileResponseForClient(null),
+        supabaseAvailable: false,
+      });
+    }
+    const profile = await notificationProfileStore.getNotificationProfile(supabase, req.profileAuth.userKey);
+    return res.json({
+      ok: true,
+      ...notificationProfileStore.profileResponseForClient(profile),
+      supabaseAvailable: true,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put('/api/notification-profile', requireProfileAuth, async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_unconfigured' });
+    }
+    const topic = req.body?.ntfyTopic ?? req.body?.ntfy_topic ?? '';
+    const result = await notificationProfileStore.upsertNotificationProfile(
+      supabase,
+      req.profileAuth.userKey,
+      topic,
+    );
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, error: result.error });
+    }
+    return res.json({
+      ok: true,
+      ...notificationProfileStore.profileResponseForClient(result.profile),
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/notify/test', requireProfileAuth, async (req, res) => {
+  const userKey = req.profileAuth.userKey;
+  if (isNotificationTestRateLimited(userKey)) {
+    return res.status(429).json({ ok: false, error: 'test_rate_limited' });
+  }
+  try {
+    const dest = await resolveNotificationDestinationForUser(userKey);
+    if (!dest.ok || !dest.destination) {
+      return res.status(400).json({ ok: false, error: 'notification_topic_not_configured' });
+    }
+    const clickUrl = notificationPipeline.buildLineupClickUrl(getParkTodayIso(), { lineupAppUrl: LINEUP_APP_URL });
+    const result = await notificationProvider.sendNotification({
+      provider: 'ntfy',
+      destination: dest.destination,
+      title: 'AP Session Alert',
+      message: 'Test notification — your Lineup alerts are working.',
+      clickUrl,
+      testEvent: true,
+    });
+    await recordNotificationEvent(
+      { user_key: userKey, session_key: null, ntfy_topic: notificationTopic.maskDestination(dest.destination) },
+      { available: null, slots: null },
+      'test',
+      'Test notification — your Lineup alerts are working.',
+      result,
+      { eventReason: 'manual_test' },
+    );
+    if (!result.ok) {
+      return res.status(502).json({ ok: false, error: result.error || 'notify_failed' });
+    }
+    markNotificationTestSent(userKey);
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // Legacy routes (deprecated)
@@ -21322,6 +21593,7 @@ function logDeploymentSchedulerConfig() {
 async function startServer() {
   await loadPersistedData();
   logDeploymentSchedulerConfig();
+  notificationConfig.logNotificationStartup(notificationRuntimeConfig);
   if (sessions.length) {
     console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }
@@ -21333,9 +21605,11 @@ async function startServer() {
       console.log('Supabase collector: current_sessions + availability_snapshots + scrape_runs');
     }
     if (INTERNAL_BETA) {
-      console.log(`Internal beta notifications enabled (default topic: ${INTERNAL_DEFAULT_NTFY_TOPIC})`);
+      console.log('Internal beta notifications UI enabled — users must save their own profile topic server-side');
     } else {
-      console.log(TOPIC ? 'Ntfy fallback topic configured (personal testing)' : 'No NTFY_TOPIC fallback — users set topics in Setup');
+      console.log(TOPIC && ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC
+        ? 'Server NTFY_TOPIC fallback configured (dev only)'
+        : 'No shared ntfy topic fallback — each profile must save a server topic');
     }
     bootstrapInBackground();
     startupCoverageCheck().catch(console.error);
