@@ -23,6 +23,7 @@ const notificationDeliveriesLib = require('./lib/notification-deliveries');
 const notificationDiagnostics = require('./lib/notification-diagnostics');
 const sessionChangeEventsLib = require('./lib/session-change-events');
 const notificationProvider = require('./lib/notification-provider');
+const notificationProviderProbe = require('./lib/notification-provider-probe');
 const notificationConfig = require('./lib/notification-config');
 const notificationProfileMigration = require('./lib/notification-profile-migration');
 const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
@@ -19985,6 +19986,16 @@ app.post('/api/admin/notifications/migrate-profile', async (req, res) => {
   }
 });
 
+app.post('/api/admin/notifications/provider-probe', async (req, res) => {
+  try {
+    const payload = await notificationProviderProbe.runProviderProbe();
+    return res.json(payload);
+  } catch (err) {
+    console.error('[notifications/provider-probe]', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
   try {
     if (!supabase) {
@@ -21198,7 +21209,12 @@ app.post('/api/notify/test', requireProfileAuth, async (req, res) => {
       { eventReason: 'manual_test' },
     );
     if (!result.ok) {
-      return res.status(502).json({ ok: false, error: result.error || 'notify_failed' });
+      const status = result.error === 'test_rate_limited' ? 429 : 502;
+      return res.status(status).json({
+        ok: false,
+        error: result.error || 'notify_failed',
+        provider: 'ntfy',
+      });
     }
     markNotificationTestSent(userKey);
     return res.json({ ok: true });
@@ -21595,6 +21611,7 @@ async function startServer() {
   await loadPersistedData();
   logDeploymentSchedulerConfig();
   notificationConfig.logNotificationStartup(notificationRuntimeConfig);
+  console.log(`  ntfy provider transport: ${notificationProvider.TRANSPORT_NAME}; family=${notificationProvider.resolveHttpFamily() ?? 'default'}; node=${process.version}`);
   if (sessions.length) {
     console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }
