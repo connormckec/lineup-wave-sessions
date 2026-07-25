@@ -573,7 +573,7 @@ input.field:focus{border-color:var(--accent)}
 
 </div>
 
-<script src="/profile-auth-client.js?v=2"></script>
+<script src="/profile-auth-client.js?v=3"></script>
 <script>
 const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 const PAC = () => window.ProfileAuthClient;
@@ -588,7 +588,7 @@ const STORAGE = {
 };
 
 const SW_CACHE_VERSION = '6';
-const APP_SHELL_BUILD = '2026-07-25-profile-auth-v2';
+const APP_SHELL_BUILD = '2026-07-25-notify-test-auth-v3';
 let cachedUserKey = null;
 let cachedProfileCode = null;
 let lastFocusRefreshAt = 0;
@@ -685,20 +685,25 @@ function getProfileAuthDiagnostic() {
 }
 
 async function fetchProfileApi(url, options = {}, timeoutMs = 45000) {
-  const auth = getProfileAuthHeaders(options.headers || {});
-  if (!auth.ok) {
-    const err = new Error(formatProfileAuthError(auth.error));
-    err.code = auth.error;
+  const merged = PAC().mergeProfileAuthFetchOptions(getSavedNormalizedProfileCode(), options);
+  if (!merged.ok) {
+    const err = new Error(formatProfileAuthError(merged.error));
+    err.code = merged.error;
     throw err;
   }
-  const res = await fetchApi(url, { ...options, headers: auth.headers }, timeoutMs);
+  let res;
+  try {
+    res = await fetchApi(url, merged.fetchOptions, timeoutMs);
+  } catch (e) {
+    e.network = true;
+    throw e;
+  }
   if (res.status === 401) {
     const body = await res.json().catch(() => ({}));
-    if (body.error === 'profile_auth_required' || body.error === 'invalid_profile_secret') {
-      const err = new Error(formatProfileAuthError(body.error));
-      err.code = body.error;
-      throw err;
-    }
+    const err = new Error(formatProfileAuthError(body.error || 'profile_auth_required'));
+    err.code = body.error || 'profile_auth_required';
+    err.status = 401;
+    throw err;
   }
   return res;
 }
@@ -1424,6 +1429,8 @@ async function loadNotificationProfileFromServer() {
 async function sendTestNotification() {
   if (!alertsEnabled()) return;
   const msgEl = document.getElementById('ntfy-topic-msg');
+  const diag = getProfileAuthDiagnostic();
+
   if (!getSavedNormalizedProfileCode()) {
     if (msgEl) {
       msgEl.textContent = formatProfileAuthError('profile_code_missing');
@@ -1431,29 +1438,41 @@ async function sendTestNotification() {
     }
     return;
   }
-  const topic = getNtfyTopic();
-  if (!topic) {
+
+  try {
+    const res = await fetchProfileApi('/api/notify/test', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    console.log('[notify/test]', {
+      authCodePresent: diag.profileCodePresent,
+      authCodeLength: diag.profileCodeLength,
+      authHeaderPrepared: diag.authHeaderPrepared,
+      status: res.status,
+    });
+    if (res.ok) {
+      if (msgEl) {
+        msgEl.textContent = 'Test notification sent.';
+        msgEl.style.color = '#00c9a7';
+      }
+      return;
+    }
     if (msgEl) {
-      msgEl.textContent = 'Enter and save your ntfy topic first.';
+      msgEl.textContent = PAC().formatNotifyTestError(res.status, body.error);
       msgEl.style.color = '#ff6b35';
     }
-    return;
-  }
-  try {
-    const res = await fetchProfileApi('/api/notify/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(formatProfileAuthError(body.error) || 'Test failed');
-    if (msgEl) {
-      msgEl.textContent = 'Test sent — check your ntfy app.';
-      msgEl.style.color = '#00c9a7';
-    }
   } catch (e) {
+    console.log('[notify/test]', {
+      authCodePresent: diag.profileCodePresent,
+      authCodeLength: diag.profileCodeLength,
+      authHeaderPrepared: diag.authHeaderPrepared,
+      status: e.status || (e.network ? 'network' : 'error'),
+    });
     if (msgEl) {
-      msgEl.textContent = e.code ? formatProfileAuthError(e.code) : `Test failed: ${e.message}`;
+      const message = e.network
+        ? PAC().formatNotifyTestError(0, null, { network: true })
+        : (e.code === 'profile_code_missing' || e.code === 'profile_auth_required' || e.code === 'invalid_profile_secret'
+          ? formatProfileAuthError(e.code)
+          : PAC().formatNotifyTestError(e.status || 0, e.code));
+      msgEl.textContent = message;
       msgEl.style.color = '#ff6b35';
     }
   }
