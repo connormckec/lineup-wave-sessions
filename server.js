@@ -14610,6 +14610,10 @@ async function executeThresholdWeekApplyPreparedJob(job) {
   const write = writeEnabled && !dryRun;
   const dateResults = [];
   let workerError = null;
+  let sourcePreparedUpdatesCount = 0;
+  let sourceWeekStart = job.results_json?.weekStart ?? null;
+  let sourceTargetDates = [];
+  let sourceScanAt = null;
   let resultsJson = {
     ...(job.results_json || {}),
     mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
@@ -14636,7 +14640,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
       workerError = validation.error;
       resultsJson = buildThresholdWeekWriteResultsJson({
         mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
-        weekStart: sourceJob?.results_json?.weekStart ?? null,
+        weekStart: sourceJob?.results_json?.weekStart ?? sourceWeekStart,
         targetDates: sourceJob?.results_json?.targetDates ?? [],
         fullScanRun: null,
         dateResults: [],
@@ -14669,13 +14673,17 @@ async function executeThresholdWeekApplyPreparedJob(job) {
 
     const {
       preparedUpdatesByDate,
-      preparedUpdatesCount,
+      preparedUpdates,
       resultsJson: sourceResultsJson,
       scanAt,
     } = validation;
-    const weekStart = sourceResultsJson.weekStart ?? null;
-    const targetDates = sourceResultsJson.targetDates
+    sourcePreparedUpdatesCount = validation.preparedUpdatesCount
+      ?? preparedUpdates?.length
+      ?? 0;
+    sourceWeekStart = sourceResultsJson.weekStart ?? sourceWeekStart;
+    sourceTargetDates = sourceResultsJson.targetDates
       || Object.keys(preparedUpdatesByDate).sort();
+    sourceScanAt = scanAt;
     const writeMode = resolveGate8WriteMode({
       thresholdWriteSafe: true,
       writeEnabled: write,
@@ -14685,14 +14693,14 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
       stage: 'applying_prepared_writes',
       sourceJobId,
-      weekStart,
-      targetDates,
-      preparedUpdatesCount,
-      sourceScanAt: scanAt,
+      weekStart: sourceWeekStart,
+      targetDates: sourceTargetDates,
+      preparedUpdatesCount: sourcePreparedUpdatesCount,
+      sourceScanAt,
       writeMode,
     });
 
-    for (const isoDate of targetDates) {
+    for (const isoDate of sourceTargetDates) {
       const preparedForDate = preparedUpdatesByDate[isoDate] || [];
       let writeResult = null;
       let dateError = null;
@@ -14731,8 +14739,8 @@ async function executeThresholdWeekApplyPreparedJob(job) {
 
       resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
         mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
-        weekStart,
-        targetDates,
+        weekStart: sourceWeekStart,
+        targetDates: sourceTargetDates,
         fullScanRun: {
           fullScanContractOk: true,
           thresholdsScanned: sourceResultsJson.thresholdsScanned ?? [],
@@ -14743,7 +14751,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
         stage: 'applying_prepared_writes',
         claimedAt: resultsJson.claimedAt ?? null,
         sourceJobId,
-        preparedUpdatesCount,
+        preparedUpdatesCount: sourcePreparedUpdatesCount,
         error: null,
       }));
     }
@@ -14751,10 +14759,11 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     workerError = err.message || String(err);
   }
 
-  const completion = thresholdMaintenance.resolveApplyJobCompletion({
+  const completion = thresholdMaintenance.buildApplyPreparedFinalResults({
     dateResults,
     workerError,
-    preparedUpdatesCount,
+    sourcePreparedUpdatesCount,
+    sourceWeekStart,
   });
   const finalStatus = completion.status;
   const finalStage = completion.stage;
@@ -14762,8 +14771,10 @@ async function executeThresholdWeekApplyPreparedJob(job) {
 
   resultsJson = buildThresholdWeekWriteResultsJson({
     mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
-    weekStart: resultsJson.weekStart ?? null,
-    targetDates: resultsJson.targetDates ?? dateResults.map((row) => row.isoDate),
+    weekStart: completion.weekStart ?? sourceWeekStart ?? resultsJson.weekStart ?? null,
+    targetDates: resultsJson.targetDates ?? sourceTargetDates.length
+      ? sourceTargetDates
+      : dateResults.map((row) => row.isoDate),
     fullScanRun: { fullScanContractOk: true },
     dateResults,
     writeMode: resolveGate8WriteMode({
@@ -14775,6 +14786,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     claimedAt: resultsJson.claimedAt ?? null,
     failedAt: finalStatus === 'failed' ? new Date().toISOString() : null,
     sourceJobId,
+    preparedUpdatesCount: completion.preparedUpdatesCount,
     error: finalError,
     partialApply: completion.partialApply,
     rowsPrepared: completion.rowsPrepared,
@@ -14797,7 +14809,9 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
     sourceJobId,
     stage: finalStage,
+    weekStart: completion.weekStart,
     dateResults,
+    preparedUpdatesCount: completion.preparedUpdatesCount,
     partialApply: completion.partialApply,
     rowsPrepared: completion.rowsPrepared,
     rowsMatched: completion.rowsMatched,
