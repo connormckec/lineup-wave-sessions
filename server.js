@@ -11,6 +11,9 @@ const WebSocket = require('ws');
 const pkg = require('./package.json');
 const { parseCalendarFixtureDom } = require('./lib/calendar-fixture-tile-parser');
 const { scrapeCalendarFixtureDom } = require('./lib/calendar-fixture-dom-scraper');
+const thresholdMaintenance = require('./lib/threshold-maintenance');
+const adminAuth = require('./lib/admin-auth');
+const publicSessionEnrich = require('./lib/public-session-enrich');
 const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
 const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
 
@@ -73,7 +76,10 @@ const THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES = Math.max(
   parseInt(process.env.THRESHOLD_WEEK_BROWSER_CRASH_MAX_RETRIES || '2', 10),
 );
 const MAINTENANCE_TICK_ENABLED = process.env.MAINTENANCE_TICK_ENABLED === 'true';
+const IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED = process.env.IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED === 'true';
+const INLINE_THRESHOLD_WORKER_ENABLED = process.env.INLINE_THRESHOLD_WORKER_ENABLED === 'true';
 const THRESHOLD_MAINTENANCE_STALE_LOCK_MS = 10 * 60 * 1000;
+const publicEnrichRateState = publicSessionEnrich.createPublicEnrichRateLimiter();
 const SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS = parseInt(process.env.SCRAPE_LOCK_MANUAL_RELEASE_MIN_MS || '120', 10) * 1000;
 const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '10000', 10);
 const BACKGROUND_THRESHOLD_SCAN_ENABLED = process.env.BACKGROUND_THRESHOLD_SCAN_ENABLED === 'true';
@@ -98,6 +104,7 @@ const ENRICHMENT_P1_OFFSET_MS = parseInt(process.env.ENRICHMENT_P1_OFFSET_MS || 
 const SCRAPE_WEEKS_AHEAD = parseInt(process.env.SCRAPE_WEEKS_AHEAD || '4', 10);
 const SUPABASE_URL              = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 const EXCLUDED_LEVELS    = ['Cabanas', 'Beach Pass'];
 const EXCLUDED_WAVES     = [5, 6];
 const BOOKING_TZ = 'America/New_York';
@@ -2041,6 +2048,7 @@ function currentRowToSession(row) {
     threshold_scan_verified: raw.threshold_scan_verified ?? false,
     threshold_scan_at: raw.threshold_scan_at ?? null,
     expectedCapacity: raw.expectedCapacity ?? null,
+    thresholdTrustedSuspendedAt: raw.thresholdTrustedSuspendedAt ?? null,
   };
 }
 
@@ -2120,6 +2128,7 @@ function sessionToCurrentRow(s, sourceTier, { scrapeKind = 'basic' } = {}) {
       threshold_scan_verified: s.threshold_scan_verified ?? false,
       threshold_scan_at: s.threshold_scan_at ?? null,
       expectedCapacity: s.expectedCapacity ?? null,
+      thresholdTrustedSuspendedAt: s.thresholdTrustedSuspendedAt ?? null,
     },
     last_seen_at: now,
     last_scraped_at: now,
@@ -3027,6 +3036,7 @@ const THRESHOLD_SESSION_FIELDS = [
   'threshold_scan_verified',
   'threshold_scan_at',
   'expectedCapacity',
+  'thresholdTrustedSuspendedAt',
 ];
 
 function thresholdFieldOnSession(s, field) {
@@ -3059,11 +3069,7 @@ function getThresholdScanMaxTested(s) {
 }
 
 function thresholdSlotsTrusted(s) {
-  if (!sessionThresholdScanVerified(s)) return false;
-  const slotSource = thresholdFieldOnSession(s, 'slot_source');
-  if (slotSource && slotSource !== 'entries_left_threshold_scan') return false;
-  const conf = thresholdConfidenceOnSession(s) || thresholdFieldOnSession(s, 'slot_status');
-  return conf === 'exact' || conf === 'at_least';
+  return thresholdMaintenance.isThresholdSlotsTrusted(s);
 }
 
 function normalizeTimeForMatch(time) {
@@ -4682,7 +4688,143 @@ function mergeSessionFieldsForUpsert(incoming, existing, { scrapeKind = 'basic' 
     merged.detailStatus = reconcileDetailStatusForSession(merged);
   }
 
+  thresholdMaintenance.applyPackedThresholdSuspension(existing, merged, now);
+  if (existing) {
+    thresholdMaintenance.restoreTrustedThresholdFields(existing, merged, { scrapeKind });
+  }
+
   return merged;
+}
+
+function describeThresholdSessionUiDisplay(s) {
+  const trustedDisplay = resolveTrustedSlotDisplay(s);
+  const slots = trustedDisplay.slots;
+  if (s?.available === false || slots === 0) {
+    return {
+      uiDisplay: 'PACKED',
+      uiReason: s?.available === false ? 'available=false → PACKED' : 'trusted slots=0 → PACKED',
+      freshnessKind: 'basic',
+      freshnessTimestamp: s?.lastBasicCheckAt || s?.lastScraped || null,
+    };
+  }
+  if (slots != null) {
+    const atLeast = trustedDisplay.atLeast;
+    const label = atLeast
+      ? `${trustedDisplay.thresholdScanMaxTested || slots}+ spots left`
+      : `${slots} spots left`;
+    const source = trustedDisplay.source;
+    return {
+      uiDisplay: label,
+      uiReason: source === 'entries_left_threshold_scan' || source === 'threshold'
+        ? `threshold trusted (${trustedDisplay.confidence}) → exact count`
+        : 'modal verified → exact count',
+      freshnessKind: source === 'modal' ? 'modal' : 'threshold',
+      freshnessTimestamp: source === 'modal'
+        ? (s?.lastDetailedCheckAt || null)
+        : (thresholdFieldOnSession(s, 'threshold_scan_at') ?? thresholdFieldOnSession(s, 'thresholdScanAt')),
+    };
+  }
+  if (sessionThresholdScanVerified(s)) {
+    const conf = thresholdConfidenceOnSession(s) || thresholdFieldOnSession(s, 'slot_status');
+    if (conf !== 'exact' && conf !== 'at_least') {
+      return {
+        uiDisplay: 'OPEN · DETAILS UNAVAILABLE',
+        uiReason: `threshold scan present but not trusted (conf=${conf}) → details unavailable`,
+        freshnessKind: 'basic',
+        freshnessTimestamp: s?.lastBasicCheckAt || s?.lastScraped || null,
+      };
+    }
+  }
+  return {
+    uiDisplay: 'OPEN · DETAILS UNAVAILABLE',
+    uiReason: 'no trusted threshold or modal → OPEN · DETAILS UNAVAILABLE',
+    freshnessKind: 'basic',
+    freshnessTimestamp: s?.lastBasicCheckAt || s?.lastScraped || null,
+  };
+}
+
+async function buildThresholdWeekDiagnostic(startDate, endDate) {
+  if (!startDate || !endDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    return { ok: false, error: 'invalid_start_or_end_date', startDate, endDate, sessions: [] };
+  }
+  if (startDate > endDate) {
+    return { ok: false, error: 'startDate_after_endDate', startDate, endDate, sessions: [] };
+  }
+
+  await ensureSessionsForStatus();
+  const sessions = [];
+  const summaryByDate = {};
+  let cur = startDate;
+  while (cur <= endDate) {
+    summaryByDate[cur] = {
+      isoDate: cur,
+      sessionsCount: 0,
+      thresholdTrustedCount: 0,
+      thresholdVerifiedCount: 0,
+      packedCount: 0,
+      detailsUnavailableCount: 0,
+      exactCountCount: 0,
+    };
+    cur = addDaysToParkIso(cur, 1);
+    if (Object.keys(summaryByDate).length > 120) break;
+  }
+
+  for (const isoDate of Object.keys(summaryByDate).sort()) {
+    const { currentSessions } = await fetchGate8CurrentSessionsForIsoDate(isoDate);
+    for (const session of currentSessions) {
+      const trustedDisplay = resolveTrustedSlotDisplay(session);
+      const ui = describeThresholdSessionUiDisplay(session);
+      const row = {
+        sessionKey: session.key,
+        isoDate: extractGate8SessionIsoDate(session) || isoDate,
+        time: extractGate8SessionTimeLabel(session),
+        waveSide: extractGate8SessionWaveSide(session),
+        sessionType: session.level || session.session_type || null,
+        available: session.available,
+        rawSlots: session.slots ?? null,
+        trustedSlots: trustedDisplay.slots,
+        trustedSlotSource: trustedDisplay.source,
+        thresholdConfidence: thresholdConfidenceOnSession(session) || thresholdFieldOnSession(session, 'slot_status'),
+        thresholdScanTimestamp: thresholdFieldOnSession(session, 'threshold_scanned_at')
+          ?? thresholdFieldOnSession(session, 'thresholdScanAt'),
+        basicScheduleTimestamp: session.lastBasicCheckAt || session.lastScraped || null,
+        detailTimestamp: session.lastDetailedCheckAt || null,
+        thresholdMatched: sessionThresholdScanVerified(session),
+        thresholdTrusted: thresholdSlotsTrusted(session),
+        identityKey: buildGate8SessionIdentityKey(session),
+        uiDisplay: ui.uiDisplay,
+        uiReason: ui.uiReason,
+        freshnessKind: ui.freshnessKind,
+        freshnessTimestamp: ui.freshnessTimestamp,
+      };
+      sessions.push(row);
+      const summary = summaryByDate[isoDate];
+      summary.sessionsCount += 1;
+      if (row.thresholdMatched) summary.thresholdVerifiedCount += 1;
+      if (row.thresholdTrusted) summary.thresholdTrustedCount += 1;
+      if (row.uiDisplay === 'PACKED') summary.packedCount += 1;
+      else if (row.uiDisplay === 'OPEN · DETAILS UNAVAILABLE') summary.detailsUnavailableCount += 1;
+      else summary.exactCountCount += 1;
+    }
+  }
+
+  const readyEval = await evaluateCompletedDryScansReadyToApply(startDate, endDate);
+
+  return {
+    ok: true,
+    startDate,
+    endDate,
+    generatedAt: new Date().toISOString(),
+    summaryByDate: Object.values(summaryByDate).sort((a, b) => a.isoDate.localeCompare(b.isoDate)),
+    sessions,
+    readyToApply: readyEval.ready,
+    rootCauseHints: {
+      partialScanCoverage: sessions.some(s => s.thresholdTrusted) && sessions.some(s => s.available && !s.thresholdTrusted),
+      unappliedDryScanReady: readyEval.ready.some(r => (r.preparedIsoDates || []).includes(startDate)),
+      staleThresholdTimestamps: sessions.some(s => s.thresholdTrusted && s.thresholdScanTimestamp
+        && s.basicScheduleTimestamp && s.thresholdScanTimestamp < s.basicScheduleTimestamp),
+    },
+  };
 }
 
 function detailCoverageStats() {
@@ -11866,30 +12008,7 @@ function groupPreparedUpdatesByDate(preparedUpdates) {
 }
 
 function applyGate8PreparedUpdateToSession(session, prep) {
-  const entry = { ...session };
-  const confidence = prep.threshold_confidence ?? prep.thresholdConfidence ?? null;
-  const scannedAt = prep.threshold_scanned_at ?? prep.thresholdScanAt ?? null;
-  entry.thresholdInferredSlots = prep.thresholdInferredSlots
-    ?? prep.available_entries
-    ?? prep.available_entries_at_least
-    ?? null;
-  entry.thresholdMaxVisible = prep.threshold_max_visible ?? prep.thresholdMaxVisible ?? null;
-  entry.thresholdConfidence = confidence;
-  entry.thresholdScanVerified = prep.threshold_scan_verified ?? prep.thresholdScanVerified === true;
-  entry.thresholdScanAt = scannedAt;
-  entry.thresholdScanMaxTested = prep.thresholdScanMaxTested ?? null;
-  entry.thresholdScanMethod = prep.thresholdScanMethod ?? 'entries_left_filter';
-  entry.thresholdDiagnostics = prep.thresholdDiagnostics ?? null;
-  entry.threshold_confidence = confidence;
-  entry.threshold_max_visible = entry.thresholdMaxVisible;
-  entry.threshold_scanned_at = scannedAt;
-  entry.threshold_scan_at = scannedAt;
-  entry.threshold_scan_verified = entry.thresholdScanVerified;
-  entry.slot_source = prep.slot_source ?? 'entries_left_threshold_scan';
-  entry.available_entries = prep.available_entries ?? null;
-  entry.available_entries_at_least = prep.available_entries_at_least ?? null;
-  entry.slot_status = prep.slot_status ?? confidence ?? null;
-  return entry;
+  return thresholdMaintenance.applyPreparedThresholdUpdate(session, prep);
 }
 
 async function rehydrateGate8PreparedRowsForApply(preparedUpdatesForDate, isoDate) {
@@ -13433,15 +13552,11 @@ function resolvePreparedScanCompletedAtFromJob(job) {
 }
 
 function isDryScanSourceAlreadyApplied(sourceJobId, preparedScanCompletedAt, applyJobs = []) {
-  if (!sourceJobId || !preparedScanCompletedAt) return false;
-  const scanTs = new Date(preparedScanCompletedAt).getTime();
-  if (!Number.isFinite(scanTs)) return false;
-  return applyJobs.some((job) => {
-    if (job.results_json?.sourceJobId !== sourceJobId) return false;
-    if (job.status !== 'completed' || job.error) return false;
-    const applyTs = job.completed_at ? new Date(job.completed_at).getTime() : NaN;
-    return Number.isFinite(applyTs) && applyTs > scanTs;
-  });
+  return thresholdMaintenance.isDryScanSourceFullyApplied(
+    sourceJobId,
+    preparedScanCompletedAt,
+    applyJobs,
+  );
 }
 
 function compactReadyToApplyCandidate(job) {
@@ -13793,6 +13908,7 @@ async function buildMaintenanceStatus(startDate, endDate) {
     staleCoverageRules: recommendations.staleCoverageRules,
     nextRecommendedDryScan,
     readyToApplyCount: recommendations.completedDryScansReadyToApply.length,
+    readyToApply: recommendations.completedDryScansReadyToApply,
     readyToApplyCandidatesRaw: recommendations.readyToApplyCandidatesRaw,
     readyToApplyExcluded: recommendations.readyToApplyExcluded,
     queuedJobs: queuedRows.map(compactMaintenanceJob),
@@ -13868,9 +13984,48 @@ async function hasQueuedOrRunningThresholdScanJob() {
   return (count || 0) > 0;
 }
 
-function isMaintenanceTickAllowed(body = {}) {
-  if (MAINTENANCE_TICK_ENABLED) return true;
-  return body.adminOverride === true;
+function clientIpFromRequest(req) {
+  return req.get('x-forwarded-for')?.split(',')[0]?.trim()
+    || req.socket?.remoteAddress
+    || 'unknown';
+}
+
+function isIsoDateWithinBookingHorizon(isoDate) {
+  return publicSessionEnrich.isIsoDateWithinHorizon(isoDate, {
+    todayIso: getParkTodayIso(),
+    maxIso: maxHorizonDateKey(),
+  });
+}
+
+async function queuePublicDateDetailEnrichment(isoDate) {
+  await ensureSessionsForStatus();
+  const openSessions = sessionsForDate(isoDate).filter((s) => s.available !== false);
+  const retryTargets = sortSessionsForFailedFirstEnrich(
+    openSessions.filter(sessionQualifiesForFailedFirstEnrich),
+  );
+  const toProcess = retryTargets.length
+    ? retryTargets
+    : sortSessionsForDetailRetry(openSessions);
+  await enqueueDateForEnrichment(isoDate, { priority: 1, reason: `public_enrich_date:${isoDate}` });
+  setImmediate(() => {
+    runDetailEnrichment({
+      isoDate,
+      sessions: toProcess,
+      reason: 'public_enrich_date',
+    }).catch((err) => console.error('[public enrich-date]', err.message));
+  });
+  return toProcess.length;
+}
+
+async function kickThresholdScanJobWorkerIfIdle() {
+  if (!INLINE_THRESHOLD_WORKER_ENABLED || !supabase) return null;
+  const claim = await claimThresholdScanJobWorker();
+  if (!claim.claimed) return null;
+  setImmediate(() => {
+    processThresholdScanJobInBackground(claim.claimed, { lockAcquired: claim.lockAcquired === true })
+      .catch((err) => console.error('maintenance threshold job worker error:', err.message));
+  });
+  return claim.claimed;
 }
 
 async function runMaintenanceTick({
@@ -13895,6 +14050,30 @@ async function runMaintenanceTick({
   const status = await buildMaintenanceStatus(startDate, endDate);
   if (!status.ok) return status;
 
+  if (status.readyToApplyCount > 0) {
+    const applyResult = await enqueueReadyMaintenancePrepared({
+      startDate,
+      endDate,
+      maxJobs: 1,
+      write: true,
+      dryRun: false,
+    });
+    if (applyResult.enqueuedJobs?.length) {
+      const enqueued = applyResult.enqueuedJobs[0];
+      await kickThresholdScanJobWorkerIfIdle();
+      return {
+        ok: true,
+        action: 'enqueued_apply_prepared',
+        job_id: enqueued.jobId,
+        sourceJobId: enqueued.sourceJobId,
+        weekStart: enqueued.weekStart,
+        preparedUpdatesCount: enqueued.preparedUpdatesCount,
+        startDate,
+        endDate,
+      };
+    }
+  }
+
   if (!status.nextRecommendedDryScan) {
     return {
       ok: true,
@@ -13902,6 +14081,7 @@ async function runMaintenanceTick({
       startDate,
       endDate,
       summary: status.summary,
+      readyToApplyCount: status.readyToApplyCount,
     };
   }
 
@@ -13925,8 +14105,11 @@ async function runMaintenanceTick({
       startDate,
       endDate,
       nextRecommendedDryScan: status.nextRecommendedDryScan,
+      readyToApplyCount: status.readyToApplyCount,
     };
   }
+
+  await kickThresholdScanJobWorkerIfIdle();
 
   return {
     ok: true,
@@ -14513,17 +14696,11 @@ async function executeThresholdWeekApplyPreparedJob(job) {
       const preparedForDate = preparedUpdatesByDate[isoDate] || [];
       let writeResult = null;
       let dateError = null;
-      let rowsPrepared = 0;
-      let missingSessionKeys = [];
+      let rehydrated = { rows: [], missingSessionKeys: [] };
 
       try {
-        const rehydrated = await rehydrateGate8PreparedRowsForApply(preparedForDate, isoDate);
-        rowsPrepared = rehydrated.rows.length;
-        missingSessionKeys = rehydrated.missingSessionKeys;
-        if (missingSessionKeys.length) {
-          dateError = `missing_sessions:${missingSessionKeys.length}`;
-        }
-        if (writeMode === 'write' && rowsPrepared > 0) {
+        rehydrated = await rehydrateGate8PreparedRowsForApply(preparedForDate, isoDate);
+        if (writeMode === 'write' && rehydrated.rows.length > 0) {
           writeResult = await applyGate8ThresholdWriteRows(rehydrated.rows, {
             writeEnabled: true,
             dryRun: false,
@@ -14538,16 +14715,18 @@ async function executeThresholdWeekApplyPreparedJob(job) {
         workerError = dateError;
       }
 
-      dateResults.push({
+      const dateOutcome = thresholdMaintenance.buildApplyDateOutcome({
         isoDate,
+        preparedForDate,
+        rehydrated,
+        writeResult,
+        dateError,
+        writeMode,
+      });
+      dateResults.push({
+        ...dateOutcome,
         currentSessionsFetchedForIsoDateCount: null,
         inferredForIsoDateCount: preparedForDate.length,
-        rowsPrepared,
-        rowsWritten: writeResult?.rowsWritten ?? 0,
-        unmatchedInferenceSample: missingSessionKeys.slice(0, 12).map((sessionKey) => ({ sessionKey })),
-        writeMode,
-        writesPerformed: writeResult?.writesPerformed === true,
-        error: dateError,
       });
 
       resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
@@ -14572,19 +14751,14 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     workerError = err.message || String(err);
   }
 
-  const failedDates = dateResults.filter((row) => row.error);
-  const summary = summarizeThresholdScanJobResults(dateResults);
-  const hasError = Boolean(workerError)
-    || failedDates.length > 0
-    || dateResults.length === 0;
-  const finalStatus = hasError ? 'failed' : 'completed';
-  const finalError = workerError
-    || (dateResults.length === 0 ? 'no_date_results' : null)
-    || (failedDates.length === dateResults.length && dateResults.length
-      ? failedDates[0]?.error || 'all_dates_failed'
-      : null)
-    || (failedDates.length > 0 ? 'partial_date_failures' : null);
-  const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
+  const completion = thresholdMaintenance.resolveApplyJobCompletion({
+    dateResults,
+    workerError,
+    preparedUpdatesCount,
+  });
+  const finalStatus = completion.status;
+  const finalStage = completion.stage;
+  const finalError = completion.error;
 
   resultsJson = buildThresholdWeekWriteResultsJson({
     mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
@@ -14599,27 +14773,38 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     }),
     stage: finalStage,
     claimedAt: resultsJson.claimedAt ?? null,
-    failedAt: finalStage === 'failed' ? new Date().toISOString() : null,
+    failedAt: finalStatus === 'failed' ? new Date().toISOString() : null,
     sourceJobId,
-    error: workerError || finalError,
+    error: finalError,
+    partialApply: completion.partialApply,
+    rowsPrepared: completion.rowsPrepared,
+    rowsMatched: completion.rowsMatched,
+    rowsWritten: completion.rowsWritten,
+    rowsUnresolved: completion.rowsUnresolved,
+    unresolvedByDate: completion.unresolvedByDate,
   });
 
   await finalizeThresholdScanJob(job.id, {
     status: finalStatus,
-    error: workerError || finalError,
+    error: finalError,
     resultsJson,
   });
 
   return {
-    ok: finalStatus === 'completed',
+    ok: completion.ok,
     job_id: job.id,
     status: finalStatus,
     mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
     sourceJobId,
     stage: finalStage,
     dateResults,
-    ...summary,
-    error: workerError || finalError,
+    partialApply: completion.partialApply,
+    rowsPrepared: completion.rowsPrepared,
+    rowsMatched: completion.rowsMatched,
+    rowsWritten: completion.rowsWritten,
+    rowsUnresolved: completion.rowsUnresolved,
+    unresolvedByDate: completion.unresolvedByDate,
+    error: finalError,
   };
 }
 
@@ -19015,6 +19200,59 @@ app.get('/api/debug/enrichment', async (_req, res) => {
   }
 });
 
+function requireAdminToken(req, res, next) {
+  const result = adminAuth.validateAdminToken(
+    adminAuth.extractAdminTokenFromRequest(req),
+    ADMIN_TOKEN,
+  );
+  if (!result.ok) {
+    return res.status(result.status).json({ ok: false, error: result.error });
+  }
+  return next();
+}
+
+app.post('/api/session-details/enrich-date', async (req, res) => {
+  try {
+    const now = Date.now();
+    const ip = clientIpFromRequest(req);
+    if (publicSessionEnrich.recordPublicEnrichIpHit(publicEnrichRateState, ip, { now })) {
+      return res.status(429).json({ status: 'rate_limited' });
+    }
+
+    const validation = publicSessionEnrich.validatePublicEnrichDateBody(req.body || {});
+    if (!validation.ok) {
+      return res.status(validation.status).json({ status: validation.error });
+    }
+    const { isoDate } = validation;
+    if (!isIsoDateWithinBookingHorizon(isoDate)) {
+      return res.status(400).json({ status: 'date_out_of_horizon' });
+    }
+
+    await ensureSessionsForStatus();
+    const openSessions = sessionsForDate(isoDate).filter((s) => s.available !== false);
+    const outcome = publicSessionEnrich.resolvePublicEnrichStatus({
+      isoDate,
+      state: publicEnrichRateState,
+      detailEnrichmentInProgress,
+      openSessionCount: openSessions.length,
+      allRecentlyDetailed: publicSessionEnrich.sessionsRecentlyDetailed(openSessions, { now }),
+      now,
+    });
+
+    if (outcome.status === 'accepted') {
+      publicSessionEnrich.markPublicEnrichDateCooldown(publicEnrichRateState, isoDate, { now });
+      await queuePublicDateDetailEnrichment(isoDate);
+    }
+
+    return res.status(outcome.httpStatus).json({ status: outcome.status });
+  } catch (err) {
+    console.error('[public enrich-date]', err.message);
+    return res.status(500).json({ status: 'unavailable' });
+  }
+});
+
+app.use('/api/admin', requireAdminToken);
+
 app.post('/api/admin/backfill-current-sessions', async (req, res) => {
   try {
     await ensureSessionsForStatus();
@@ -19301,6 +19539,24 @@ app.get('/api/admin/threshold-coverage', async (req, res) => {
   }
 });
 
+app.get('/api/admin/threshold-week-diagnostic', async (req, res) => {
+  try {
+    const startDate = normalizeIsoDateParam(req.query.startDate || req.query.start_date);
+    const endDate = normalizeIsoDateParam(req.query.endDate || req.query.end_date);
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate_and_endDate_required' });
+    }
+    const diagnostic = await buildThresholdWeekDiagnostic(startDate, endDate);
+    if (!diagnostic.ok) {
+      return res.status(400).json(diagnostic);
+    }
+    return res.json(diagnostic);
+  } catch (err) {
+    console.error('threshold-week-diagnostic error:', err.message);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
 app.get('/api/admin/maintenance-recommendations', async (req, res) => {
   try {
     const { startDate, endDate } = resolveMaintenanceDateRange(req.query || {});
@@ -19385,14 +19641,6 @@ app.post('/api/admin/maintenance/apply-ready-prepared', async (req, res) => {
 app.post('/api/admin/maintenance/tick', async (req, res) => {
   try {
     const body = req.body || {};
-    if (!isMaintenanceTickAllowed(body)) {
-      return res.status(403).json({
-        ok: true,
-        action: 'skipped',
-        reason: 'maintenance_tick_disabled',
-        hint: 'Set MAINTENANCE_TICK_ENABLED=true or pass adminOverride: true',
-      });
-    }
     if (!supabase) {
       return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
     }
@@ -20877,6 +21125,18 @@ function startBackgroundCollector() {
     console.log(`  Scheduling threshold batch every ${BACKGROUND_THRESHOLD_SCAN_EVERY_MINS} minutes (max ${THRESHOLD_SCAN_MAX_WEEKS_PER_RUN} week(s)/run)`);
   }
 
+  if (IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED) {
+    collectorState.cronTasks.maintenanceTick = scheduleCronSafe(
+      '0 * * * *',
+      () => {
+        runMaintenanceTick({ includeStale: true })
+          .catch((err) => console.error('[maintenance tick]', err.message));
+      },
+      'Maintenance tick',
+    );
+    console.log('  Scheduling in-process maintenance tick hourly');
+  }
+
   scrapeScheduleEnabled = !!(collectorState.cronTasks.tier1 && collectorState.cronTasks.tier2 && collectorState.cronTasks.tier3);
   if (!scrapeScheduleEnabled) {
     console.error('  Background collector FAILED to schedule — check cron expressions');
@@ -20920,8 +21180,30 @@ function bootstrapInBackground() {
   startBackgroundCollector();
 }
 
+function logDeploymentSchedulerConfig() {
+  const scheduling = publicSessionEnrich.resolveSchedulingMode({
+    inProcessMaintenanceSchedulerEnabled: IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED,
+    inlineThresholdWorkerEnabled: INLINE_THRESHOLD_WORKER_ENABLED,
+  });
+  console.log('── Deployment scheduler config ──');
+  console.log(`  admin authentication configured: ${ADMIN_TOKEN ? 'yes' : 'no'}`);
+  console.log(`  in-process maintenance scheduler: ${IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED ? 'enabled' : 'disabled'}`);
+  console.log(`  inline threshold worker: ${INLINE_THRESHOLD_WORKER_ENABLED ? 'enabled' : 'disabled'}`);
+  console.log(`  scheduling mode: ${scheduling.mode}`);
+  if (MAINTENANCE_TICK_ENABLED) {
+    console.warn('  WARNING: MAINTENANCE_TICK_ENABLED is legacy and no longer starts an in-process scheduler; use IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED instead');
+  }
+  if (THRESHOLD_JOBS_ENABLED) {
+    console.warn('  WARNING: THRESHOLD_JOBS_ENABLED is legacy and no longer starts an inline worker; use INLINE_THRESHOLD_WORKER_ENABLED instead');
+  }
+  for (const warning of scheduling.warnings) {
+    console.warn(`  WARNING: ${warning}`);
+  }
+}
+
 async function startServer() {
   await loadPersistedData();
+  logDeploymentSchedulerConfig();
   if (sessions.length) {
     console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }

@@ -262,7 +262,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 
 /* ── Session cards ── */
 .sc{
-  display:flex;align-items:center;gap:10px;
+  --sc-action-width:80px;
+  display:grid;
+  grid-template-columns:6px minmax(0,1fr) var(--sc-action-width);
+  align-items:center;
+  column-gap:10px;
   min-height:76px;
   background:var(--card);
   border:1px solid var(--border);
@@ -274,8 +278,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 }
 .sc.watching{border-color:rgba(0,201,167,.4);box-shadow:0 0 0 1px rgba(0,201,167,.15)}
 .sc:active{background:var(--card-hover)}
-.sc-accent{width:6px;align-self:stretch;flex-shrink:0;border-radius:10px 0 0 10px;margin-right:2px}
-.sc-body{flex:1;min-width:0;padding-left:10px;overflow:hidden}
+.sc-accent{width:6px;align-self:stretch;flex-shrink:0;border-radius:10px 0 0 10px;margin-right:0}
+.sc-body{min-width:0;padding-left:10px;overflow:hidden}
 .sc-time{
   font-family:var(--font-display);font-size:clamp(19px, 5vw, 22px);font-weight:700;
   letter-spacing:.04em;text-transform:uppercase;line-height:1.1;
@@ -293,15 +297,23 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .sc-detail-pending{font-size:10px;color:var(--muted);margin-top:2px;font-style:italic;opacity:.85}
 .fallback-note{font-size:11px;color:var(--muted);text-align:center;padding:6px 12px 2px;font-style:italic;opacity:.9}
 .sc-fresh{display:block;font-size:10px;color:var(--muted);margin-top:2px;font-weight:400}
-.sc-right{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
-.sc-actions{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;flex-shrink:0;padding:4px 10px 4px 0;min-width:52px}
+.sc-right,.sc-actions{
+  width:var(--sc-action-width);
+  min-width:var(--sc-action-width);
+  max-width:var(--sc-action-width);
+  box-sizing:border-box;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:6px;flex-shrink:0;padding:4px 2px;
+  justify-self:end;
+}
 .cond-badge{
+  width:100%;max-width:100%;box-sizing:border-box;
   font-family:var(--font-display);font-weight:700;
   letter-spacing:.03em;text-align:center;line-height:1.25;
-  max-width:none;overflow:visible;white-space:normal;
+  overflow:hidden;white-space:normal;overflow-wrap:anywhere;
 }
 .cond-compact{display:block}
-.cond-full{display:none;font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+.cond-full{display:none;font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:normal;overflow-wrap:anywhere}
 .cond-primary{display:block;font-size:12px;font-weight:700;line-height:1.2}
 .cond-sub{
   display:block;margin-top:2px;font-size:9px;font-weight:600;
@@ -414,9 +426,9 @@ input.field:focus{border-color:var(--accent)}
   .cond-primary{font-size:12px}
 }
 @media (min-width:768px){
+  .sc{--sc-action-width:96px}
   .cond-compact{display:none}
   .cond-full{display:block}
-  .sc-actions,.sc-right{min-width:88px}
 }
 </style>
 </head>
@@ -1320,9 +1332,14 @@ function sessionDetailVerified(s) {
 }
 
 function sessionThresholdSlotsTrusted(s) {
+  if (s?.available === false) return false;
   const verified = s?.thresholdScanVerified === true || s?.threshold_scan_verified === true;
   const source = s?.slot_source || s?.slotsSource;
   const conf = s?.thresholdConfidence || s?.slot_status;
+  const suspendedAt = s?.thresholdTrustedSuspendedAt || s?.raw?.thresholdTrustedSuspendedAt;
+  const verifiedAt = s?.threshold_scan_at || s?.thresholdScanAt || s?.threshold_scanned_at;
+  if (suspendedAt && verifiedAt && new Date(verifiedAt) <= new Date(suspendedAt)) return false;
+  if (suspendedAt && !verifiedAt) return false;
   return verified
     && (source === 'entries_left_threshold_scan' || source === 'threshold' || !source)
     && (conf === 'exact' || conf === 'at_least');
@@ -1928,7 +1945,7 @@ function scheduleRefreshPoll() {
 async function triggerBackgroundDetailRefresh(isoDate) {
   if (!isoDate) return;
   try {
-    await fetchApi('/api/admin/enrich-date', {
+    await fetchApi('/api/session-details/enrich-date', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ isoDate }),
