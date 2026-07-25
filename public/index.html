@@ -433,6 +433,7 @@ input.field:focus{border-color:var(--accent)}
 </style>
 </head>
 <body>
+<script src="/session-data-status.js"></script>
 <div id="app">
 
   <header id="header">
@@ -724,6 +725,9 @@ let selectedDateMeta = {
   endpoint: null,
   isScrapeInProgress: false,
   hasSavedSessions: false,
+  isFallback: false,
+  lastBasicCheckAt: null,
+  lastCheckedForDate: null,
 };
 
 let selectedDateFetchToken = 0;
@@ -942,6 +946,9 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
         isLoading: false,
         lastFetchError: formatApiError(payload),
         endpoint,
+        isFallback: !!payload.isFallback,
+        lastBasicCheckAt: payload.lastBasicCheckAt ?? null,
+        lastCheckedForDate: payload.lastCheckedForDate ?? null,
       };
       if (selectedDateSessions.length) {
         const byKey = new Map(asSessionArray(data.sessions).map(s => [s.key, s]));
@@ -966,6 +973,8 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       isLoading: false,
       lastFetchError: null,
       endpoint,
+      lastBasicCheckAt: payload.lastBasicCheckAt ?? null,
+      lastCheckedForDate: payload.lastCheckedForDate ?? null,
     };
     lastFetchError = null;
 
@@ -2183,7 +2192,11 @@ async function refresh({ silent = false } = {}) {
       selectedDateSessions = prevSessions;
     }
     showStatusMessage(
-      `<span class="check-time">${selectedDateSessions?.length ? 'Connection error · showing saved data' : `Could not load sessions · ${lastFetchError}`}</span>`
+      `<span class="check-time">${deriveSessionDataStatus({
+        ...buildSessionDataStatusInput(),
+        hasUsableSessions: selectedDateSessions.length > 0,
+        lastFetchError: lastFetchError || selectedDateMeta.lastFetchError,
+      }).fullText}</span>`
     );
     safeRenderAll();
   } finally {
@@ -2260,78 +2273,59 @@ function onBellClick(sJson) {
   return toggleWatch(sJson);
 }
 
+function buildSessionDataStatusInput() {
+  const loadedCount = asSessionArray(data.sessions).length;
+  const selectedCount = selectedDateSessions.length;
+  const hasUsableSessions = selectedCount > 0
+    || (selectedDateMeta.hasSavedSessions && selectedDateMeta.statusReason === 'saved_sessions_found')
+    || (selectedDateMeta.sessionsCount > 0 && selectedDateMeta.statusReason === 'saved_sessions_found');
+  return {
+    dataSource: selectedDateMeta.dataSource || data.dataSource || data.source,
+    isFallback: !!selectedDateMeta.isFallback,
+    statusReason: selectedDateMeta.statusReason,
+    isRefreshing: !!(data.scrapeInProgress
+      || selectedDateMeta.isScrapeInProgress
+      || (selectedDateMeta.isLoading && hasUsableSessions)),
+    isLoading: !!(
+      (uiLoading && !selectedCount && !loadedCount)
+      || (selectedDateMeta.isLoading && !selectedCount && !loadedCount)
+    ),
+    hasUsableSessions,
+    lastFetchError: selectedDateMeta.lastFetchError || lastFetchError,
+    lastScrapeError: data.lastScrapeError || null,
+    isUsingCachedData: !!data.isUsingCachedData,
+    checkedAt: selectedDateMeta.lastBasicCheckAt
+      || selectedDateMeta.lastCheckedForDate
+      || data.lastSuccessfulScrape
+      || data.lastCheck
+      || null,
+    ageMinutes: data.minutesSinceLastScrape ?? data.dataAgeMinutes ?? null,
+  };
+}
+
 function renderStatusBar() {
   const dot  = document.getElementById('ntfy-dot');
   const txt  = document.getElementById('status-text');
   if (!txt) return;
   if (dot) dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
 
-  const {
-    scrapeInProgress,
-    isUsingCachedData,
-    dataAgeMinutes,
-    minutesSinceLastScrape,
-    lastScrapeError,
-    sessionsCount,
-    currentSessionsCount,
-    lastSuccessfulScrape,
-    source,
-    dataSource,
-  } = data;
-
-  const loadedCount = asSessionArray(data.sessions).length;
-  const selectedCount = selectedDateSessions.length;
-  const trackedCount = selectedCount || loadedCount || (currentSessionsCount ?? sessionsCount ?? 0);
-  const hasSavedReason = ['saved_sessions_found', 'fallback_sessions_found'].includes(selectedDateMeta.statusReason);
-  const hasSavedForView = selectedCount > 0 || selectedDateMeta.hasSavedSessions || hasSavedReason;
-  const ageMins = minutesSinceLastScrape ?? dataAgeMinutes;
-  const src = source || dataSource;
-
-  const ageLabel = (mins) => {
-    if (mins == null) return null;
-    if (mins < 1) return 'just now';
-    return `${mins}m ago`;
-  };
-
-  let detail;
-  if ((scrapeInProgress || selectedDateMeta.isLoading) && hasSavedForView) {
-    detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
-  } else if (scrapeInProgress && trackedCount > 0) {
-    detail = `checked ${ageLabel(ageMins) || 'recently'} · refreshing…`;
-  } else if (scrapeInProgress) {
-    detail = 'refreshing…';
-  } else if (!hasSavedForView && !lastSuccessfulScrape && !scrapeInProgress) {
-    detail = 'waiting for first scrape';
-  } else if (lastScrapeError && trackedCount > 0) {
-    detail = 'showing saved data · refresh failed';
-  } else if (hasSavedForView || isUsingCachedData || src === 'supabase' || src === 'supabase/current_sessions' || (src || '').includes('fallback')) {
-    detail = `showing saved data · checked ${ageLabel(ageMins) || 'earlier'}`;
-  } else {
-    detail = `checked ${ageLabel(ageMins) || 'just now'}`;
-  }
-
-  if (uiLoading && !loadedCount && !selectedCount) {
-    txt.innerHTML = '<span class="check-time">Loading sessions…</span>';
+  if (bootState === 'error'
+    && !selectedDateSessions.length
+    && !asSessionArray(data.sessions).length
+    && !data.lastSuccessfulScrape) {
     return;
   }
 
-  if (lastFetchError && !loadedCount && !selectedCount && !lastSuccessfulScrape) {
-    txt.innerHTML = `<span class="check-time">Could not load · ${lastFetchError}</span>`;
-    return;
-  }
+  const model = deriveSessionDataStatus(buildSessionDataStatusInput());
 
-  if (bootState === 'error' && !loadedCount && !lastSuccessfulScrape) {
-    return;
-  }
-
-  if (!hasSavedForView && !lastSuccessfulScrape && !scrapeInProgress && !trackedCount) {
-    txt.innerHTML = `<span class="check-time">${detail}</span>`;
+  if (!model.showSessionCount) {
+    txt.innerHTML = `<span class="check-time status-${model.severity}">${model.fullText}</span>`;
     return;
   }
 
   const visible = visibleBrowseSessions();
   const countLabel = browseCountLabel(visible);
-  txt.innerHTML = `<span class="open-count">${countLabel}</span><span class="check-time"> · ${detail}</span>`;
+  txt.innerHTML = `<span class="open-count">${countLabel}</span><span class="check-time status-${model.severity}"> · ${model.fullText}</span>`;
 }
 
 function renderBrowse() {

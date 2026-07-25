@@ -38,6 +38,10 @@ app.use((req, res, next) => {
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
+app.get('/session-data-status.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'session-data-status.js'));
+});
 
 const PORT       = process.env.PORT || 3000;
 const TOPIC      = process.env.NTFY_TOPIC || '';
