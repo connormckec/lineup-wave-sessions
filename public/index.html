@@ -228,17 +228,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .week-day .wd-abbr{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .week-day .wd-num{font-family:var(--font-display);font-size:18px;font-weight:700;margin-top:4px;line-height:1}
 .week-day .wd-dot{
-  width:5px;height:5px;border-radius:50%;background:var(--muted);
+  width:5px;height:5px;border-radius:50%;background:var(--accent);
   margin:5px auto 0;
 }
 .week-day.no-sessions{
   opacity:.7;
   cursor:pointer;
 }
-.week-day.no-sessions .wd-dot{display:none}
-.week-day:not(.has-sessions) .wd-dot{
-  background:var(--muted);opacity:.4;
+.week-day.coverage-unknown{
+  cursor:pointer;
 }
+.week-day:not(.has-sessions) .wd-dot{display:none}
 .picker-divider{height:1px;background:var(--border);margin:0 0 14px}
 .time-row{display:flex;gap:10px;margin-bottom:16px}
 .time-field{flex:1}
@@ -728,6 +728,174 @@ let selectedDateMeta = {
 
 let selectedDateFetchToken = 0;
 
+const DATE_COVERAGE_CACHE_TTL_MS = 60_000;
+let dateCoverageState = {
+  byDate: {},
+  status: 'idle',
+  lastFetchedAt: null,
+  endpoint: null,
+  rangeKey: null,
+  error: null,
+};
+let dateCoverageFetchToken = 0;
+
+function dateCoverageRangeForPicker() {
+  const days = getPickerDays();
+  if (!days.length) return null;
+  return {
+    startDate: days[0],
+    endDate: days[days.length - 1],
+    rangeKey: `${days[0]}:${days[days.length - 1]}`,
+  };
+}
+
+function syncSelectedDateIntoCoverage() {
+  if (!activeDayKey) return;
+  const mapped = {
+    statusReason: selectedDateMeta.statusReason,
+    sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+    lastCheckedAt: data.lastSuccessfulScrape || null,
+  };
+  dateCoverageState.byDate = mergeSelectedDateCoverage(
+    dateCoverageState.byDate,
+    activeDayKey,
+    mapped,
+  );
+}
+
+function coverageStatusForDate(dateKey) {
+  if (dateKey === activeDayKey) {
+    const fromSelected = coverageStatusFromSelectedDateMeta({
+      statusReason: selectedDateMeta.statusReason,
+      sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+      lastCheckedAt: data.lastSuccessfulScrape || null,
+    });
+    if (fromSelected?.status === 'has_sessions') return 'has_sessions';
+    if (fromSelected?.status === 'checked_empty') return 'checked_empty';
+    if (fromSelected?.status === 'error') return 'error';
+  }
+  const row = dateCoverageState.byDate[dateKey];
+  if (row?.status) return row.status;
+  if (dateCoverageState.status === 'loading') return 'loading';
+  if (dateCoverageState.status === 'error') return 'error';
+  return 'not_checked';
+}
+
+function mergeSelectedDateCoverage(byDate, isoDate, selectedMeta = {}) {
+  const sessionsCount = selectedMeta.sessionsCount ?? 0;
+  const statusReason = selectedMeta.statusReason;
+  if (sessionsCount > 0 || statusReason === 'saved_sessions_found' || statusReason === 'fallback_sessions_found') {
+    return {
+      ...byDate,
+      [isoDate]: {
+        isoDate,
+        status: 'has_sessions',
+        sessionCount: sessionsCount,
+        lastCheckedAt: selectedMeta.lastCheckedAt ?? null,
+      },
+    };
+  }
+  if (statusReason === 'checked_no_sessions') {
+    return {
+      ...byDate,
+      [isoDate]: {
+        isoDate,
+        status: 'checked_empty',
+        sessionCount: 0,
+        lastCheckedAt: selectedMeta.lastCheckedAt ?? null,
+      },
+    };
+  }
+  if (statusReason === 'error' || statusReason === 'schema_error') {
+    return {
+      ...byDate,
+      [isoDate]: {
+        isoDate,
+        status: 'error',
+        sessionCount: null,
+        lastCheckedAt: null,
+      },
+    };
+  }
+  return byDate;
+}
+
+function coverageStatusFromSelectedDateMeta({ statusReason, sessionsCount = 0 } = {}) {
+  if (sessionsCount > 0 || statusReason === 'saved_sessions_found' || statusReason === 'fallback_sessions_found') {
+    return { status: 'has_sessions', sessionCount: sessionsCount };
+  }
+  if (statusReason === 'checked_no_sessions') return { status: 'checked_empty', sessionCount: 0 };
+  if (statusReason === 'error' || statusReason === 'schema_error') return { status: 'error', sessionCount: null };
+  return null;
+}
+
+function pickerClassForCoverageStatus(status) {
+  if (status === 'has_sessions') return 'has-sessions';
+  if (status === 'checked_empty') return 'no-sessions checked-empty';
+  return 'coverage-unknown';
+}
+
+async function loadDateCoverage({ force = false } = {}) {
+  const range = dateCoverageRangeForPicker();
+  if (!range) return;
+
+  const now = Date.now();
+  const shouldFetch = force
+    || dateCoverageState.rangeKey !== range.rangeKey
+    || !dateCoverageState.lastFetchedAt
+    || now - dateCoverageState.lastFetchedAt >= DATE_COVERAGE_CACHE_TTL_MS
+    || dateCoverageState.status === 'error'
+    || dateCoverageState.status === 'idle';
+
+  if (!shouldFetch) return;
+
+  const token = ++dateCoverageFetchToken;
+  const endpoint = `/api/session-date-coverage?startDate=${encodeURIComponent(range.startDate)}&endDate=${encodeURIComponent(range.endDate)}`;
+  dateCoverageState = {
+    ...dateCoverageState,
+    status: 'loading',
+    endpoint,
+    rangeKey: range.rangeKey,
+    error: null,
+  };
+  if (pickerOpen) renderPickerWeek();
+
+  try {
+    const res = await fetchApi(endpoint, {}, 15000);
+    const payload = await res.json();
+    if (token !== dateCoverageFetchToken) return;
+    if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+
+    const byDate = {};
+    for (const row of payload.dates || []) {
+      if (row?.isoDate) byDate[row.isoDate] = row;
+    }
+    dateCoverageState = {
+      byDate: mergeSelectedDateCoverage(byDate, activeDayKey, {
+        statusReason: selectedDateMeta.statusReason,
+        sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+        lastCheckedAt: payload.fetchedAt || data.lastSuccessfulScrape || null,
+      }),
+      status: 'ready',
+      lastFetchedAt: Date.now(),
+      endpoint,
+      rangeKey: range.rangeKey,
+      error: null,
+    };
+  } catch (err) {
+    if (token !== dateCoverageFetchToken) return;
+    dateCoverageState = {
+      ...dateCoverageState,
+      status: 'error',
+      lastFetchedAt: Date.now(),
+      error: err?.message || String(err),
+    };
+  }
+
+  if (pickerOpen) renderPickerWeek();
+  renderDebugState();
+}
+
 async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
   const dateKey = normalizeIsoDate(isoDate);
   const token = ++selectedDateFetchToken;
@@ -781,6 +949,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
         data.sessions = [...byKey.values()];
       }
       console.warn('[dateSessions] schema missing', { date: dateKey, dataSource: selectedDateMeta.dataSource });
+      syncSelectedDateIntoCoverage();
       return;
     }
 
@@ -813,6 +982,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       apiDurationMs: payload.apiDurationMs,
       supabaseQueryMs: payload.supabaseQueryMs,
     });
+    syncSelectedDateIntoCoverage();
   } catch (err) {
     if (token !== selectedDateFetchToken) return;
     selectedDateMeta.lastFetchError = formatApiError(err?.message || String(err));
@@ -824,6 +994,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       selectedDateMeta.statusReason = isSchemaMissingMessage(selectedDateMeta.lastFetchError) ? 'schema_error' : 'error';
     }
     console.error('[dateSessions]', dateKey, err);
+    syncSelectedDateIntoCoverage();
   } finally {
     clearTimeout(failsafe);
     if (token === selectedDateFetchToken) {
@@ -1982,6 +2153,7 @@ async function refreshStatusInBackground({ silent = true } = {}) {
     data.watchList = watchlistForUi();
     saveStatusCache();
     await loadSelectedDateSessions(activeDayKey, { silent: true });
+    await loadDateCoverage({ force: true });
     if (!silent) safeRenderAll();
   } catch (e) {
     console.warn('[refreshStatusInBackground]', e?.message || e);
@@ -1996,8 +2168,10 @@ async function refresh({ silent = false } = {}) {
     await loadSelectedDateSessions(activeDayKey, { silent: true });
     triggerBackgroundDetailRefresh(activeDayKey);
     refreshStatusInBackground({ silent: true }).then(() => {
-      safeRenderAll();
-      scheduleRefreshPoll();
+      loadDateCoverage({ force: true }).finally(() => {
+        safeRenderAll();
+        scheduleRefreshPoll();
+      });
     });
     finishLoading('ready');
     safeRenderAll();
@@ -2393,6 +2567,13 @@ function renderDebugState() {
     ['Selected date endpoint', selectedDateMeta.endpoint || '—'],
     ['Returned sessions', String(selectedDateMeta.sessionsCount ?? selectedDateSessions.length)],
     ['Status reason', selectedDateMeta.statusReason || '—'],
+    ['Selected-date coverage state', coverageStatusForDate(activeDayKey)],
+    ['Coverage endpoint', dateCoverageState.endpoint || '—'],
+    ['Coverage status', dateCoverageState.status || '—'],
+    ['Coverage last fetched', dateCoverageState.lastFetchedAt
+      ? fmtTime(new Date(dateCoverageState.lastFetchedAt).toISOString())
+      : '—'],
+    ['Coverage fetch error', dateCoverageState.error || '—'],
     ['dataSource', selectedDateMeta.dataSource || data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
     ['schemaHealth', data.schemaHealth?.missingTables?.length
@@ -2573,7 +2754,6 @@ function initTimeSelects() {
 }
 
 function renderPickerWeek() {
-  const sessionDays = sessionDaysSet();
   const days = getPickerDays();
   const today = todayKey();
   document.getElementById('picker-week').innerHTML = days.map(k => {
@@ -2581,11 +2761,13 @@ function renderPickerWeek() {
     const abbr = k === today ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short' });
     const num = d.getDate();
     const on = pickerDraft.dayKey === k;
-    const has = sessionDays.has(k);
-    return `<button type="button" class="week-day${on ? ' on' : ''}${has ? ' has-sessions' : ' no-sessions'}" data-pick-day="${k}">
+    const covStatus = coverageStatusForDate(k);
+    const cls = pickerClassForCoverageStatus(covStatus);
+    const showDot = covStatus === 'has_sessions';
+    return `<button type="button" class="week-day${on ? ' on' : ''} ${cls}" data-pick-day="${k}" data-coverage-status="${covStatus}">
       <div class="wd-abbr">${abbr}</div>
       <div class="wd-num">${num}</div>
-      ${has ? '<div class="wd-dot" aria-hidden="true"></div>' : '<div class="wd-dot" aria-hidden="true"></div>'}
+      ${showDot ? '<div class="wd-dot" aria-hidden="true"></div>' : '<div class="wd-dot" aria-hidden="true"></div>'}
     </button>`;
   }).join('');
 }
@@ -2605,6 +2787,7 @@ function openPicker() {
   document.getElementById('picker-from').value = filterFromH ?? '';
   document.getElementById('picker-to').value = filterToH ?? '';
   renderPickerWeek();
+  loadDateCoverage().catch((err) => console.warn('[dateCoverage]', err?.message || err));
   scrollPickerToDay(pickerDraft.dayKey);
   document.getElementById('picker-backdrop').classList.add('open');
   document.getElementById('picker-sheet').classList.add('open');
@@ -2715,6 +2898,7 @@ initTimeSelects();
       console.warn('[boot] background status', err?.message || err);
     });
     triggerBackgroundDetailRefresh(activeDayKey);
+    loadDateCoverage().catch((err) => console.warn('[dateCoverage]', err?.message || err));
 
     profilePromise.catch(() => {});
     loadWatchlistFromServer().then(() => {

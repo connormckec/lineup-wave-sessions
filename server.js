@@ -14,6 +14,7 @@ const { scrapeCalendarFixtureDom } = require('./lib/calendar-fixture-dom-scraper
 const thresholdMaintenance = require('./lib/threshold-maintenance');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
+const sessionDateCoverage = require('./lib/session-date-coverage');
 const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
 const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
 
@@ -19004,6 +19005,98 @@ app.get('/api/schema/health', async (_req, res) => {
     supabaseInitError,
     ...schemaHealthPayload(),
   });
+});
+
+async function buildSessionDateCoveragePayload(startDate, endDate) {
+  const range = sessionDateCoverage.resolveCoverageDateRange(startDate, endDate, {
+    todayIso: getParkTodayIso(),
+    maxIso: maxHorizonDateKey(),
+  });
+  if (!range.ok) return range;
+
+  let rows = [];
+  if (supabase) {
+    if (!supabaseSchemaHealth.checkedAt) {
+      auditSupabaseSchema().catch(console.error);
+    }
+    if (supabaseSchemaHealth.checkedAt && !supabaseSchemaHealth.currentSessionsAvailable) {
+      rows = allStoredSessions()
+        .filter((session) => {
+          const dk = sessionDateKey(session);
+          return dk && dk >= range.startDate && dk <= range.endDate;
+        })
+        .map((session) => ({
+          iso_date: sessionDateKey(session),
+          session_type: session.level || session.session_type || null,
+          last_basic_check_at: session.lastBasicCheckAt || session.last_basic_check_at || null,
+          raw: { wave: session.wave ?? session.raw?.wave ?? null },
+        }));
+    } else {
+      const { data, error } = await supabase
+        .from('current_sessions')
+        .select('iso_date, session_type, last_basic_check_at, raw')
+        .eq('park', PARK)
+        .gte('iso_date', range.startDate)
+        .lte('iso_date', range.endDate);
+      if (error) {
+        if (isMissingTableError(error)) {
+          supabaseSchemaHealth.currentSessionsAvailable = false;
+        } else {
+          throw error;
+        }
+      } else {
+        rows = data || [];
+        if (rows.length) supabaseSchemaHealth.currentSessionsAvailable = true;
+      }
+    }
+  } else {
+    rows = allStoredSessions()
+      .filter((session) => {
+        const dk = sessionDateKey(session);
+        return dk && dk >= range.startDate && dk <= range.endDate;
+      })
+      .map((session) => ({
+        iso_date: sessionDateKey(session),
+        session_type: session.level || session.session_type || null,
+        last_basic_check_at: session.lastBasicCheckAt || session.last_basic_check_at || null,
+        raw: { wave: session.wave ?? session.raw?.wave ?? null },
+      }));
+  }
+
+  const aggregatedByDate = sessionDateCoverage.aggregateCoverageByDate(rows);
+  const dates = sessionDateCoverage.buildDateCoverageList(
+    range.startDate,
+    range.endDate,
+    aggregatedByDate,
+    datesCheckedEmpty,
+    persistedDatesChecked,
+  );
+
+  return {
+    ok: true,
+    startDate: range.startDate,
+    endDate: range.endDate,
+    fetchedAt: new Date().toISOString(),
+    dates,
+  };
+}
+
+app.get('/api/session-date-coverage', async (req, res) => {
+  try {
+    const startDate = req.query.startDate || req.query.start_date;
+    const endDate = req.query.endDate || req.query.end_date;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ ok: false, error: 'startDate_and_endDate_required' });
+    }
+    const payload = await buildSessionDateCoveragePayload(startDate, endDate);
+    if (!payload.ok) {
+      return res.status(payload.status || 400).json(payload);
+    }
+    return res.json(payload);
+  } catch (err) {
+    console.error('[session-date-coverage]', err.message);
+    return res.status(500).json({ ok: false, error: 'coverage_unavailable' });
+  }
 });
 
 app.get('/api/sessions', async (req, res) => {

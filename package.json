@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-threshold-maintenance-regression.js && node scripts/test-apply-prepared-completion-regression.js && node scripts/test-route-auth-regression.js && node scripts/test-scheduler-mode-regression.js",
+    "test": "node scripts/test-threshold-maintenance-regression.js && node scripts/test-apply-prepared-completion-regression.js && node scripts/test-route-auth-regression.js && node scripts/test-scheduler-mode-regression.js && node scripts/test-session-date-coverage-regression.js",
     "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
