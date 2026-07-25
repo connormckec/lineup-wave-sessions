@@ -19996,6 +19996,41 @@ app.post('/api/admin/notifications/provider-probe', async (req, res) => {
   }
 });
 
+app.post('/api/admin/notifications/relay-publish-test', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const userKey = String(req.body?.userKey || req.body?.user_key || '').trim();
+    if (!userKey) {
+      return res.status(400).json({ ok: false, error: 'userKey_required' });
+    }
+    const dest = await resolveNotificationDestinationForUser(userKey);
+    if (!dest.ok || !dest.destination) {
+      return res.status(400).json({ ok: false, error: 'notification_topic_not_configured' });
+    }
+    const clickUrl = notificationPipeline.buildLineupClickUrl(getParkTodayIso(), { lineupAppUrl: LINEUP_APP_URL });
+    const result = await notificationProvider.sendNotification({
+      provider: 'ntfy',
+      destination: dest.destination,
+      title: 'AP Session Alert',
+      message: 'Relay publish test — admin controlled.',
+      clickUrl,
+      testEvent: true,
+    });
+    return res.json({
+      ok: result.ok,
+      transport: result.transport,
+      providerStatus: result.providerStatus,
+      error: result.error || null,
+      destinationMasked: notificationTopic.maskDestination(dest.destination),
+    });
+  } catch (err) {
+    console.error('[notifications/relay-publish-test]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
   try {
     if (!supabase) {
@@ -21611,7 +21646,10 @@ async function startServer() {
   await loadPersistedData();
   logDeploymentSchedulerConfig();
   notificationConfig.logNotificationStartup(notificationRuntimeConfig);
-  console.log(`  ntfy provider transport: ${notificationProvider.TRANSPORT_NAME}; family=${notificationProvider.resolveHttpFamily() ?? 'default'}; node=${process.version}`);
+  for (const line of notificationProvider.buildStartupLogLines(notificationProvider.resolveProviderSettings())) {
+    console.log(`  ${line}`);
+  }
+  console.log(`  ntfy direct family: ${notificationProvider.resolveHttpFamily() ?? 'default'}; node=${process.version}`);
   if (sessions.length) {
     console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }

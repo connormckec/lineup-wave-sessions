@@ -1,0 +1,9 @@
+name = "lineup-ntfy-relay"
+main = "src/index.js"
+compatibility_date = "2024-06-01"
+
+# Set secret in Cloudflare (do not commit):
+#   wrangler secret put NTFY_RELAY_SECRET
+
+[vars]
+# No secrets here.

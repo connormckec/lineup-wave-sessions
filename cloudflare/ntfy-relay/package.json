@@ -1,0 +1,8 @@
+{
+  "name": "lineup-ntfy-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}
