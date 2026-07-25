@@ -26,6 +26,8 @@ const notificationProvider = require('./lib/notification-provider');
 const notificationProviderProbe = require('./lib/notification-provider-probe');
 const notificationConfig = require('./lib/notification-config');
 const notificationProfileMigration = require('./lib/notification-profile-migration');
+const pushSubscriptionStore = require('./lib/push-subscription-store');
+const webPushConfig = require('./lib/web-push-config');
 const APP_VERSION = process.env.APP_VERSION || pkg.version || '1.0.0';
 const BUILD_TIME = process.env.BUILD_TIME || new Date().toISOString();
 
@@ -38,7 +40,7 @@ app.use((req, res, next) => {
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     res.set('Surrogate-Control', 'no-store');
-  } else if (req.path === '/' || req.path === '/index.html' || req.path === '/profile-auth-client.js') {
+  } else if (req.path === '/' || req.path === '/index.html' || req.path === '/profile-auth-client.js' || req.path === '/push-client.js') {
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.set('Pragma', 'no-cache');
   } else if (/\.(png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(req.path)) {
@@ -263,6 +265,7 @@ const REQUIRED_SUPABASE_TABLES = [
   'notification_profiles',
   'session_change_events',
   'notification_deliveries',
+  'push_subscriptions',
 ];
 
 let supabaseSchemaHealth = {
@@ -6740,6 +6743,26 @@ async function resolveNotificationDestinationForUser(userKey) {
   });
 }
 
+async function listPushSubscriptionsForUser(userKey) {
+  if (!supabase || !userKey) return [];
+  return pushSubscriptionStore.listActiveSubscriptionsForUser(supabase, userKey);
+}
+
+function notificationPipelineDeliveryOptions() {
+  return {
+    deliveryProvider: notificationRuntimeConfig.notificationDeliveryProvider,
+    resolveDestination: resolveNotificationDestinationForUser,
+    listPushSubscriptions: listPushSubscriptionsForUser,
+  };
+}
+
+let vapidConfigWarningLogged = false;
+function warnVapidConfigOnce(error) {
+  if (vapidConfigWarningLogged) return;
+  vapidConfigWarningLogged = true;
+  console.warn(`  WARNING: Web Push VAPID configuration error: ${error}`);
+}
+
 function isNotificationTestRateLimited(userKey, now = Date.now()) {
   const last = notificationTestRateByUser.get(userKey) || 0;
   return now - last < NOTIFICATION_TEST_COOLDOWN_MS;
@@ -11997,10 +12020,10 @@ async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun
           previousSession: previousByKey.get(row.key),
           nextSession: sessionsByKey.get(row.key),
           watches: watchItems,
-          resolveDestination: resolveNotificationDestinationForUser,
           sourceJobId,
           dryRun: false,
           writeSucceeded: true,
+          ...notificationPipelineDeliveryOptions(),
         });
         notificationResults.push({ sessionKey: row.key, ...result });
         if (result.ok === false) {
@@ -19025,6 +19048,10 @@ function statusPayload(userKey = null, selectedDate = null, profileCode = null) 
     ntfyOk: !!TOPIC,
     ntfyFallbackConfigured: !!TOPIC,
     internalBetaNotifications: INTERNAL_BETA,
+    showNtfyDevUi: notificationRuntimeConfig.showNtfyDevUi,
+    webPushEnabled: notificationRuntimeConfig.webPushEnabled,
+    webPushConfigured: notificationRuntimeConfig.webPushConfigured,
+    notificationDeliveryProvider: notificationRuntimeConfig.notificationDeliveryProvider,
     internalDefaultNtfyTopic: null,
     internalDefaultProfileCode: null,
     user_key: userKey || null,
@@ -19893,6 +19920,8 @@ app.post('/api/admin/notifications/process-deliveries', async (req, res) => {
         return watchItems.find((w) => w.id === watchId) || null;
       },
       resolveDestination: resolveNotificationDestinationForUser,
+      loadPushSubscriptionById: (id) => pushSubscriptionStore.findSubscriptionById(supabase, id),
+      onVapidConfigError: warnVapidConfigOnce,
     });
     return res.json(result);
   } catch (err) {
@@ -19908,6 +19937,7 @@ app.get('/api/admin/notifications/diagnostics', async (req, res) => {
     }
     const payload = await notificationDiagnostics.buildDiagnosticsPayload(supabase, {
       limit: Math.min(100, parseInt(req.query.limit || '25', 10) || 25),
+      deliveryProvider: notificationRuntimeConfig.notificationDeliveryProvider,
     });
     return res.json({ ok: true, ...payload });
   } catch (err) {
@@ -19954,7 +19984,7 @@ app.post('/api/admin/notifications/test-pipeline', async (req, res) => {
       supabase,
       eventRow,
       watches: [watch],
-      resolveDestination: resolveNotificationDestinationForUser,
+      ...notificationPipelineDeliveryOptions(),
     });
 
     return res.json({
@@ -21198,6 +21228,9 @@ app.get('/api/notification-profile', requireProfileAuth, async (req, res) => {
 });
 
 app.put('/api/notification-profile', requireProfileAuth, async (req, res) => {
+  if (notificationRuntimeConfig.notificationDeliveryProvider === 'webpush') {
+    return res.status(410).json({ ok: false, error: 'ntfy_profile_deprecated' });
+  }
   try {
     if (!supabase) {
       return res.status(503).json({ ok: false, error: 'supabase_unconfigured' });
@@ -21220,11 +21253,164 @@ app.put('/api/notification-profile', requireProfileAuth, async (req, res) => {
   }
 });
 
+app.get('/api/push/vapid-public-key', async (req, res) => {
+  if (!notificationRuntimeConfig.webPushEnabled) {
+    return res.status(503).json({ ok: false, error: 'web_push_disabled' });
+  }
+  const config = webPushConfig.readWebPushConfig(process.env);
+  if (!config.configured || !config.publicKey) {
+    return res.status(503).json({ ok: false, error: config.configError || 'webpush_not_configured' });
+  }
+  return res.json({ ok: true, publicKey: config.publicKey });
+});
+
+app.post('/api/push/subscribe', requireProfileAuth, async (req, res) => {
+  if (!notificationRuntimeConfig.webPushEnabled) {
+    return res.status(503).json({ ok: false, error: 'web_push_disabled' });
+  }
+  const config = webPushConfig.readWebPushConfig(process.env);
+  if (!config.configured) {
+    return res.status(503).json({ ok: false, error: config.configError || 'webpush_not_configured' });
+  }
+  if (!supabase) {
+    return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+  }
+  try {
+    const result = await pushSubscriptionStore.upsertPushSubscription(
+      supabase,
+      req.profileAuth.userKey,
+      {
+        ...req.body,
+        userAgent: req.headers['user-agent'] || req.body?.userAgent || null,
+      },
+    );
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, error: result.error });
+    }
+    return res.json({
+      ok: true,
+      ...pushSubscriptionStore.toSafeSubscriptionResponse(result.subscription),
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/push/subscribe', requireProfileAuth, async (req, res) => {
+  if (!supabase) {
+    return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+  }
+  try {
+    const result = await pushSubscriptionStore.deactivateSubscriptionForDevice(
+      supabase,
+      req.profileAuth.userKey,
+      req.body?.deviceInstallId,
+    );
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, error: result.error });
+    }
+    return res.json({
+      ok: true,
+      deactivated: !!result.subscription,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/push/status', requireProfileAuth, async (req, res) => {
+  if (!supabase) {
+    return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+  }
+  try {
+    const deviceInstallId = req.query.deviceInstallId || req.headers['x-lineup-device-install-id'] || null;
+    const status = await pushSubscriptionStore.buildPushStatusForUser(
+      supabase,
+      req.profileAuth.userKey,
+      deviceInstallId,
+      { webPushConfigured: notificationRuntimeConfig.webPushConfigured },
+    );
+    return res.json({
+      ok: true,
+      enabled: notificationRuntimeConfig.webPushEnabled,
+      provider: notificationRuntimeConfig.notificationDeliveryProvider,
+      ...status,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/notify/test', requireProfileAuth, async (req, res) => {
   const userKey = req.profileAuth.userKey;
   if (isNotificationTestRateLimited(userKey)) {
     return res.status(429).json({ ok: false, error: 'test_rate_limited' });
   }
+
+  if (notificationRuntimeConfig.notificationDeliveryProvider === 'webpush') {
+    if (!notificationRuntimeConfig.webPushConfigured) {
+      return res.status(503).json({ ok: false, error: 'webpush_not_configured' });
+    }
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    try {
+      const deviceInstallId = req.body?.deviceInstallId;
+      const subRow = await pushSubscriptionStore.findActiveSubscriptionForDevice(
+        supabase,
+        userKey,
+        deviceInstallId,
+      );
+      if (!subRow) {
+        return res.status(400).json({ ok: false, error: 'push_subscription_not_found' });
+      }
+      const sendSub = pushSubscriptionStore.toSendSubscription(subRow);
+      const clickPath = notificationPipeline.buildRelativeClickPath(getParkTodayIso());
+      const result = await notificationProvider.sendNotification({
+        provider: 'webpush',
+        subscription: sendSub,
+        title: 'Lineup',
+        message: 'Test notification — your Lineup alerts are working.',
+        clickUrl: clickPath,
+        eventType: 'test',
+        sessionKey: 'test',
+        isoDate: getParkTodayIso(),
+        testEvent: true,
+        lineupOrigin: LINEUP_APP_URL,
+      });
+      await recordNotificationEvent(
+        { user_key: userKey, session_key: null, ntfy_topic: pushSubscriptionStore.endpointHashPrefix(subRow.endpoint_hash) },
+        { available: null, slots: null },
+        'test',
+        'Test notification — your Lineup alerts are working.',
+        result,
+        { eventReason: 'manual_test_webpush' },
+      );
+      if (!result.ok) {
+        if (result.deactivateSubscription) {
+          await pushSubscriptionStore.deactivateSubscriptionById(supabase, subRow.id, result.error);
+        } else if (!result.ok) {
+          await pushSubscriptionStore.recordSubscriptionFailure(supabase, subRow.id, result.error);
+        }
+        const status = result.error === 'timeout' || result.transient ? 502 : 400;
+        return res.status(status).json({
+          ok: false,
+          error: result.error || 'notify_failed',
+          provider: 'webpush',
+        });
+      }
+      await pushSubscriptionStore.recordSubscriptionSuccess(supabase, subRow.id);
+      markNotificationTestSent(userKey);
+      return res.json({ ok: true, provider: 'webpush' });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+
+  if (notificationRuntimeConfig.notificationDeliveryProvider !== 'ntfy') {
+    return res.status(503).json({ ok: false, error: 'notification_provider_disabled' });
+  }
+
   try {
     const dest = await resolveNotificationDestinationForUser(userKey);
     if (!dest.ok || !dest.destination) {
@@ -21650,10 +21836,12 @@ async function startServer() {
   await loadPersistedData();
   logDeploymentSchedulerConfig();
   notificationConfig.logNotificationStartup(notificationRuntimeConfig);
-  for (const line of notificationProvider.buildStartupLogLines(notificationProvider.resolveProviderSettings())) {
-    console.log(`  ${line}`);
+  if (notificationRuntimeConfig.notificationDeliveryProvider === 'ntfy') {
+    for (const line of notificationProvider.buildStartupLogLines(notificationProvider.resolveProviderSettings())) {
+      console.log(`  ${line}`);
+    }
+    console.log(`  ntfy direct family: ${notificationProvider.resolveHttpFamily() ?? 'default'}; node=${process.version}`);
   }
-  console.log(`  ntfy direct family: ${notificationProvider.resolveHttpFamily() ?? 'default'}; node=${process.version}`);
   if (sessions.length) {
     console.log(`Serving ${sessions.length} saved session(s) (${dataSource}) — background scrapes will refresh in place`);
   }
@@ -21664,12 +21852,14 @@ async function startServer() {
     if (supabaseConfigured) {
       console.log('Supabase collector: current_sessions + availability_snapshots + scrape_runs');
     }
-    if (INTERNAL_BETA) {
-      console.log('Internal beta notifications UI enabled — users must save their own profile topic server-side');
+    if (INTERNAL_BETA && notificationRuntimeConfig.showNtfyDevUi) {
+      console.log('Internal beta ntfy dev UI enabled — production notifications use Web Push when configured');
+    } else if (notificationRuntimeConfig.notificationDeliveryProvider === 'webpush') {
+      console.log('Lineup Web Push notifications configured — users enable alerts from Settings on each device');
+    } else if (notificationRuntimeConfig.notificationDeliveryProvider === 'ntfy') {
+      console.log('ntfy rollback provider active — each profile must save a server topic');
     } else {
-      console.log(TOPIC && ALLOW_INTERNAL_DEFAULT_NTFY_TOPIC
-        ? 'Server NTFY_TOPIC fallback configured (dev only)'
-        : 'No shared ntfy topic fallback — each profile must save a server topic');
+      console.log('Notification delivery provider disabled');
     }
     bootstrapInBackground();
     startupCoverageCheck().catch(console.error);

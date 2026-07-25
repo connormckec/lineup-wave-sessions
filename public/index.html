@@ -62,8 +62,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 #status-meta #status-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #status-meta .open-count{color:var(--accent);font-weight:600}
 #status-meta .check-time{color:var(--sub)}
-#ntfy-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
-#ntfy-dot.ok{background:var(--accent);box-shadow:0 0 6px rgba(0,201,167,.5)}
+#notify-dot,#ntfy-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+#notify-dot.ok,#ntfy-dot.ok{background:var(--accent);box-shadow:0 0 6px rgba(0,201,167,.5)}
 #refresh-btn{width:36px;height:36px;border:1px solid var(--border);border-radius:8px;background:rgba(6,26,53,.6);color:var(--sub);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s,border-color .15s}
 #refresh-btn:active{background:var(--card-hover)}
 #refresh-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
@@ -436,7 +436,7 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/browse-session-filters.js"></script>
+<script src="/browse-session-filters.js?v=8"></script>
 <div id="app">
 
   <header id="header">
@@ -459,7 +459,7 @@ input.field:focus{border-color:var(--accent)}
       </svg>
     </div>
     <div id="status-meta">
-      <div id="ntfy-dot"></div>
+      <div id="notify-dot"></div>
       <span id="status-text">Loading...</span>
     </div>
   </header>
@@ -509,10 +509,29 @@ input.field:focus{border-color:var(--accent)}
         <p id="profile-code-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
         <p class="profile-code-display" id="profile-user-key-hint" hidden></p>
       </div>
-      <div class="setup-divider" id="setup-divider"></div>
-      <div class="setup-block" id="demo-alerts-block">
-        <h3>Demo Alerts</h3>
-        <p class="demo-intro">Internal demo only. For now, alerts use ntfy so we can test the watchlist logic before building native push.</p>
+      <div class="setup-divider" id="push-setup-divider"></div>
+      <div class="setup-block" id="push-notifications-block">
+        <h3>Notifications</h3>
+        <p class="profile-hint" id="push-status-message">Checking notification status…</p>
+        <div class="push-homescreen-hint profile-hint" id="push-homescreen-hint" hidden>
+          <strong>On iPhone:</strong>
+          <ol style="margin:8px 0 0 18px;font-size:12px;color:var(--sub);line-height:1.5">
+            <li>Tap Share</li>
+            <li>Choose Add to Home Screen</li>
+            <li>Open Lineup from the new icon</li>
+            <li>Return here and tap Enable notifications</li>
+          </ol>
+        </div>
+        <div class="setup-actions">
+          <button type="button" class="btn btn-outline" id="push-enable-btn" onclick="enablePushNotifications()">Enable notifications</button>
+          <button type="button" class="btn btn-outline" id="push-test-btn" onclick="sendPushTestNotification()">Send test notification</button>
+          <button type="button" class="btn btn-outline" id="push-disable-btn" onclick="disablePushNotifications()">Disable on this device</button>
+        </div>
+        <p id="push-notify-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
+      </div>
+      <div class="setup-block" id="demo-alerts-block" hidden>
+        <h3>Demo Alerts (dev)</h3>
+        <p class="demo-intro">Internal ntfy rollback UI — not shown in production Web Push flow.</p>
         <p class="demo-subscribe" id="ntfy-subscribe-hint">Subscribe to your saved topic in the ntfy app after you save it below.</p>
         <div class="lbl">Topic</div>
         <input class="field" type="text" id="ntfy-topic-input" placeholder="your-ntfy-topic" autocomplete="off">
@@ -522,7 +541,7 @@ input.field:focus{border-color:var(--accent)}
         </div>
         <p id="ntfy-topic-msg" style="font-size:12px;color:var(--sub);margin:10px 0 0"></p>
       </div>
-      <div class="setup-divider"></div>
+      <div class="setup-divider" id="setup-divider" hidden></div>
       <div class="setup-block" id="debug-state-block">
         <h3>App state</h3>
         <p class="profile-hint">Compare build and data source across phone and desktop. Reset clears cached UI state only — your Supabase Lineup is not deleted.</p>
@@ -574,7 +593,8 @@ input.field:focus{border-color:var(--accent)}
 
 </div>
 
-<script src="/profile-auth-client.js?v=3"></script>
+<script src="/profile-auth-client.js?v=8"></script>
+<script src="/push-client.js?v=8"></script>
 <script>
 const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 const PAC = () => window.ProfileAuthClient;
@@ -589,8 +609,10 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '6';
-const APP_SHELL_BUILD = '2026-07-25-notify-test-auth-v3';
+const SW_CACHE_VERSION = '8';
+const APP_SHELL_BUILD = '2026-07-25-web-push-v8';
+const LPC = () => window.LineupPushClient;
+let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
 let cachedProfileCode = null;
 let lastFocusRefreshAt = 0;
@@ -1480,6 +1502,146 @@ async function sendTestNotification() {
   }
 }
 
+async function refreshPushStatus() {
+  const statusEl = document.getElementById('push-status-message');
+  const homescreenHint = document.getElementById('push-homescreen-hint');
+  const enableBtn = document.getElementById('push-enable-btn');
+  const testBtn = document.getElementById('push-test-btn');
+  const disableBtn = document.getElementById('push-disable-btn');
+  if (!LPC() || !data.webPushEnabled) {
+    pushUiStatus = { uiState: 'unavailable', thisDeviceActive: false };
+    if (statusEl) statusEl.textContent = 'Web Push is temporarily unavailable.';
+    if (homescreenHint) homescreenHint.hidden = true;
+    if (enableBtn) enableBtn.disabled = true;
+    if (testBtn) testBtn.disabled = true;
+    if (disableBtn) disableBtn.disabled = true;
+    renderStatusBar();
+    return pushUiStatus;
+  }
+
+  if (!getSavedNormalizedProfileCode()) {
+    pushUiStatus = { uiState: 'ready', thisDeviceActive: false, stateMessage: 'Save a profile sync code first, then enable notifications.' };
+    if (statusEl) statusEl.textContent = pushUiStatus.stateMessage;
+    if (homescreenHint) homescreenHint.hidden = !LPC().isStandaloneMode() ? false : true;
+    if (enableBtn) enableBtn.disabled = true;
+    if (testBtn) testBtn.disabled = true;
+    if (disableBtn) disableBtn.disabled = true;
+    renderStatusBar();
+    return pushUiStatus;
+  }
+
+  try {
+    const status = await LPC().fetchPushStatus((url, opts) => fetchProfileApi(url, opts));
+    pushUiStatus = status;
+    if (statusEl) statusEl.textContent = status.stateMessage || LPC().stateMessage(status.uiState);
+    if (homescreenHint) homescreenHint.hidden = status.uiState !== 'needs_homescreen';
+    if (enableBtn) enableBtn.disabled = !['ready', 'repair'].includes(status.uiState);
+    if (testBtn) testBtn.disabled = !status.thisDeviceActive;
+    if (disableBtn) disableBtn.disabled = !status.thisDeviceActive;
+  } catch (err) {
+    pushUiStatus = { uiState: 'unavailable', thisDeviceActive: false, stateMessage: 'Could not load notification status.' };
+    if (statusEl) statusEl.textContent = pushUiStatus.stateMessage;
+    if (homescreenHint) homescreenHint.hidden = true;
+    if (enableBtn) enableBtn.disabled = true;
+    if (testBtn) testBtn.disabled = true;
+    if (disableBtn) disableBtn.disabled = true;
+  }
+  renderStatusBar();
+  return pushUiStatus;
+}
+
+async function resyncPushSubscriptionOnBoot() {
+  if (!LPC()?.supportsPushManager?.() || !data.webPushEnabled || !getSavedNormalizedProfileCode()) return;
+  if (Notification.permission !== 'granted') return;
+  try {
+    await LPC().resyncIfGranted((url, opts) => fetchProfileApi(url, opts));
+  } catch (err) {
+    console.warn('[push] boot resync', err);
+  }
+}
+
+async function enablePushNotifications() {
+  const msgEl = document.getElementById('push-notify-msg');
+  if (!getSavedNormalizedProfileCode()) {
+    if (msgEl) {
+      msgEl.textContent = formatProfileAuthError('profile_code_missing');
+      msgEl.style.color = '#ff6b35';
+    }
+    return;
+  }
+  if (msgEl) {
+    msgEl.textContent = 'Requesting permission…';
+    msgEl.style.color = 'var(--sub)';
+  }
+  try {
+    const result = await LPC().enableNotifications((url, opts) => fetchProfileApi(url, opts));
+    if (!result.ok) {
+      if (msgEl) {
+        msgEl.textContent = result.state === 'denied'
+          ? 'Notification permission denied.'
+          : 'Could not enable notifications on this device.';
+        msgEl.style.color = '#ff6b35';
+      }
+    } else if (msgEl) {
+      msgEl.textContent = 'Notifications enabled on this device.';
+      msgEl.style.color = '#00c9a7';
+    }
+    await refreshPushStatus();
+  } catch (err) {
+    if (msgEl) {
+      msgEl.textContent = LPC().formatPushError(err.status || 0, err.code);
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+}
+
+async function disablePushNotifications() {
+  const msgEl = document.getElementById('push-notify-msg');
+  try {
+    await LPC().disableOnThisDevice((url, opts) => fetchProfileApi(url, opts));
+    if (msgEl) {
+      msgEl.textContent = 'Notifications disabled on this device.';
+      msgEl.style.color = 'var(--sub)';
+    }
+    await refreshPushStatus();
+  } catch (err) {
+    if (msgEl) {
+      msgEl.textContent = LPC().formatPushError(err.status || 0, err.code);
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+}
+
+async function sendPushTestNotification() {
+  const msgEl = document.getElementById('push-notify-msg');
+  if (!getSavedNormalizedProfileCode()) {
+    if (msgEl) {
+      msgEl.textContent = formatProfileAuthError('profile_code_missing');
+      msgEl.style.color = '#ff6b35';
+    }
+    return;
+  }
+  try {
+    const result = await LPC().sendTestNotification((url, opts) => fetchProfileApi(url, opts));
+    if (result.ok) {
+      if (msgEl) {
+        msgEl.textContent = 'Test notification sent.';
+        msgEl.style.color = '#00c9a7';
+      }
+      return;
+    }
+    if (msgEl) {
+      msgEl.textContent = LPC().formatPushError(result.status, result.body?.error);
+      msgEl.style.color = '#ff6b35';
+    }
+  } catch (err) {
+    if (msgEl) {
+      msgEl.textContent = LPC().formatPushError(0, null, { network: true });
+      msgEl.style.color = '#ff6b35';
+    }
+  }
+}
+
 const LEVEL_ORDER = [
   'Progressive', 'Intermediate', 'Advanced Turns', 'Advanced Barrels',
   'Expert Turns', 'Expert Barrels', 'Pro Turns', 'Pro Barrels',
@@ -2247,6 +2409,10 @@ let data          = {
   sessions: [], watchList: [], history: {}, lastCheck: null,
   ntfyOk: false, scrapeMeta: {},
   internalBetaNotifications: false,
+  showNtfyDevUi: false,
+  webPushEnabled: false,
+  webPushConfigured: false,
+  notificationDeliveryProvider: 'disabled',
   internalDefaultNtfyTopic: null,
 };
 let activeDayKey  = todayKey();
@@ -2386,22 +2552,32 @@ function renderAll() {
 function applyInternalBetaNav() {
   const nav = document.getElementById('nav-setup');
   const pane = document.getElementById('pane-setup');
+  const pushBlock = document.getElementById('push-notifications-block');
+  const pushDivider = document.getElementById('push-setup-divider');
   const demoBlock = document.getElementById('demo-alerts-block');
   const setupDivider = document.getElementById('setup-divider');
   const navLabel = document.getElementById('nav-setup-label');
   if (!nav) return;
 
-  const beta = !!data.internalBetaNotifications;
+  const showPush = !!data.webPushEnabled;
+  const showNtfyDev = !!data.internalBetaNotifications && !!data.showNtfyDevUi;
   nav.hidden = false;
-  nav.classList.toggle('nav-beta', beta);
+  nav.classList.toggle('nav-beta', showNtfyDev);
   if (pane) pane.hidden = false;
-  if (demoBlock) demoBlock.hidden = !beta;
-  if (setupDivider) setupDivider.hidden = !beta;
-  if (navLabel) navLabel.textContent = beta ? 'Settings' : 'Settings';
+  if (pushBlock) pushBlock.hidden = !showPush;
+  if (pushDivider) pushDivider.hidden = !showPush;
+  if (demoBlock) demoBlock.hidden = !showNtfyDev;
+  if (setupDivider) setupDivider.hidden = !showNtfyDev;
+  if (navLabel) navLabel.textContent = 'Settings';
 }
 
 function alertsEnabled() {
-  return !!data.internalBetaNotifications;
+  if (data.webPushEnabled && data.notificationDeliveryProvider === 'webpush') return true;
+  return !!data.internalBetaNotifications && !!data.showNtfyDevUi;
+}
+
+function pushNotificationsActiveOnDevice() {
+  return !!(pushUiStatus?.thisDeviceActive && pushUiStatus?.uiState === 'enabled');
 }
 
 function onBellClick(sJson) {
@@ -2446,10 +2622,14 @@ function buildSessionDataStatusInput() {
 }
 
 function renderStatusBar() {
-  const dot  = document.getElementById('ntfy-dot');
+  const dot  = document.getElementById('notify-dot');
   const txt  = document.getElementById('status-text');
   if (!txt) return;
-  if (dot) dot.className = (alertsEnabled() && getNtfyTopic()) ? 'ok' : '';
+  if (dot) {
+    const pushOk = data.webPushEnabled && pushNotificationsActiveOnDevice();
+    const ntfyOk = data.showNtfyDevUi && data.internalBetaNotifications && getNtfyTopic();
+    dot.className = (pushOk || ntfyOk) ? 'ok' : '';
+  }
 
   if (bootState === 'error'
     && !selectedDateSessions.length
@@ -2633,7 +2813,7 @@ function renderWatching() {
 
   if (!n) {
     el.innerHTML = alertsEnabled()
-      ? '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Demo ntfy alerts fire when spots open or slots run low.</div>'
+      ? '<div class="empty">Tap 🔔 on any session to add it to your lineup.<br>Lineup alerts notify this device when spots open.</div>'
       : '<div class="empty">Push alerts coming soon.<br>Browse sessions to see live availability.</div>';
     return;
   }
@@ -2771,27 +2951,33 @@ function renderSetup() {
     return;
   }
 
-  if (subscribeHint) {
-    const topic = getNtfyTopic();
-    const masked = PAC().maskNtfyTopicForDisplay(topic);
-    subscribeHint.textContent = masked
-      ? `Subscribe to your saved topic in ntfy (${masked}). Use the same value in the Topic field below.`
-      : 'Subscribe to your saved topic in the ntfy app after you save it below.';
+  if (data.webPushEnabled) {
+    refreshPushStatus().catch((err) => console.warn('[push] status', err));
   }
 
-  if (input && document.activeElement !== input) {
-    input.value = getNtfyTopicForInput();
-  }
-  if (msgEl) {
-    if (hasSavedNtfyTopic()) {
-      msgEl.textContent = 'Topic saved on this device.';
-      msgEl.style.color = '#00c9a7';
-    } else if (getNtfyTopic()) {
-      msgEl.textContent = 'Using demo default — tap Save to persist a custom topic.';
-      msgEl.style.color = 'var(--sub)';
-    } else {
-      msgEl.textContent = 'Enter the demo topic and tap Save.';
-      msgEl.style.color = 'var(--sub)';
+  if (data.showNtfyDevUi && data.internalBetaNotifications) {
+    if (subscribeHint) {
+      const topic = getNtfyTopic();
+      const masked = PAC().maskNtfyTopicForDisplay(topic);
+      subscribeHint.textContent = masked
+        ? `Subscribe to your saved topic in ntfy (${masked}). Use the same value in the Topic field below.`
+        : 'Subscribe to your saved topic in the ntfy app after you save it below.';
+    }
+
+    if (input && document.activeElement !== input) {
+      input.value = getNtfyTopicForInput();
+    }
+    if (msgEl) {
+      if (hasSavedNtfyTopic()) {
+        msgEl.textContent = 'Topic saved on this device.';
+        msgEl.style.color = '#00c9a7';
+      } else if (getNtfyTopic()) {
+        msgEl.textContent = 'Using demo default — tap Save to persist a custom topic.';
+        msgEl.style.color = 'var(--sub)';
+      } else {
+        msgEl.textContent = 'Enter the demo topic and tap Save.';
+        msgEl.style.color = 'var(--sub)';
+      }
     }
   }
   renderDebugState();
@@ -2799,7 +2985,7 @@ function renderSetup() {
 
 async function toggleWatch(sJson) {
   const s = JSON.parse(decodeURIComponent(sJson));
-  const topic = alertsEnabled() ? getNtfyTopic() : null;
+  const topic = (data.showNtfyDevUi && data.internalBetaNotifications) ? getNtfyTopic() : null;
   const existing = localWatchlist.find(w => (w.session_key || w.key) === s.key);
 
   if (!getSavedNormalizedProfileCode()) {
@@ -3057,7 +3243,10 @@ initTimeSelects();
     triggerBackgroundDetailRefresh(activeDayKey);
     loadDateCoverage().catch((err) => console.warn('[dateCoverage]', err?.message || err));
 
-    profilePromise.catch(() => {});
+    profilePromise.then(() => {
+      resyncPushSubscriptionOnBoot().catch((err) => console.warn('[boot] push resync', err));
+      if (data.webPushEnabled) refreshPushStatus().catch(() => {});
+    }).catch(() => {});
     loadWatchlistFromServer().then(() => {
       purgeExpiredWatchlistLocal();
       safeRenderAll();

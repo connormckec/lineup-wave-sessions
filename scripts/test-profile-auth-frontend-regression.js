@@ -103,7 +103,8 @@ async function runTests() {
     assert.ok(!html.includes('user_key: getUserKey()'));
     assert.ok(!html.includes('user_key: userKey'));
     assert.ok(!html.includes('ap-surf-connor-2026'));
-    assert.ok(html.includes('/profile-auth-client.js?v=3'));
+    assert.ok(html.includes('/profile-auth-client.js?v='));
+    assert.ok(html.includes('/push-client.js?v='));
   }
 
   {
