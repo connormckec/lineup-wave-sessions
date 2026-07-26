@@ -21,6 +21,7 @@ const notificationProfileStore = require('./lib/notification-profile-store');
 const notificationPipeline = require('./lib/notification-pipeline');
 const notificationDeliveriesLib = require('./lib/notification-deliveries');
 const notificationDiagnostics = require('./lib/notification-diagnostics');
+const marketObservations = require('./lib/market-observations');
 const sessionChangeEventsLib = require('./lib/session-change-events');
 const notificationProvider = require('./lib/notification-provider');
 const notificationProviderProbe = require('./lib/notification-provider-probe');
@@ -266,6 +267,8 @@ const REQUIRED_SUPABASE_TABLES = [
   'session_change_events',
   'notification_deliveries',
   'push_subscriptions',
+  'session_market_observations',
+  'session_product_price_observations',
 ];
 
 let supabaseSchemaHealth = {
@@ -365,6 +368,7 @@ let lastHistorySnapshotSavedAt = null;
 let lastLatestSnapshotSavedAt = null;
 let lastSnapshotRowsInsertedLastRun = 0;
 const HISTORY_SNAPSHOTS_ENABLED = process.env.HISTORY_SNAPSHOTS !== 'false';
+const MARKET_OBSERVATIONS_ENABLED = process.env.MARKET_OBSERVATIONS_ENABLED === 'true';
 const PARK = 'atlantic_park';
 const serverStartedAt = new Date().toISOString();
 let backgroundCollectorEnabled = process.env.BACKGROUND_COLLECTOR_ENABLED !== 'false';
@@ -5592,8 +5596,14 @@ async function saveAvailabilitySnapshotsToSupabase(scrapedSessions, sourceTier, 
   }
 }
 
-async function persistTierScrapeResults(sessions, tier, { slotCountsAttempted = false, slotCountsError = null } = {}) {
+async function persistTierScrapeResults(sessions, tier, { slotCountsAttempted = false, slotCountsError = null, observationRunId = null } = {}) {
   const merged = asSessionArray(sessions);
+  const previousByKey = new Map();
+  for (const s of merged) {
+    if (!s?.key) continue;
+    const existing = sessionsByKey.get(s.key);
+    previousByKey.set(s.key, existing ? { ...existing } : null);
+  }
   const diagnostics = {
     sessionsFound: merged.length,
     sessionsEligibleForUpsert: 0,
@@ -5640,7 +5650,65 @@ async function persistTierScrapeResults(sessions, tier, { slotCountsAttempted = 
     };
   }
 
+  if (basicWrite.rowsUpserted > 0 && !basicWrite.error) {
+    const updatedSessions = merged.map((s) => sessionsByKey.get(s.key) || s);
+    diagnostics.marketObservations = await recordMarketObservationsAfterWrite({
+      previousByKey,
+      updatedSessions,
+      writeSucceeded: true,
+      observationRunId,
+      freshPriceFromCurrentRun: slotCountsAttempted && !slotCountsError,
+    });
+  }
+
   return diagnostics;
+}
+
+async function recordMarketObservationsAfterWrite({
+  previousByKey,
+  updatedSessions,
+  writeSucceeded,
+  sourceJobId = null,
+  observationRunId = null,
+  freshPriceFromCurrentRun = false,
+} = {}) {
+  if (!MARKET_OBSERVATIONS_ENABLED) {
+    return { attempted: 0, inserted: 0, suppressed: 0, skippedUnchanged: 0, skippedDisabled: true, errors: [] };
+  }
+  if (!writeSucceeded || !supabase || !updatedSessions?.length) {
+    return { attempted: 0, inserted: 0, suppressed: 0, skippedUnchanged: 0, errors: [] };
+  }
+  if (!supabaseSchemaHealth.tables?.session_market_observations?.exists) {
+    return {
+      attempted: updatedSessions.length,
+      inserted: 0,
+      suppressed: 0,
+      skippedUnchanged: 0,
+      schemaMissing: true,
+      errors: [],
+    };
+  }
+  try {
+    return await marketObservations.recordMarketObservationsForWrites(supabase, {
+      previousByKey,
+      updatedSessions,
+      writeSucceeded,
+      sourceJobId,
+      observationRunId,
+      freshPriceFromCurrentRun,
+      park: PARK,
+      enabled: MARKET_OBSERVATIONS_ENABLED,
+    });
+  } catch (err) {
+    console.error('[market-observations] batch failed:', err.message);
+    return {
+      attempted: updatedSessions.length,
+      inserted: 0,
+      suppressed: 0,
+      skippedUnchanged: 0,
+      errors: [{ error: err.message }],
+    };
+  }
 }
 
 // ── Detail enrichment (future dates: slots/capacity/price) ─────────────────────
@@ -6060,6 +6128,12 @@ async function runDetailEnrichment({ priority = null, isoDate = null, sessions: 
 
           await upsertCurrentSessionsToSupabase([entry], 0, { scrapeKind: 'detailed' });
           await saveAvailabilitySnapshotsToSupabase([entry], 0, { snapshotType: 'detailed' });
+          await recordMarketObservationsAfterWrite({
+            previousByKey: new Map([[s.key, prior]]),
+            updatedSessions: [sessionsByKey.get(s.key) || entry],
+            writeSucceeded: true,
+            freshPriceFromCurrentRun: true,
+          });
 
           await markQueueItemStatus(s.key, 'done');
           await page.waitForTimeout(ENRICHMENT_DELAY_MS);
@@ -12012,6 +12086,22 @@ async function applyGate8ThresholdWriteRows(rowsPrepared, { writeEnabled, dryRun
   const notificationResults = [];
 
   if (writeSucceeded) {
+    const updatedSessions = rowsPrepared.map((row) => sessionsByKey.get(row.key) || row);
+    try {
+      const marketObsSummary = await recordMarketObservationsAfterWrite({
+        previousByKey,
+        updatedSessions,
+        writeSucceeded: true,
+        sourceJobId,
+        observationRunId: sourceJobId,
+      });
+      if (marketObsSummary.errors?.length) {
+        console.error('[market-observations] threshold apply errors:', marketObsSummary.errors.slice(0, 3));
+      }
+    } catch (err) {
+      console.error('[market-observations] threshold apply failed:', err.message);
+    }
+
     for (const row of rowsPrepared) {
       if (!row?.key) continue;
       try {
@@ -18910,6 +19000,7 @@ async function runTierScrape(tier, { reason = 'manual' } = {}) {
     const writeDiag = await persistTierScrapeResults(merged, tier, {
       slotCountsAttempted: cfg.slotCounts,
       slotCountsError: report.slotCountsError,
+      observationRunId: scrapeRunId,
     });
     rowsUpserted = writeDiag.rowsUpserted;
     snapshotsInserted = writeDiag.snapshotsInserted;
@@ -19942,6 +20033,44 @@ app.get('/api/admin/notifications/diagnostics', async (req, res) => {
     return res.json({ ok: true, ...payload });
   } catch (err) {
     console.error('[notifications/diagnostics]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/market-observations/diagnostics', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const limit = Math.min(100, parseInt(req.query.limit || '25', 10) || 25);
+    const diagnostics = await marketObservations.fetchMarketObservationDiagnostics(supabase, { limit });
+    const leftRightPriceDiffs = await marketObservations.fetchLeftRightPairedPriceDiffs(supabase, { limit });
+    const operationalStatus = marketObservations.buildOperationalStatus({
+      schemaAvailable: supabaseSchemaHealth.tables?.session_market_observations?.exists === true,
+      sessions: allStoredSessions(),
+      enrichmentMetrics,
+    });
+    return res.json({
+      ok: true,
+      marketObservationsEnabled: MARKET_OBSERVATIONS_ENABLED,
+      operationalStatus,
+      heartbeatIntervalHours: marketObservations.HEARTBEAT_MS / 3600000,
+      dedupePolicy: {
+        changeEvents: 'state fingerprint only (no minute bucket)',
+        heartbeat: 'state fingerprint + 6-hour bucket',
+        priceFreshness: 'fresh only when current detail run exact_match succeeds',
+        inventoryFreshnessCutoffMinutes: marketObservations.resolveInventoryFreshnessMinutes(),
+        inputs: ['park', 'session_key', 'priceFingerprint', 'productFingerprint', 'availabilityFingerprint', 'timeBucketOrState'],
+        heartbeatBucketMs: marketObservations.HEARTBEAT_MS,
+        nearTermHeartbeatHours: marketObservations.NEAR_TERM_HEARTBEAT_HOURS,
+        leftRightPairToleranceMs: marketObservations.LEFT_RIGHT_PAIR_TOLERANCE_MS,
+        leftRightPairPrecedence: ['session_start', 'session_type', 'left_right_side', 'observation_run_id'],
+      },
+      ...diagnostics,
+      leftRightPriceDiffs,
+    });
+  } catch (err) {
+    console.error('[market-observations/diagnostics]', err.message);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -21818,6 +21947,7 @@ function logDeploymentSchedulerConfig() {
   });
   console.log('── Deployment scheduler config ──');
   console.log(`  admin authentication configured: ${ADMIN_TOKEN ? 'yes' : 'no'}`);
+  console.log(`  market observations enabled: ${MARKET_OBSERVATIONS_ENABLED ? 'yes' : 'no (set MARKET_OBSERVATIONS_ENABLED=true after migration)'}`);
   console.log(`  in-process maintenance scheduler: ${IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED ? 'enabled' : 'disabled'}`);
   console.log(`  inline threshold worker: ${INLINE_THRESHOLD_WORKER_ENABLED ? 'enabled' : 'disabled'}`);
   console.log(`  scheduling mode: ${scheduling.mode}`);
