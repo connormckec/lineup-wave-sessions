@@ -13,6 +13,7 @@ const { parseCalendarFixtureDom } = require('./lib/calendar-fixture-tile-parser'
 const { scrapeCalendarFixtureDom } = require('./lib/calendar-fixture-dom-scraper');
 const thresholdMaintenance = require('./lib/threshold-maintenance');
 const thresholdWorkerClaim = require('./lib/threshold-worker-claim');
+const adaptiveSchedule = require('./lib/adaptive-threshold-schedule');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
@@ -1571,7 +1572,21 @@ function isDetailReadyForQueueRetry(s) {
   return new Date(nextRetry).getTime() <= Date.now();
 }
 
-function sessionDetailQueueEligible(s, { force = false, availabilityChanged = false } = {}) {
+function priceVerificationStaleMaxAgeHours(s) {
+  const hoursUntilStart = adaptiveSchedule.hoursUntilSessionStart(s);
+  return adaptiveSchedule.resolvePriceTargetAgeMinutes({ hoursUntilStart }) / 60;
+}
+
+function sessionNeedsPriceVerification(s, { force = false, inventoryChanged = false } = {}) {
+  const watchKeys = watchedSessionKeys();
+  return adaptiveSchedule.evaluatePriceSchedule(s, {
+    watched: watchKeys.has(s.key),
+    force,
+    inventoryChanged,
+  }).due;
+}
+
+function sessionDetailQueueEligible(s, { force = false, availabilityChanged = false, inventoryChanged = false } = {}) {
   if (!s?.key) return false;
   if (force) return s.available !== false;
 
@@ -1589,20 +1604,23 @@ function sessionDetailQueueEligible(s, { force = false, availabilityChanged = fa
   if (!isDetailReadyForQueueRetry(s)) return false;
 
   if (sessionDetailVerified(s) && sessionHasDetailedData(s)) {
-    if (!sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority))) return false;
+    if (!sessionNeedsPriceVerification(s, { inventoryChanged }) && !sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority))) {
+      return false;
+    }
   }
 
   if (availabilityChanged || sessionsNeedingDetailAfterBasic.has(s.key)) return true;
   if (watchKeys.has(s.key)) {
-    return !sessionDetailVerified(s) || sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+    return !sessionDetailVerified(s) || sessionNeedsPriceVerification(s, { inventoryChanged });
   }
   if (days <= 2) {
-    return !sessionDetailVerified(s) || sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(1));
+    return !sessionDetailVerified(s) || sessionNeedsPriceVerification(s, { inventoryChanged });
   }
   if (!sessionHasDetailedData(s)) return true;
   if (isDetailRetryableFailureStatus(status)) return true;
   if (status === 'pending' || !status) return true;
-  return sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority));
+  return sessionNeedsPriceVerification(s, { inventoryChanged })
+    || sessionNeedsDetailEnrichment(s, detailStaleMaxAgeHours(priority));
 }
 
 function sessionQualifiesForDetailEnrichment(s, opts = {}) {
@@ -13647,9 +13665,12 @@ async function buildThresholdCoverageForRange(startDate, endDate) {
 
 function getThresholdStaleMaxAgeMs(isoDate) {
   const daysAhead = daysFromToday(isoDate);
-  if (daysAhead <= 7) return 6 * 60 * 60 * 1000;
-  if (daysAhead <= 21) return 24 * 60 * 60 * 1000;
-  return 72 * 60 * 60 * 1000;
+  const hoursUntilStart = daysAhead * 24;
+  const targetMinutes = adaptiveSchedule.resolveInventoryTargetAgeMinutes({
+    watched: false,
+    hoursUntilStart,
+  });
+  return targetMinutes * 60 * 1000;
 }
 
 function computeThresholdAgeHours(latestThresholdScannedAt) {
@@ -14055,8 +14076,8 @@ async function fetchMaintenanceThresholdScanJobs({ statuses, limit = 20, orderBy
   if (!supabase) return [];
   let query = supabase
     .from('threshold_scan_jobs')
-    .select('id, status, mode, dry_run, write_enabled, error, created_at, started_at, completed_at, results_json')
-    .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_APPLY]);
+    .select('id, status, mode, dry_run, write_enabled, error, created_at, started_at, completed_at, results_json, dates')
+    .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_APPLY, THRESHOLD_SCAN_JOB_MODE_DATE]);
   if (statuses?.length) query = query.in('status', statuses);
   query = query.order(orderBy, { ascending: false }).limit(limit);
   const { data, error } = await query;
@@ -14078,7 +14099,18 @@ async function buildMaintenanceStatus(startDate, endDate) {
 
   const nextRecommendedDryScan = eligibleDryScans[0] || null;
   const thresholdWorker = await buildThresholdWorkerDiagnostics();
+  const adaptiveScheduling = await buildAdaptiveScheduleDiagnostics();
   const adminWarnings = [...(thresholdWorker.adminWarnings || [])];
+  if (adaptiveScheduling.watchedDueCount > 0 || adaptiveScheduling.generalDueCount > 0) {
+    if (queuedRows.length && !runningRows.length) {
+      adminWarnings.push({
+        code: 'inventory_due_sessions_waiting',
+        watchedDueCount: adaptiveScheduling.watchedDueCount,
+        generalDueCount: adaptiveScheduling.generalDueCount,
+        message: `${adaptiveScheduling.watchedDueCount + adaptiveScheduling.generalDueCount} session(s) due for trusted inventory refresh`,
+      });
+    }
+  }
 
   return {
     ok: true,
@@ -14097,6 +14129,7 @@ async function buildMaintenanceStatus(startDate, endDate) {
     recentFailures: failedRows.map(compactMaintenanceJob),
     recentCompletedJobs: completedRows.map(compactMaintenanceJob),
     thresholdWorker,
+    adaptiveScheduling,
     adminWarnings,
   };
 }
@@ -14155,6 +14188,180 @@ async function enqueueNextMaintenanceDryScan({
   }
 
   return { ok: true, enqueuedJobs };
+}
+
+async function fetchActiveDateThresholdScanIsoDates() {
+  if (!supabase) return new Set();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, dates, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE)
+    .in('status', ['queued', 'running']);
+  if (error) throw new Error(error.message);
+  const isoDates = new Set();
+  for (const job of data || []) {
+    for (const isoDate of job.dates || []) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(isoDate))) isoDates.add(String(isoDate));
+    }
+  }
+  return isoDates;
+}
+
+async function buildAdaptiveScheduleDiagnostics() {
+  await ensureSessionsForStatus();
+  const now = new Date();
+  const todayIso = getParkTodayIso();
+  const watchKeys = watchedSessionKeys();
+  const sessions = allStoredSessions().filter((s) => !adaptiveSchedule.isSessionEnded(s, now));
+  const evaluations = sessions.map((session) => {
+    const watched = watchKeys.has(session.key);
+    return {
+      sessionKey: session.key,
+      isoDate: session.isoDate || session.dateKey || null,
+      watched,
+      inventory: adaptiveSchedule.evaluateInventorySchedule(session, { watched, now }),
+      price: adaptiveSchedule.evaluatePriceSchedule(session, { watched, now }),
+    };
+  });
+  const dueScan = adaptiveSchedule.collectDueDateScanCandidates(sessions, {
+    watchKeys,
+    now,
+    todayIso,
+    daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+  });
+  const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
+  return {
+    generatedAt: now.toISOString(),
+    ...adaptiveSchedule.buildScheduleDiagnosticsSummary(evaluations),
+    watchedDueCount: dueScan.watchedDueCount,
+    generalDueCount: dueScan.generalDueCount,
+    dueDateCandidates: dueScan.candidates.slice(0, 10),
+    topDueDateCandidate: dueScan.topCandidate,
+    activeDateScanIsoDates: [...activeDateScans].sort(),
+    cadencePolicy: {
+      watchedInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_WATCHED,
+      generalInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_GENERAL,
+      priceVerificationMinutes: adaptiveSchedule.PRICE_TARGET_MINUTES,
+      analyticsHeartbeatMinutes: adaptiveSchedule.HEARTBEAT_TARGET_MINUTES,
+      nearTermDateScanMaxHoursGeneral: adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL,
+      nearTermDateScanMaxHoursWatched: adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_WATCHED,
+    },
+    sample: evaluations
+      .filter((row) => row.inventory?.due || row.price?.due)
+      .slice(0, 25)
+      .map((row) => ({
+        sessionKey: row.sessionKey,
+        isoDate: row.isoDate,
+        watched: row.watched,
+        inventory: row.inventory,
+        price: row.price,
+      })),
+  };
+}
+
+async function enqueueNearTermDateThresholdScan(isoDate, {
+  reason = 'near_term_due',
+  watchedDueCount = 0,
+  generalDueCount = 0,
+} = {}) {
+  const minT = 1;
+  const maxT = THRESHOLD_JOB_MAX_THRESHOLD;
+  const enqueued = await enqueueThresholdScanJob({
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    dates: [isoDate],
+    minThreshold: minT,
+    maxThreshold: maxT,
+    dryRun: true,
+    writeEnabled: false,
+  });
+  return {
+    jobId: enqueued.id,
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    isoDate,
+    dates: [isoDate],
+    reason,
+    watchedDueCount,
+    generalDueCount,
+  };
+}
+
+async function runNearTermMaintenanceTick({
+  startDate = null,
+  endDate = null,
+} = {}) {
+  if (!supabase) {
+    return { ok: false, error: 'supabase_not_configured' };
+  }
+
+  const scheduleDiagnostics = await buildAdaptiveScheduleDiagnostics();
+  const range = resolveMaintenanceDateRange({ startDate, endDate });
+
+  if (await hasQueuedOrRunningThresholdScanJob()) {
+    return {
+      ok: true,
+      action: 'skipped',
+      reason: 'job_already_running_or_queued',
+      pass: 'near_term',
+      scheduleDiagnostics,
+      ...range,
+    };
+  }
+
+  const readyEval = await evaluateCompletedDryScansReadyToApply(range.startDate, range.endDate);
+  if (readyEval.ready.length > 0) {
+    const applyResult = await enqueueReadyMaintenancePrepared({
+      startDate: range.startDate,
+      endDate: range.endDate,
+      maxJobs: 1,
+      write: true,
+      dryRun: false,
+    });
+    if (applyResult.enqueuedJobs?.length) {
+      const enqueued = applyResult.enqueuedJobs[0];
+      await kickThresholdScanJobWorkerIfIdle();
+      return {
+        ok: true,
+        action: 'enqueued_apply_prepared',
+        pass: 'near_term',
+        job_id: enqueued.jobId,
+        sourceJobId: enqueued.sourceJobId,
+        scheduleDiagnostics,
+        ...range,
+      };
+    }
+  }
+
+  const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
+  const top = scheduleDiagnostics.topDueDateCandidate;
+  if (!top || activeDateScans.has(top.isoDate)) {
+    return {
+      ok: true,
+      action: 'none_needed',
+      pass: 'near_term',
+      reason: top ? 'due_date_already_queued' : 'no_due_near_term_dates',
+      scheduleDiagnostics,
+      ...range,
+    };
+  }
+
+  const enqueued = await enqueueNearTermDateThresholdScan(top.isoDate, {
+    reason: 'adaptive_near_term_due',
+    watchedDueCount: top.watchedDueCount,
+    generalDueCount: top.generalDueCount,
+  });
+  await kickThresholdScanJobWorkerIfIdle();
+  return {
+    ok: true,
+    action: 'enqueued_date_scan',
+    pass: 'near_term',
+    ...enqueued,
+    scheduleDiagnostics,
+    ...range,
+  };
+}
+
+async function runBroadMaintenanceTick(options = {}) {
+  return runMaintenanceTick({ ...options, pass: 'broad' });
 }
 
 async function hasQueuedOrRunningThresholdScanJob() {
@@ -20098,6 +20305,34 @@ app.post('/api/admin/maintenance/apply-ready-prepared', async (req, res) => {
   }
 });
 
+app.post('/api/admin/maintenance/near-term-tick', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const { startDate, endDate } = resolveMaintenanceDateRange(body);
+    const result = await runNearTermMaintenanceTick({ startDate, endDate });
+    if (!result.ok && result.error) {
+      return res.status(400).json(result);
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('maintenance-near-term-tick error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+app.get('/api/admin/adaptive-schedule/diagnostics', async (_req, res) => {
+  try {
+    const diagnostics = await buildAdaptiveScheduleDiagnostics();
+    return res.json({ ok: true, ...diagnostics });
+  } catch (err) {
+    console.error('adaptive-schedule diagnostics error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
 app.post('/api/admin/maintenance/tick', async (req, res) => {
   try {
     const body = req.body || {};
@@ -20203,6 +20438,10 @@ app.get('/api/admin/market-observations/diagnostics', async (req, res) => {
         heartbeat: 'state fingerprint + 6-hour bucket',
         priceFreshness: 'fresh only when current detail run exact_match succeeds',
         inventoryFreshnessCutoffMinutes: marketObservations.resolveInventoryFreshnessMinutes(),
+        analyticsHeartbeatMinutes: adaptiveSchedule.HEARTBEAT_TARGET_MINUTES,
+        priceVerificationMinutes: adaptiveSchedule.PRICE_TARGET_MINUTES,
+        watchedInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_WATCHED,
+        generalInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_GENERAL,
         inputs: ['park', 'session_key', 'priceFingerprint', 'productFingerprint', 'availabilityFingerprint', 'timeBucketOrState'],
         heartbeatBucketMs: marketObservations.HEARTBEAT_MS,
         nearTermHeartbeatHours: marketObservations.NEAR_TERM_HEARTBEAT_HOURS,
@@ -22049,15 +22288,24 @@ function startBackgroundCollector() {
   }
 
   if (IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED) {
+    collectorState.cronTasks.nearTermMaintenanceTick = scheduleCronSafe(
+      '*/5 * * * *',
+      () => {
+        runNearTermMaintenanceTick()
+          .catch((err) => console.error('[near-term maintenance tick]', err.message));
+      },
+      'Near-term maintenance tick',
+    );
     collectorState.cronTasks.maintenanceTick = scheduleCronSafe(
       '0 * * * *',
       () => {
         runMaintenanceTick({ includeStale: true })
-          .catch((err) => console.error('[maintenance tick]', err.message));
+          .catch((err) => console.error('[broad maintenance tick]', err.message));
       },
-      'Maintenance tick',
+      'Broad maintenance tick',
     );
-    console.log('  Scheduling in-process maintenance tick hourly');
+    console.log('  Scheduling near-term maintenance tick every 5 minutes');
+    console.log('  Scheduling broad maintenance tick hourly');
   }
 
   scrapeScheduleEnabled = !!(collectorState.cronTasks.tier1 && collectorState.cronTasks.tier2 && collectorState.cronTasks.tier3);
