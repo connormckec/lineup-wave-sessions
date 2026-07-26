@@ -12,6 +12,7 @@ const pkg = require('./package.json');
 const { parseCalendarFixtureDom } = require('./lib/calendar-fixture-tile-parser');
 const { scrapeCalendarFixtureDom } = require('./lib/calendar-fixture-dom-scraper');
 const thresholdMaintenance = require('./lib/threshold-maintenance');
+const thresholdWorkerClaim = require('./lib/threshold-worker-claim');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
@@ -3477,36 +3478,15 @@ async function releaseThresholdJobScrapeLockIfStale() {
 }
 
 function thresholdScanJobNeedsScrapeLock(job) {
-  const mode = job?.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
-  return mode !== THRESHOLD_SCAN_JOB_MODE_APPLY;
+  return thresholdWorkerClaim.thresholdScanJobNeedsScrapeLock(job);
 }
 
 function getThresholdScanJobPriorityBucket(job) {
-  const mode = job?.mode || THRESHOLD_SCAN_JOB_MODE_DATE;
-  if (mode === THRESHOLD_SCAN_JOB_MODE_APPLY) return 0;
-
-  const dates = job?.results_json?.targetDates || job?.dates || [];
-  const weekStart = job?.results_json?.weekStart
-    || (dates[0] ? getMondayWeekStartIso(String(dates[0])) : null);
-  const anchor = dates.length ? [...dates].map(String).sort()[0] : weekStart;
-  const daysAhead = anchor ? daysFromToday(anchor) : 999;
-  return daysAhead <= 21 ? 1 : 2;
+  return thresholdWorkerClaim.getThresholdScanJobPriorityBucket(job, getParkTodayIso());
 }
 
 function compareThresholdScanJobPriority(a, b) {
-  const bucketA = getThresholdScanJobPriorityBucket(a);
-  const bucketB = getThresholdScanJobPriorityBucket(b);
-  if (bucketA !== bucketB) return bucketA - bucketB;
-
-  const datesA = a?.results_json?.targetDates || a?.dates || [];
-  const datesB = b?.results_json?.targetDates || b?.dates || [];
-  const anchorA = datesA.length ? [...datesA].map(String).sort()[0] : (a?.results_json?.weekStart || '');
-  const anchorB = datesB.length ? [...datesB].map(String).sort()[0] : (b?.results_json?.weekStart || '');
-  const daysA = anchorA ? daysFromToday(anchorA) : 999;
-  const daysB = anchorB ? daysFromToday(anchorB) : 999;
-  if (daysA !== daysB) return daysA - daysB;
-
-  return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+  return thresholdWorkerClaim.compareThresholdScanJobPriority(a, b, getParkTodayIso());
 }
 
 function recordPageCrash(stage, err, { weekKey = null, failureReason = 'failed_page_crash', tier = null } = {}) {
@@ -12269,13 +12249,14 @@ function validatePreparedSourceJob(sourceJob) {
   }
   const preparedUpdatesByDate = resultsJson.preparedUpdatesByDate
     || groupPreparedUpdatesByDate(preparedUpdates);
+  const preparedUpdatesCount = preparedUpdates.length || countPreparedUpdates(preparedUpdatesByDate);
   return {
     ok: true,
     sourceJob,
     resultsJson,
     preparedUpdates,
     preparedUpdatesByDate,
-    preparedUpdatesCount: preparedUpdates.length,
+    preparedUpdatesCount,
     scanAt,
   };
 }
@@ -14096,6 +14077,8 @@ async function buildMaintenanceStatus(startDate, endDate) {
   ]);
 
   const nextRecommendedDryScan = eligibleDryScans[0] || null;
+  const thresholdWorker = await buildThresholdWorkerDiagnostics();
+  const adminWarnings = [...(thresholdWorker.adminWarnings || [])];
 
   return {
     ok: true,
@@ -14113,6 +14096,8 @@ async function buildMaintenanceStatus(startDate, endDate) {
     runningJobs: runningRows.map(compactMaintenanceJob),
     recentFailures: failedRows.map(compactMaintenanceJob),
     recentCompletedJobs: completedRows.map(compactMaintenanceJob),
+    thresholdWorker,
+    adminWarnings,
   };
 }
 
@@ -14610,9 +14595,78 @@ async function processThresholdScanJobInBackground(job, { lockAcquired = false }
   }
 }
 
+async function buildThresholdWorkerDiagnostics() {
+  const workerEndpoint = '/api/admin/run-threshold-scan-job';
+  const base = {
+    workerEndpoint,
+    thresholdJobsEnabledLegacy: THRESHOLD_JOBS_ENABLED,
+    inlineThresholdWorkerEnabled: INLINE_THRESHOLD_WORKER_ENABLED,
+    scrapeLockHeld: scrapeInProgress === true,
+    scrapeLockAgeMs: getScrapeLockAgeMs(),
+    blockingScrapeTier: currentScrapeTier,
+    blockingScrapeStartedAt: currentScrapeStartedAt,
+    queuedTotal: 0,
+    queuedEligibleCount: 0,
+    skippedCount: 0,
+    claimedCount: 0,
+    skipReasonsByCode: {},
+    runningJobCount: 0,
+    primaryBlocker: supabase ? 'no_queued_jobs' : 'supabase_not_configured',
+    adminWarnings: [],
+  };
+  if (!supabase) {
+    base.adminWarnings.push({
+      code: 'supabase_not_configured',
+      message: 'Threshold worker cannot claim jobs without Supabase',
+    });
+    return base;
+  }
+
+  const [{ count: runningCount, error: runningError }, { data: queuedJobs, error: queuedError }] = await Promise.all([
+    supabase
+      .from('threshold_scan_jobs')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'running'),
+    supabase
+      .from('threshold_scan_jobs')
+      .select('id, status, mode, dry_run, write_enabled, created_at, results_json')
+      .eq('status', 'queued')
+      .order('created_at', { ascending: true })
+      .limit(50),
+  ]);
+  if (runningError) {
+    base.primaryBlocker = runningError.message;
+    base.adminWarnings.push({ code: 'worker_query_failed', message: runningError.message });
+    return base;
+  }
+  if (queuedError) {
+    base.primaryBlocker = queuedError.message;
+    base.adminWarnings.push({ code: 'worker_query_failed', message: queuedError.message });
+    return base;
+  }
+
+  const queueAnalysis = thresholdWorkerClaim.analyzeThresholdWorkerQueue({
+    queuedJobs: queuedJobs || [],
+    runningCount: runningCount || 0,
+    scrapeLockHeld: scrapeInProgress === true,
+    scrapeLockAgeMs: getScrapeLockAgeMs(),
+    todayIso: getParkTodayIso(),
+  });
+
+  return {
+    ...base,
+    ...queueAnalysis,
+    claimedCount: 0,
+  };
+}
+
 async function claimNextThresholdScanJob() {
   if (!supabase) {
-    return { claimed: null, reason: 'supabase_not_configured', lockAcquired: false };
+    return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+      claimed: null,
+      reason: 'supabase_not_configured',
+      lockAcquired: false,
+    });
   }
 
   await releaseThresholdJobScrapeLockIfStale();
@@ -14622,10 +14676,11 @@ async function claimNextThresholdScanJob() {
     .select('*', { count: 'exact', head: true })
     .eq('status', 'running');
   if (runningError) {
-    return { claimed: null, reason: runningError.message, lockAcquired: false };
-  }
-  if ((runningCount || 0) > 0) {
-    return { claimed: null, reason: 'job_already_running', lockAcquired: false };
+    return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+      claimed: null,
+      reason: runningError.message,
+      lockAcquired: false,
+    });
   }
 
   const { data: queuedJobs, error: nextError } = await supabase
@@ -14635,19 +14690,50 @@ async function claimNextThresholdScanJob() {
     .order('created_at', { ascending: true })
     .limit(50);
   if (nextError) {
-    return { claimed: null, reason: nextError.message, lockAcquired: false };
+    return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+      claimed: null,
+      reason: nextError.message,
+      lockAcquired: false,
+    });
   }
+
+  const queueAnalysis = thresholdWorkerClaim.analyzeThresholdWorkerQueue({
+    queuedJobs: queuedJobs || [],
+    runningCount: runningCount || 0,
+    scrapeLockHeld: scrapeInProgress === true,
+    scrapeLockAgeMs: getScrapeLockAgeMs(),
+    todayIso: getParkTodayIso(),
+  });
+
   if (!queuedJobs?.length) {
-    return { claimed: null, reason: 'no_queued_jobs', lockAcquired: false };
+    return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+      claimed: null,
+      reason: 'no_queued_jobs',
+      lockAcquired: false,
+      queueAnalysis,
+      claimedCount: 0,
+    });
+  }
+
+  if ((runningCount || 0) > 0) {
+    return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+      claimed: null,
+      reason: 'job_already_running',
+      lockAcquired: false,
+      queueAnalysis,
+      claimedCount: 0,
+    });
   }
 
   const sortedJobs = [...queuedJobs].sort(compareThresholdScanJobPriority);
+  const skippedJobs = [];
   for (const nextJob of sortedJobs) {
     const needsScrapeLock = thresholdScanJobNeedsScrapeLock(nextJob);
     let lockAcquired = false;
 
     if (needsScrapeLock) {
       if (!tryAcquireScrapeLock('threshold scan job worker', 0)) {
+        skippedJobs.push({ jobId: nextJob.id, skipReason: 'scrape_lock_unavailable' });
         continue;
       }
       lockAcquired = true;
@@ -14666,20 +14752,64 @@ async function claimNextThresholdScanJob() {
         .maybeSingle();
       if (claimError) {
         if (lockAcquired) releaseScrapeLock();
-        return { claimed: null, reason: claimError.message, lockAcquired: false };
+        return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+          claimed: null,
+          reason: claimError.message,
+          lockAcquired: false,
+          queueAnalysis: {
+            ...queueAnalysis,
+            skipReasonsByCode: {
+              ...queueAnalysis.skipReasonsByCode,
+              claim_update_failed: 1,
+            },
+          },
+          claimedCount: 0,
+        });
       }
       if (!claimed) {
         if (lockAcquired) releaseScrapeLock();
+        skippedJobs.push({ jobId: nextJob.id, skipReason: 'claim_race_lost' });
         continue;
       }
-      return { claimed, reason: null, lockAcquired };
+      return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+        claimed,
+        reason: null,
+        lockAcquired,
+        queueAnalysis: {
+          ...queueAnalysis,
+          claimedJobId: claimed.id,
+          claimedJobMode: claimed.mode || null,
+          claimedCount: 1,
+          adminWarnings: [],
+        },
+        claimedCount: 1,
+      });
     } catch (err) {
       if (lockAcquired) releaseScrapeLock();
       throw err;
     }
   }
 
-  return { claimed: null, reason: 'scrape_in_progress', lockAcquired: false };
+  const skipReasonsByCode = { ...queueAnalysis.skipReasonsByCode };
+  for (const row of skippedJobs) {
+    skipReasonsByCode[row.skipReason] = (skipReasonsByCode[row.skipReason] || 0) + 1;
+  }
+  if (!skipReasonsByCode.scrape_lock_unavailable && queueAnalysis.queuedEligibleCount > 0) {
+    skipReasonsByCode.scrape_lock_unavailable = skippedJobs.filter((r) => r.skipReason === 'scrape_lock_unavailable').length;
+  }
+
+  return thresholdWorkerClaim.buildThresholdWorkerClaimResult({
+    claimed: null,
+    reason: 'scrape_in_progress',
+    lockAcquired: false,
+    queueAnalysis: {
+      ...queueAnalysis,
+      skippedCount: skippedJobs.length,
+      skipReasonsByCode,
+      primaryBlocker: 'scrape_in_progress',
+    },
+    claimedCount: 0,
+  });
 }
 
 async function persistThresholdScanJobProgress(jobId, resultsJson) {
@@ -14958,12 +15088,23 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     workerError = err.message || String(err);
   }
 
-  const completion = thresholdMaintenance.buildApplyPreparedFinalResults({
-    dateResults,
-    workerError,
-    sourcePreparedUpdatesCount,
-    sourceWeekStart,
-  });
+  let completion;
+  try {
+    completion = thresholdMaintenance.buildApplyPreparedFinalResults({
+      dateResults,
+      workerError,
+      sourcePreparedUpdatesCount,
+      sourceWeekStart,
+    });
+  } catch (completionErr) {
+    workerError = workerError || completionErr.message || String(completionErr);
+    completion = thresholdMaintenance.buildApplyPreparedFinalResults({
+      dateResults,
+      workerError,
+      sourcePreparedUpdatesCount,
+      sourceWeekStart,
+    });
+  }
   const finalStatus = completion.status;
   const finalStage = completion.stage;
   const finalError = completion.error;
@@ -14991,6 +15132,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     rowsPrepared: completion.rowsPrepared,
     rowsMatched: completion.rowsMatched,
     rowsWritten: completion.rowsWritten,
+    rowsWrittenSuccessfully: completion.rowsWrittenSuccessfully,
     rowsUnresolved: completion.rowsUnresolved,
     unresolvedByDate: completion.unresolvedByDate,
   });
@@ -15011,6 +15153,7 @@ async function executeThresholdWeekApplyPreparedJob(job) {
     weekStart: completion.weekStart,
     dateResults,
     preparedUpdatesCount: completion.preparedUpdatesCount,
+    rowsWrittenSuccessfully: completion.rowsWrittenSuccessfully,
     partialApply: completion.partialApply,
     rowsPrepared: completion.rowsPrepared,
     rowsMatched: completion.rowsMatched,
@@ -20201,11 +20344,16 @@ app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
     }
 
     const claim = await claimThresholdScanJobWorker();
+    const diagnostics = claim.diagnostics || null;
     if (!claim.claimed) {
+      const eligibleQueuedRemain = (diagnostics?.queuedModeEligibleCount || 0) > 0;
       return res.json({
         ok: false,
         skipped: true,
         reason: claim.reason,
+        idle: !eligibleQueuedRemain,
+        warning: eligibleQueuedRemain ? 'eligible_queued_jobs_unclaimed' : null,
+        diagnostics,
       });
     }
 
@@ -20220,7 +20368,9 @@ app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
     return res.json({
       ok: true,
       job_id: job.id,
+      mode: job.mode || null,
       status: 'running',
+      diagnostics,
     });
   } catch (err) {
     console.error('run-threshold-scan-job error:', err.message);
@@ -20229,6 +20379,19 @@ app.post('/api/admin/run-threshold-scan-job', async (req, res) => {
       error: err.message || String(err),
       crashed: isPlaywrightCrashError(err),
     });
+  }
+});
+
+app.get('/api/admin/threshold-worker/diagnostics', async (_req, res) => {
+  try {
+    const diagnostics = await buildThresholdWorkerDiagnostics();
+    return res.json({
+      ok: true,
+      ...diagnostics,
+    });
+  } catch (err) {
+    console.error('threshold-worker diagnostics error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
