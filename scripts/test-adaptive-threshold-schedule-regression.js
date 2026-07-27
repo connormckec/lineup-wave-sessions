@@ -65,7 +65,7 @@ async function runTests() {
     ts: Math.floor(new Date('2026-07-27T12:00:00.000Z').getTime() / 1000),
     threshold_scanned_at: null,
   });
-  assert.strictEqual(adaptiveSchedule.isSessionEligibleForInventorySchedule(packed, { watched: true }), true);
+  assert.strictEqual(adaptiveSchedule.isSessionEligibleForInventorySchedule(packed, { watched: true, now }), true);
   const evalResult = adaptiveSchedule.evaluateInventorySchedule(packed, { watched: true, now });
   assert.strictEqual(evalResult.eligible, true);
   assert.strictEqual(evalResult.due, true);

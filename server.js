@@ -14,6 +14,8 @@ const { scrapeCalendarFixtureDom } = require('./lib/calendar-fixture-dom-scraper
 const thresholdMaintenance = require('./lib/threshold-maintenance');
 const thresholdWorkerClaim = require('./lib/threshold-worker-claim');
 const adaptiveSchedule = require('./lib/adaptive-threshold-schedule');
+const thresholdDatePipeline = require('./lib/threshold-date-pipeline');
+const thresholdNearTermScheduler = require('./lib/threshold-near-term-scheduler');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
@@ -12355,6 +12357,8 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
     thresholdScanMaxReached: fullScanRun.thresholdScanMaxReached,
     thresholdStopReason: fullScanRun.thresholdStopReason,
     rowsPrepared: rowsPrepared.length,
+    preparedRows: rowsPrepared,
+    preparedUpdatesByDate: buildPreparedUpdatesByDateFromRows(rowsPrepared),
     rowsWritten,
     writeMode,
     writesPerformed,
@@ -13734,13 +13738,7 @@ function preparedIsoDatesOverlapRange(preparedIsoDates, startDate, endDate) {
 }
 
 function resolvePreparedUpdatesCountFromResults(resultsJson = {}) {
-  const explicit = resultsJson.preparedUpdatesCount;
-  if (explicit != null && explicit > 0) return explicit;
-  const fromByDate = resultsJson.preparedUpdatesByDate
-    ? countPreparedUpdates(resultsJson.preparedUpdatesByDate)
-    : 0;
-  if (fromByDate > 0) return fromByDate;
-  return flattenPreparedUpdatesFromResults(resultsJson).length;
+  return thresholdDatePipeline.resolvePreparedUpdatesCountFromResults(resultsJson);
 }
 
 function resolvePreparedScanCompletedAtFromJob(job) {
@@ -13765,7 +13763,9 @@ function compactReadyToApplyCandidate(job) {
   const preparedScanCompletedAt = resolvePreparedScanCompletedAtFromJob(job);
   return {
     sourceJobId: job.id,
+    sourceMode: job.mode ?? null,
     weekStart: resultsJson.weekStart ?? null,
+    targetIsoDate: resultsJson.targetIsoDate ?? job.dates?.[0] ?? null,
     preparedUpdatesCount: resolvePreparedUpdatesCountFromResults(resultsJson),
     preparedScanCompletedAt,
     preparedIsoDates,
@@ -13787,7 +13787,7 @@ async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate =
     supabase
       .from('threshold_scan_jobs')
       .select('id, status, mode, dry_run, error, completed_at, dates, results_json')
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_WEEK)
+      .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_DATE])
       .eq('status', 'completed')
       .order('completed_at', { ascending: false })
       .limit(200),
@@ -13821,9 +13821,22 @@ async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate =
       continue;
     }
 
+    if (!thresholdDatePipeline.isDateScanOperationallyComplete(resultsJson)
+      && job.mode === THRESHOLD_SCAN_JOB_MODE_DATE) {
+      excluded.push({ ...candidate, reason: 'date_scan_contract_incomplete' });
+      continue;
+    }
+
     const preparedUpdatesCount = resolvePreparedUpdatesCountFromResults(resultsJson);
-    if (!preparedUpdatesCount) {
-      excluded.push({ ...candidate, reason: 'prepared_updates_empty' });
+    if (preparedUpdatesCount == null) {
+      excluded.push({ ...candidate, reason: 'prepared_updates_count_null' });
+      continue;
+    }
+    if (preparedUpdatesCount <= 0) {
+      excluded.push({
+        ...candidate,
+        reason: resultsJson.preparedZeroReason || 'prepared_updates_empty',
+      });
       continue;
     }
 
@@ -13862,7 +13875,9 @@ async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate =
 
     ready.push({
       sourceJobId: job.id,
+      sourceMode: job.mode,
       weekStart: resultsJson.weekStart ?? null,
+      targetIsoDate: resultsJson.targetIsoDate ?? job.dates?.[0] ?? null,
       preparedUpdatesCount,
       preparedScanCompletedAt,
       preparedIsoDates,
@@ -13876,7 +13891,11 @@ async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate =
     });
   }
 
-  ready.sort((a, b) => (a.weekStart || '').localeCompare(b.weekStart || ''));
+  ready.sort((a, b) => {
+    const aDate = a.targetIsoDate || a.weekStart || '';
+    const bDate = b.targetIsoDate || b.weekStart || '';
+    return aDate.localeCompare(bDate);
+  });
 
   return { ready, candidatesRaw, excluded };
 }
@@ -14102,7 +14121,14 @@ async function buildMaintenanceStatus(startDate, endDate) {
   const adaptiveScheduling = await buildAdaptiveScheduleDiagnostics();
   const adminWarnings = [...(thresholdWorker.adminWarnings || [])];
   if (adaptiveScheduling.watchedDueCount > 0 || adaptiveScheduling.generalDueCount > 0) {
-    if (queuedRows.length && !runningRows.length) {
+    if ((queuedRows.length + runningRows.length) === 0 && adaptiveScheduling.backlog?.unhealthy) {
+      adminWarnings.push({
+        code: 'due_backlog_idle_pipeline',
+        watchedDueCount: adaptiveScheduling.watchedDueCount,
+        generalDueCount: adaptiveScheduling.generalDueCount,
+        message: `${adaptiveScheduling.watchedDueCount + adaptiveScheduling.generalDueCount} due session(s) with no queued/running date scan or apply work`,
+      });
+    } else if (queuedRows.length && !runningRows.length) {
       adminWarnings.push({
         code: 'inventory_due_sessions_waiting',
         watchedDueCount: adaptiveScheduling.watchedDueCount,
@@ -14110,6 +14136,21 @@ async function buildMaintenanceStatus(startDate, endDate) {
         message: `${adaptiveScheduling.watchedDueCount + adaptiveScheduling.generalDueCount} session(s) due for trusted inventory refresh`,
       });
     }
+  }
+  if (adaptiveScheduling.nearTermScheduler?.dualSchedulerRisk) {
+    adminWarnings.push({
+      code: 'dual_near_term_scheduler_risk',
+      message: 'IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED may duplicate external near-term cron',
+    });
+  }
+  if (adaptiveScheduling.datePipeline?.latestDateScanJobId
+    && adaptiveScheduling.datePipeline?.operationallyComplete === false
+    && adaptiveScheduling.datePipeline?.status === 'completed') {
+    adminWarnings.push({
+      code: 'date_scan_false_complete',
+      jobId: adaptiveScheduling.datePipeline.latestDateScanJobId,
+      message: 'Latest date scan marked completed without a valid prepared-results contract',
+    });
   }
 
   return {
@@ -14207,6 +14248,82 @@ async function fetchActiveDateThresholdScanIsoDates() {
   return isoDates;
 }
 
+async function fetchLatestDateThresholdScanJob() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, dry_run, error, created_at, started_at, completed_at, dates, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+async function fetchApplyJobForSourceJobId(sourceJobId) {
+  if (!supabase || !sourceJobId) return null;
+  const { data: rows, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, status, mode, error, completed_at, results_json, created_at')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) throw new Error(error.message);
+  return (rows || []).find((job) => job.results_json?.sourceJobId === sourceJobId) || null;
+}
+
+async function fetchDatePipelineQueueCounts() {
+  if (!supabase) {
+    return {
+      queuedDateScans: 0,
+      runningDateScans: 0,
+      queuedDateApplies: 0,
+      runningDateApplies: 0,
+      readyDateApplies: 0,
+    };
+  }
+  const [queuedDate, runningDate, queuedApply, runningApply, readyEval] = await Promise.all([
+    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'queued'),
+    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'running'),
+    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'queued'),
+    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'running'),
+    evaluateCompletedDryScansReadyToApply(),
+  ]);
+  return {
+    queuedDateScans: queuedDate.count || 0,
+    runningDateScans: runningDate.count || 0,
+    queuedDateApplies: queuedApply.count || 0,
+    runningDateApplies: runningApply.count || 0,
+    readyDateApplies: (readyEval.ready || []).filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE).length,
+  };
+}
+
+function computeOldestInventoryAges(evaluations = []) {
+  let oldestTrusted = null;
+  let oldestWatched = null;
+  let oldestGeneralNearTerm = null;
+  for (const row of evaluations) {
+    const age = row.inventory?.actualFreshnessMinutes;
+    if (age == null) continue;
+    oldestTrusted = oldestTrusted == null ? age : Math.max(oldestTrusted, age);
+    if (row.watched) {
+      oldestWatched = oldestWatched == null ? age : Math.max(oldestWatched, age);
+    } else if ((row.inventory?.hoursUntilStart ?? 999) <= 72) {
+      oldestGeneralNearTerm = oldestGeneralNearTerm == null ? age : Math.max(oldestGeneralNearTerm, age);
+    }
+  }
+  return {
+    oldestTrustedInventoryAgeMinutes: oldestTrusted,
+    oldestWatchedInventoryAgeMinutes: oldestWatched,
+    oldestGeneralNearTermInventoryAgeMinutes: oldestGeneralNearTerm,
+  };
+}
+
 async function buildAdaptiveScheduleDiagnostics() {
   await ensureSessionsForStatus();
   const now = new Date();
@@ -14230,6 +14347,34 @@ async function buildAdaptiveScheduleDiagnostics() {
     daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
   });
   const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
+  const [
+    latestDateJob,
+    queueCounts,
+    readyEval,
+  ] = await Promise.all([
+    fetchLatestDateThresholdScanJob(),
+    fetchDatePipelineQueueCounts(),
+    evaluateCompletedDryScansReadyToApply(),
+  ]);
+  const latestApplyJob = latestDateJob
+    ? await fetchApplyJobForSourceJobId(latestDateJob.id)
+    : null;
+  const readyForLatestDate = (readyEval.ready || []).some((row) => row.sourceJobId === latestDateJob?.id);
+  const inventoryAges = computeOldestInventoryAges(evaluations);
+  const nearTermScheduler = thresholdNearTermScheduler.buildNearTermSchedulerDiagnostics({
+    inProcessMaintenanceSchedulerEnabled: IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED,
+    inlineThresholdWorkerEnabled: INLINE_THRESHOLD_WORKER_ENABLED,
+  });
+  const datePipeline = thresholdDatePipeline.buildDatePipelineDiagnostics({
+    latestDateJob,
+    applyJob: latestApplyJob,
+    readyToApply: readyForLatestDate,
+  });
+  const backlog = thresholdDatePipeline.buildBacklogHealthDiagnostics({
+    dueScan,
+    ...queueCounts,
+    ...inventoryAges,
+  });
   return {
     generatedAt: now.toISOString(),
     ...adaptiveSchedule.buildScheduleDiagnosticsSummary(evaluations),
@@ -14238,6 +14383,10 @@ async function buildAdaptiveScheduleDiagnostics() {
     dueDateCandidates: dueScan.candidates.slice(0, 10),
     topDueDateCandidate: dueScan.topCandidate,
     activeDateScanIsoDates: [...activeDateScans].sort(),
+    nearTermScheduler,
+    datePipeline,
+    backlog,
+    readyToApplyDateScans: (readyEval.ready || []).filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE).slice(0, 5),
     cadencePolicy: {
       watchedInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_WATCHED,
       generalInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_GENERAL,
@@ -14288,16 +14437,19 @@ async function enqueueNearTermDateThresholdScan(isoDate, {
 async function runNearTermMaintenanceTick({
   startDate = null,
   endDate = null,
+  source = 'unknown',
 } = {}) {
   if (!supabase) {
-    return { ok: false, error: 'supabase_not_configured' };
+    const result = { ok: false, error: 'supabase_not_configured' };
+    thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+    return result;
   }
 
   const scheduleDiagnostics = await buildAdaptiveScheduleDiagnostics();
   const range = resolveMaintenanceDateRange({ startDate, endDate });
 
   if (await hasQueuedOrRunningThresholdScanJob()) {
-    return {
+    const result = {
       ok: true,
       action: 'skipped',
       reason: 'job_already_running_or_queued',
@@ -14305,6 +14457,8 @@ async function runNearTermMaintenanceTick({
       scheduleDiagnostics,
       ...range,
     };
+    thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+    return result;
   }
 
   const readyEval = await evaluateCompletedDryScansReadyToApply(range.startDate, range.endDate);
@@ -14319,29 +14473,38 @@ async function runNearTermMaintenanceTick({
     if (applyResult.enqueuedJobs?.length) {
       const enqueued = applyResult.enqueuedJobs[0];
       await kickThresholdScanJobWorkerIfIdle();
-      return {
+      const result = {
         ok: true,
         action: 'enqueued_apply_prepared',
         pass: 'near_term',
         job_id: enqueued.jobId,
         sourceJobId: enqueued.sourceJobId,
+        selectedIsoDate: enqueued.targetIsoDate || readyEval.ready[0]?.targetIsoDate || null,
         scheduleDiagnostics,
         ...range,
       };
+      thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+      return result;
     }
   }
 
   const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
   const top = scheduleDiagnostics.topDueDateCandidate;
   if (!top || activeDateScans.has(top.isoDate)) {
-    return {
+    const dueBacklog = (scheduleDiagnostics.watchedDueCount || 0) + (scheduleDiagnostics.generalDueCount || 0);
+    const result = {
       ok: true,
       action: 'none_needed',
       pass: 'near_term',
-      reason: top ? 'due_date_already_queued' : 'no_due_near_term_dates',
+      reason: top
+        ? 'due_date_already_queued'
+        : (dueBacklog > 0 ? 'due_backlog_no_near_term_candidate' : 'no_due_near_term_dates'),
+      unhealthy: dueBacklog > 0 && !top,
       scheduleDiagnostics,
       ...range,
     };
+    thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+    return result;
   }
 
   const enqueued = await enqueueNearTermDateThresholdScan(top.isoDate, {
@@ -14350,14 +14513,17 @@ async function runNearTermMaintenanceTick({
     generalDueCount: top.generalDueCount,
   });
   await kickThresholdScanJobWorkerIfIdle();
-  return {
+  const result = {
     ok: true,
     action: 'enqueued_date_scan',
     pass: 'near_term',
+    selectedIsoDate: top.isoDate,
     ...enqueued,
     scheduleDiagnostics,
     ...range,
   };
+  thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+  return result;
 }
 
 async function runBroadMaintenanceTick(options = {}) {
@@ -14556,7 +14722,9 @@ async function enqueueReadyMaintenancePrepared({
       jobId: enqueued.id,
       mode: THRESHOLD_SCAN_JOB_MODE_APPLY,
       sourceJobId: row.sourceJobId,
+      sourceMode: row.sourceMode || null,
       weekStart: row.weekStart,
+      targetIsoDate: row.targetIsoDate || null,
       preparedUpdatesCount: row.preparedUpdatesCount,
     });
   }
@@ -14600,20 +14768,25 @@ function resolveThresholdScanJobDates(body = {}) {
 }
 
 function buildThresholdScanJobDateResult(isoDate, writeRun, extra = {}) {
+  const preparedForDate = writeRun?.preparedUpdatesByDate?.[isoDate]
+    || buildPreparedUpdatesByDateFromRows(writeRun?.preparedRows || [])[isoDate]
+    || [];
   return {
     isoDate,
     fullScanContractOk: writeRun?.fullScanContractOk === true,
-    rowsPrepared: writeRun?.rowsPrepared ?? 0,
+    rowsPrepared: writeRun?.rowsPrepared ?? preparedForDate.length,
+    preparedUpdatesCount: preparedForDate.length,
     rowsWritten: writeRun?.rowsWritten ?? 0,
     writeMode: writeRun?.writeMode ?? null,
     writesPerformed: writeRun?.writesPerformed === true,
     exactCount: writeRun?.exactCount ?? 0,
     atLeastCount: writeRun?.atLeastCount ?? 0,
+    noMatchCount: writeRun?.noMatchCount ?? 0,
     thresholdStopReason: writeRun?.thresholdStopReason ?? null,
-    scanAttemptCount: writeRun?.scanAttemptCount ?? null,
-    recoveredFromCrash: writeRun?.recoveredFromCrash === true,
-    crashReason: writeRun?.crashReason ?? null,
-    crashed: writeRun?.crashed === true,
+    scanAttemptCount: extra.scanAttemptCount ?? writeRun?.scanAttemptCount ?? null,
+    recoveredFromCrash: extra.recoveredFromCrash ?? writeRun?.recoveredFromCrash === true,
+    crashReason: extra.crashReason ?? writeRun?.crashReason ?? null,
+    crashed: extra.crashed ?? writeRun?.crashed === true,
     error: writeRun?.error ?? null,
     durationMs: extra.durationMs ?? null,
   };
@@ -14680,11 +14853,18 @@ async function enqueueThresholdScanJob({
   } else {
     initialResults = {
       mode,
+      targetIsoDate: dates?.[0] ?? null,
+      targetDates: dates,
       datesRequested: dates,
       dateResults: [],
       totalRowsPrepared: 0,
       totalRowsWritten: 0,
       writesPerformed: false,
+      fullScanContractOk: false,
+      preparedUpdatesByDate: {},
+      preparedUpdates: [],
+      preparedUpdatesCount: 0,
+      stage: 'queued',
     };
   }
   const payload = {
@@ -15048,17 +15228,46 @@ async function finalizeThresholdScanJob(jobId, {
 
 async function executeThresholdScanJob(job) {
   const dates = Array.isArray(job.dates) ? job.dates : [];
+  const targetIsoDate = dates[0] || null;
   const dryRun = job.dry_run !== false;
   const writeEnabled = job.write_enabled === true;
   const write = writeEnabled && !dryRun;
   const dateResults = [];
   let workerError = null;
+  let preparedUpdatesByDate = {};
+  let fullScanRunAggregate = {
+    fullScanContractOk: false,
+    exactCount: 0,
+    atLeastCount: 0,
+    noMatchCount: 0,
+    thresholdsScanned: [],
+    thresholdScanMaxReached: null,
+    thresholdStopReason: null,
+    error: null,
+  };
+
+  let resultsJson = await persistThresholdWeekJobStage(job.id, job.results_json || {}, {
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    targetIsoDate,
+    targetDates: dates,
+    scanRunId: job.id,
+    stage: 'claimed',
+    claimedAt: new Date().toISOString(),
+    dateResults: [],
+    preparedUpdatesByDate: {},
+    preparedUpdatesCount: 0,
+    fullScanContractOk: false,
+  });
 
   for (const isoDate of dates) {
     const dateStarted = Date.now();
     let launched = null;
     try {
       await ensureSessionsForStatus();
+      resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, {
+        stage: 'scanning_date',
+        currentIsoDate: isoDate,
+      });
       const recovery = await runGate8DateWriteContractWithRecovery({
         isoDate,
         weekMode: true,
@@ -15069,15 +15278,42 @@ async function executeThresholdScanJob(job) {
         launched: null,
       });
       launched = recovery.launched;
-      const dateResult = buildThresholdScanJobDateResult(isoDate, recovery.writeRun, {
+      const writeRun = recovery.writeRun || {};
+      if (writeRun.preparedUpdatesByDate) {
+        preparedUpdatesByDate = mergePreparedUpdatesByDate(
+          preparedUpdatesByDate,
+          writeRun.preparedUpdatesByDate,
+        );
+      }
+      if (writeRun.fullScanContractOk === true) {
+        fullScanRunAggregate = {
+          fullScanContractOk: true,
+          exactCount: (fullScanRunAggregate.exactCount || 0) + (writeRun.exactCount || 0),
+          atLeastCount: (fullScanRunAggregate.atLeastCount || 0) + (writeRun.atLeastCount || 0),
+          noMatchCount: (fullScanRunAggregate.noMatchCount || 0) + (writeRun.noMatchCount || 0),
+          thresholdsScanned: writeRun.thresholdsScanned || fullScanRunAggregate.thresholdsScanned,
+          thresholdScanMaxReached: writeRun.thresholdScanMaxReached ?? fullScanRunAggregate.thresholdScanMaxReached,
+          thresholdStopReason: writeRun.thresholdStopReason ?? fullScanRunAggregate.thresholdStopReason,
+          error: writeRun.error ?? null,
+        };
+      } else if (!fullScanRunAggregate.fullScanContractOk) {
+        fullScanRunAggregate.error = writeRun.error || fullScanRunAggregate.error;
+      }
+      const dateResult = buildThresholdScanJobDateResult(isoDate, writeRun, {
         durationMs: Date.now() - dateStarted,
+        scanAttemptCount: recovery.scanAttemptCount,
+        recoveredFromCrash: recovery.recoveredFromCrash,
+        crashReason: recovery.crashReason,
+        crashed: recovery.crashed,
       });
       dateResults.push(dateResult);
+      if (dateResult.error) workerError = workerError || dateResult.error;
     } catch (err) {
       dateResults.push({
         isoDate,
         fullScanContractOk: false,
         rowsPrepared: 0,
+        preparedUpdatesCount: 0,
         rowsWritten: 0,
         writeMode: resolveGate8WriteMode({
           thresholdWriteSafe: false,
@@ -15087,6 +15323,7 @@ async function executeThresholdScanJob(job) {
         writesPerformed: false,
         exactCount: 0,
         atLeastCount: 0,
+        noMatchCount: 0,
         thresholdStopReason: null,
         scanAttemptCount: 1,
         recoveredFromCrash: false,
@@ -15100,26 +15337,91 @@ async function executeThresholdScanJob(job) {
       await safeCloseBrowser(launched);
     }
 
-    const summary = summarizeThresholdScanJobResults(dateResults);
-    await persistThresholdScanJobProgress(job.id, {
-      datesRequested: dates,
+    resultsJson = await persistThresholdWeekJobStage(job.id, resultsJson, buildThresholdWeekWriteResultsJson({
+      mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+      weekStart: targetIsoDate ? getMondayWeekStartIso(targetIsoDate) : null,
+      targetDates: dates,
+      fullScanRun: fullScanRunAggregate,
       dateResults,
-      ...summary,
-      lastCompletedIsoDate: isoDate,
-    });
+      writeMode: resolveGate8WriteMode({
+        thresholdWriteSafe: fullScanRunAggregate.fullScanContractOk === true,
+        writeEnabled: write,
+        dryRun,
+      }),
+      stage: 'processing_dates',
+      claimedAt: resultsJson.claimedAt ?? null,
+      preparedUpdatesByDate,
+      preparedUpdatesCount: countPreparedUpdates(preparedUpdatesByDate),
+      sourceJobId: null,
+      error: workerError,
+    }));
   }
 
-  const summary = summarizeThresholdScanJobResults(dateResults);
-  const resultsJson = {
-    datesRequested: dates,
+  const preparedUpdatesCount = countPreparedUpdates(preparedUpdatesByDate);
+  const preparedZeroReason = thresholdDatePipeline.resolvePreparedZeroReason({
+    fullScanContractOk: fullScanRunAggregate.fullScanContractOk,
+    exactInferenceCount: fullScanRunAggregate.exactCount,
+    preparedUpdatesCount,
     dateResults,
-    ...summary,
-  };
-  const allFailed = dateResults.length > 0 && dateResults.every((row) => row.error);
-  const finalStatus = allFailed ? 'failed' : 'completed';
-  const finalError = allFailed
-    ? (workerError || 'all_dates_failed')
-    : (summary.failedDateCount > 0 ? 'partial_date_failures' : null);
+  });
+  const preparedScanCompletedAt = fullScanRunAggregate.fullScanContractOk === true
+    ? new Date().toISOString()
+    : null;
+  const contractValidation = thresholdDatePipeline.validateDateScanResultContract({
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    targetIsoDate,
+    targetDates: dates,
+    stage: fullScanRunAggregate.fullScanContractOk === true ? 'completed' : 'failed',
+    fullScanContractOk: fullScanRunAggregate.fullScanContractOk === true,
+    preparedUpdatesCount,
+    preparedScanCompletedAt,
+  });
+  const operationallyComplete = thresholdDatePipeline.isDateScanOperationallyComplete({
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    targetIsoDate,
+    targetDates: dates,
+    stage: fullScanRunAggregate.fullScanContractOk === true ? 'completed' : 'failed',
+    fullScanContractOk: fullScanRunAggregate.fullScanContractOk === true,
+    preparedUpdatesCount,
+    preparedScanCompletedAt,
+  });
+  const allFailed = dateResults.length > 0 && dateResults.every((row) => row.error || row.fullScanContractOk !== true);
+  const finalStatus = operationallyComplete && !allFailed ? 'completed' : 'failed';
+  const finalStage = finalStatus === 'completed' ? 'completed' : 'failed';
+  const finalError = finalStatus === 'completed'
+    ? (dateResults.some((row) => row.error) ? 'partial_date_failures' : null)
+    : (workerError
+      || fullScanRunAggregate.error
+      || (contractValidation.errors.length ? contractValidation.errors.join(',') : 'date_scan_contract_incomplete'));
+
+  resultsJson = buildThresholdWeekWriteResultsJson({
+    mode: THRESHOLD_SCAN_JOB_MODE_DATE,
+    weekStart: targetIsoDate ? getMondayWeekStartIso(targetIsoDate) : null,
+    targetDates: dates,
+    fullScanRun: fullScanRunAggregate,
+    dateResults,
+    writeMode: resolveGate8WriteMode({
+      thresholdWriteSafe: fullScanRunAggregate.fullScanContractOk === true,
+      writeEnabled: write,
+      dryRun,
+    }),
+    stage: finalStage,
+    claimedAt: resultsJson.claimedAt ?? null,
+    completedFullScanAt: preparedScanCompletedAt,
+    preparedUpdatesByDate,
+    preparedUpdatesCount,
+    preparedScanCompletedAt,
+    preparedZeroReason,
+    scanRunId: job.id,
+    targetIsoDate,
+    exactInferenceCount: fullScanRunAggregate.exactCount,
+    ambiguityCount: fullScanRunAggregate.atLeastCount + fullScanRunAggregate.noMatchCount,
+    trustedSessionCount: preparedUpdatesCount,
+    failedSessionCount: dateResults.filter((row) => row.error).length,
+    fullScanContractOk: fullScanRunAggregate.fullScanContractOk === true,
+    resultsError: finalError,
+    error: finalError,
+  });
 
   await finalizeThresholdScanJob(job.id, {
     status: finalStatus,
@@ -15127,12 +15429,17 @@ async function executeThresholdScanJob(job) {
     resultsJson,
   });
 
+  const summary = summarizeThresholdScanJobResults(dateResults);
   return {
     ok: finalStatus === 'completed',
     job_id: job.id,
     status: finalStatus,
     datesRequested: dates,
+    targetIsoDate,
     dateResults,
+    preparedUpdatesCount,
+    preparedZeroReason,
+    operationallyComplete,
     ...summary,
     error: finalError,
   };
@@ -20312,7 +20619,7 @@ app.post('/api/admin/maintenance/near-term-tick', async (req, res) => {
       return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
     }
     const { startDate, endDate } = resolveMaintenanceDateRange(body);
-    const result = await runNearTermMaintenanceTick({ startDate, endDate });
+    const result = await runNearTermMaintenanceTick({ startDate, endDate, source: 'external' });
     if (!result.ok && result.error) {
       return res.status(400).json(result);
     }
@@ -22291,7 +22598,7 @@ function startBackgroundCollector() {
     collectorState.cronTasks.nearTermMaintenanceTick = scheduleCronSafe(
       '*/5 * * * *',
       () => {
-        runNearTermMaintenanceTick()
+        runNearTermMaintenanceTick({ source: 'in_process' })
           .catch((err) => console.error('[near-term maintenance tick]', err.message));
       },
       'Near-term maintenance tick',
