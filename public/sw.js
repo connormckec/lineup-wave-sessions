@@ -17,9 +17,17 @@ function isAppShell(url) {
   return url.pathname === '/' || url.pathname === '/index.html';
 }
 
+function isPrototypeAsset(url) {
+  const path = url.pathname;
+  return path === '/browse-prototype.html'
+    || path === '/browse-ui-semantics.js'
+    || path === '/lib/browse-ui-semantics.js'
+    || path === '/lib/browse-ui-fixtures.js';
+}
+
 function isStaticAsset(url) {
   if (url.origin !== self.location.origin) return false;
-  if (isApiRequest(url) || isAppShell(url)) return false;
+  if (isApiRequest(url) || isAppShell(url) || isPrototypeAsset(url)) return false;
   return /\.(png|jpg|jpeg|webp|svg|ico|woff2?|css|js|json)$/i.test(url.pathname)
     || url.pathname.startsWith('/brand/');
 }

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lineup Browse — UI Prototype</title>
+<script>
+(function isolatePrototypeFromServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  var flag = 'lineup-browse-prototype-sw-isolated';
+  if (sessionStorage.getItem(flag) === '1') return;
+  navigator.serviceWorker.getRegistrations().then(function(regs) {
+    var hadControl = !!(navigator.serviceWorker.controller || regs.length);
+    if (!hadControl) {
+      sessionStorage.setItem(flag, '1');
+      return;
+    }
+    return Promise.all(regs.map(function(r) { return r.unregister(); })).then(function() {
+      sessionStorage.setItem(flag, '1');
+      if (navigator.serviceWorker.controller) location.reload();
+    });
+  }).catch(function(err) {
+    console.warn('[browse-prototype] service worker isolation failed', err);
+  });
+}());
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --navy:#0a1628;
+  --surface:#eef2f6;
+  --surface-elevated:#f8fafc;
+  --card:#ffffff;
+  --card-border:#d8e0ea;
+  --text:#0a1628;
+  --text-secondary:#4a6178;
+  --text-muted:#7a8fa3;
+  --accent:#00b8a9;
+  --accent-soft:rgba(0,184,169,.12);
+  --amber:#d97706;
+  --slate-dark:#64748b;
+  --dot-taken:#cbd5e1;
+  --dot-open:#00b8a9;
+  --dot-scarce:#d97706;
+  --dot-unverified:#e2e8f0;
+  --safe-top:env(safe-area-inset-top,0px);
+  --safe-bottom:env(safe-area-inset-bottom,0px);
+  --nav-h:calc(52px + var(--safe-bottom));
+  --font-display:'Barlow Condensed',sans-serif;
+  --font-body:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+  --radius-card:13px;
+  --radius-sm:8px;
+  --app-max:480px;
+}
+html,body{height:100%;background:var(--surface);color:var(--text);font-family:var(--font-body)}
+body{overflow:hidden}
+#app{
+  display:flex;flex-direction:column;height:100dvh;min-height:100vh;width:100%;
+  max-width:var(--app-max);margin:0 auto;background:var(--surface);
+  padding-top:var(--safe-top);padding-bottom:var(--nav-h);
+}
+
+#header{background:var(--navy);padding:8px 14px 10px;flex-shrink:0;color:#fff}
+.header-top{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.header-brand{display:flex;align-items:center;gap:10px;min-width:0}
+.header-mark{width:36px;height:36px;border-radius:50%;flex-shrink:0;object-fit:cover}
+.header-copy{min-width:0}
+#app-title{font-family:var(--font-display);font-size:22px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;line-height:1;color:#fff}
+.app-sublabel{font-size:10px;color:rgba(255,255,255,.62);margin-top:2px}
+
+.live-panel{
+  margin:8px 0 0;padding:10px 12px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:var(--radius-sm);
+}
+.live-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px}
+.live-title{font-family:var(--font-display);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#fff}
+.live-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.live-side{min-width:0}
+.live-side-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.48);margin-bottom:4px}
+.live-level{font-family:var(--font-display);font-size:15px;font-weight:700;line-height:1.15;color:#fff;margin-bottom:3px}
+.live-occupancy{font-size:11px;font-weight:600;color:rgba(255,255,255,.92);line-height:1.35}
+.live-spots{font-size:10px;color:rgba(255,255,255,.68);margin-top:2px;line-height:1.3}
+.live-verified{font-size:10px;color:rgba(255,255,255,.58);margin-top:3px;font-variant-numeric:tabular-nums}
+.live-verified.stale{color:#fbbf24}
+.live-empty{font-size:11px;color:rgba(255,255,255,.55);line-height:1.35;font-style:italic}
+.live-idle-copy{font-family:var(--font-display);font-size:16px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#fff;margin-bottom:8px}
+.live-next-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.48);margin-bottom:3px}
+.live-next-value{font-size:12px;font-weight:600;color:rgba(255,255,255,.92);line-height:1.35}
+.live-help{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.1);font-size:9px;line-height:1.4;color:rgba(255,255,255,.45)}
+
+#refresh-btn{width:44px;height:44px;border:1px solid rgba(255,255,255,.2);border-radius:var(--radius-sm);background:rgba(255,255,255,.06);color:rgba(255,255,255,.7);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+#refresh-btn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2}
+
+.app-body{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+#content{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;background:var(--surface)}
+.pane{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:0 0 8px;-webkit-overflow-scrolling:touch}
+
+#sidebar{display:none}
+
+.day-rail-wrap{padding:8px 0 4px;background:var(--surface);position:sticky;top:0;z-index:5;border-bottom:1px solid var(--card-border)}
+.day-rail{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:0 14px;scroll-padding-left:14px;-webkit-overflow-scrolling:touch}
+.day-rail::-webkit-scrollbar{display:none}
+.day-chip{
+  flex:0 0 auto;min-width:58px;padding:7px 10px 6px;
+  background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-sm);
+  text-align:center;cursor:pointer;position:relative;
+}
+.day-chip.selected{border-color:var(--accent);background:var(--accent-soft)}
+.day-chip.selected::after{content:'';position:absolute;bottom:0;left:10px;right:10px;height:2px;background:var(--accent);border-radius:1px}
+.day-chip.watched::before{content:'';position:absolute;top:5px;right:5px;width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.day-wd{font-family:var(--font-display);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary)}
+.day-num{font-family:var(--font-display);font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1;margin-top:1px;color:var(--text)}
+.day-open{font-size:9px;color:var(--text-muted);margin-top:3px;font-variant-numeric:tabular-nums}
+
+.filter-bar{padding:0;background:var(--surface);position:sticky;top:0;z-index:4;border-bottom:1px solid var(--card-border)}
+.filter-tabs{display:flex;gap:0;overflow-x:auto;scrollbar-width:none;padding:0 14px;-webkit-overflow-scrolling:touch}
+.filter-tabs::-webkit-scrollbar{display:none}
+.filter-tab{
+  flex:0 0 auto;padding:0 12px;border:none;background:none;
+  font-family:var(--font-body);font-size:12px;font-weight:500;color:var(--text-muted);
+  cursor:pointer;position:relative;white-space:nowrap;min-height:44px;display:flex;align-items:center;
+}
+.filter-tab.selected{color:var(--text);font-weight:600}
+.filter-tab.selected::after{content:'';position:absolute;bottom:0;left:8px;right:8px;height:2px;background:var(--accent);border-radius:1px}
+.filter-tab.filter-more-tab{color:var(--text-secondary);font-size:11px;margin-left:4px}
+
+#session-list{padding:6px 14px 20px}
+.proto-error-root{padding:12px 14px}
+.proto-error-root[hidden]{display:none}
+.proto-note{font-size:10px;color:var(--text-muted);text-align:center;padding:5px 8px;background:var(--surface-elevated);border:1px dashed var(--card-border);border-radius:var(--radius-sm);margin-bottom:6px;line-height:1.35}
+.proto-error{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:var(--radius-sm);padding:12px 14px;font-size:13px;line-height:1.4}
+.app-body.proto-init-failed .pane,.app-body.proto-init-failed #sidebar{display:none}
+
+.sc{
+  display:grid;grid-template-columns:4px 1fr auto;align-items:stretch;
+  background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-card);
+  margin-bottom:6px;overflow:hidden;
+}
+.sc.watching{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft)}
+.sc-accent{align-self:stretch;background:var(--level-color,var(--slate-dark))}
+.sc-main{padding:8px 10px 8px 8px;min-width:0;display:flex;flex-direction:column;gap:2px}
+.sc-row-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.sc-time{font-family:var(--font-display);font-size:19px;font-weight:800;letter-spacing:.02em;font-variant-numeric:tabular-nums;line-height:1;color:var(--text)}
+.sc-status{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.sc-status.open,.sc-status.healthy{color:var(--accent)}.sc-status.scarce{color:var(--amber)}.sc-status.packed{color:var(--amber)}.sc-status.full{color:var(--slate-dark)}.sc-status.unverified{color:var(--text-muted)}
+.sc-level{font-family:var(--font-display);font-size:13px;font-weight:700;color:var(--level-color,var(--text));letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sc-wave{font-size:11px;color:var(--text-secondary);font-weight:500}
+.sc-dots-row{display:flex;align-items:center;gap:6px;margin-top:1px}
+.slot-bar{display:flex;gap:2px;align-items:center}
+.slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--dot-taken)}
+.slot-dot.open{background:var(--dot-open)}.slot-dot.scarce{background:var(--dot-scarce)}.slot-dot.unverified{background:var(--dot-unverified)}
+.sc-dot-label{font-size:10px;font-weight:600;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.sc-verified{font-size:9px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.sc-side{padding:8px 8px 8px 0;display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:5px;min-width:92px}
+.watch-btn,.book-btn{
+  min-height:44px;height:44px;padding:0 10px;border-radius:var(--radius-sm);font-size:11px;font-weight:600;
+  font-family:var(--font-body);cursor:pointer;white-space:nowrap;text-align:center;
+  display:flex;align-items:center;justify-content:center;line-height:1.15;
+}
+.watch-btn{
+  min-width:112px;width:112px;border:none;background:var(--accent);color:#fff;font-weight:700;
+  box-sizing:border-box;
+}
+.watch-btn.watching{
+  min-width:112px;width:112px;height:44px;padding:0 10px;border-radius:var(--radius-sm);
+  background:var(--navy);color:#fff;box-shadow:inset 0 0 0 2px var(--accent);font-weight:700;
+}
+.watch-btn.off{opacity:.5;cursor:not-allowed;background:var(--slate-dark)}
+.book-btn{border:1px solid var(--card-border);background:var(--surface-elevated);color:var(--text-secondary);font-size:11px;font-weight:500;text-decoration:none}
+
+#nav{
+  position:fixed;left:50%;bottom:0;transform:translateX(-50%);
+  width:100%;max-width:var(--app-max);height:var(--nav-h);padding-bottom:var(--safe-bottom);
+  background:var(--card);border-top:1px solid var(--card-border);display:flex;z-index:100;
+}
+.nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;border:none;background:none;color:var(--text-muted);font-size:10px;font-weight:500;cursor:pointer;min-height:52px}
+.nav-btn.on{color:var(--text);font-weight:600}
+
+.side-card{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-card);padding:14px 16px;margin-bottom:12px}
+.side-card h2{font-family:var(--font-display);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-secondary);margin-bottom:10px}
+.side-metric{font-size:24px;font-weight:800;font-family:var(--font-display);color:var(--accent);line-height:1}
+.side-sub{font-size:12px;color:var(--text-secondary);margin-top:4px;line-height:1.4}
+.side-list{list-style:none;display:flex;flex-direction:column;gap:8px}
+.side-list li{font-size:12px;line-height:1.35;color:var(--text)}
+.side-list .side-list-meta{font-size:11px;color:var(--text-muted);margin-top:2px}
+.side-empty{font-size:12px;color:var(--text-muted);font-style:italic;line-height:1.4}
+
+@media (max-width:360px){.live-grid{grid-template-columns:1fr;gap:8px}}
+
+@media (min-width:768px){
+  :root{--app-max:720px}
+  .sc-side{min-width:104px}
+  .live-grid{gap:12px 20px}
+  .live-level{font-size:16px}
+}
+
+@media (min-width:1024px){
+  :root{--app-max:1360px}
+  body{overflow:auto;background:linear-gradient(180deg,#e8edf3 0%,var(--surface) 120px)}
+  #app{
+    min-height:100dvh;height:auto;padding-bottom:24px;box-shadow:0 0 0 1px var(--card-border);
+  }
+  #header{padding:14px 24px 16px}
+  .header-top{align-items:flex-start}
+  .header-brand{gap:12px}
+  #app-title{font-size:26px}
+  .live-panel{margin-top:12px;padding:14px 16px}
+  .live-grid{grid-template-columns:1fr 1fr;gap:16px 32px}
+  .live-title{font-size:12px}
+  .live-level{font-size:17px}
+
+  #nav{
+    position:static;transform:none;width:auto;max-width:none;height:auto;padding:0;
+    margin:0 24px 12px;background:transparent;border:none;gap:4px;justify-content:flex-end;
+  }
+  .nav-btn{
+    flex:0 0 auto;min-height:40px;padding:0 16px;border-radius:999px;
+    font-size:13px;font-weight:600;background:rgba(255,255,255,.08);color:rgba(255,255,255,.72);
+  }
+  .nav-btn.on{background:rgba(255,255,255,.16);color:#fff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}
+  .header-top{display:grid;grid-template-columns:1fr auto auto;align-items:center}
+  .header-brand{grid-column:1}
+  #nav{grid-column:2;order:0;margin:0}
+  #refresh-btn{grid-column:3}
+
+  .app-body{
+    flex-direction:row;align-items:stretch;gap:20px;padding:0 24px 24px;min-height:520px;
+  }
+  #content{flex:1.35;min-width:0;border:1px solid var(--card-border);border-radius:var(--radius-card);background:var(--card)}
+  .pane{padding-bottom:16px}
+  #sidebar{
+    display:block;flex:0 0 320px;min-width:280px;max-width:340px;overflow-y:auto;
+  }
+  .day-rail-wrap,.filter-bar{background:var(--card)}
+  .day-rail,.filter-tabs{padding-left:18px;padding-right:18px}
+  #session-list{padding:8px 18px 18px}
+  .proto-note{display:none}
+  .sc{
+    grid-template-columns:4px 1fr auto auto;gap:0;margin-bottom:8px;
+  }
+  .sc-main{padding:12px 14px 12px 10px}
+  .sc-time{font-size:21px}
+  .sc-side{
+    flex-direction:row;align-items:center;padding:12px 12px 12px 0;gap:8px;min-width:0;
+  }
+  .watch-btn,.book-btn{min-width:112px;padding:0 14px}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-top">
+      <div class="header-brand">
+        <img src="/brand/lineup-mark-72.png" alt="" class="header-mark" width="36" height="36">
+        <div class="header-copy">
+          <h1 id="app-title">Lineup</h1>
+          <p class="app-sublabel">Atlantic Park sessions</p>
+        </div>
+      </div>
+      <nav id="nav" aria-label="Primary">
+        <button class="nav-btn on" type="button">Browse</button>
+        <button class="nav-btn" type="button">Lineup</button>
+        <button class="nav-btn" type="button">Settings</button>
+      </nav>
+      <button type="button" id="refresh-btn" aria-label="Refresh sessions">
+        <svg viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+    </div>
+    <div class="live-panel" id="live-panel" aria-live="polite"></div>
+  </header>
+  <div class="app-body">
+    <div id="proto-error-root" hidden></div>
+    <main id="content">
+      <div class="pane">
+        <div class="day-rail-wrap"><div class="day-rail" id="day-rail"></div></div>
+        <div class="filter-bar"><div class="filter-tabs" id="level-tabs"></div></div>
+        <div id="session-list"></div>
+      </div>
+    </main>
+    <aside id="sidebar" aria-label="Browse summary"></aside>
+  </div>
+</div>
+<script src="/lib/browse-ui-fixtures.js?v=2"></script>
+<script src="/lib/browse-ui-semantics.js?v=2"></script>
+<script>
+'use strict';
+
+const PROTO_ASSET_VERSION = '2';
+const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
+const REQUIRED_SEM_FUNCTIONS = [
+  'computeLiveNowSummary',
+  'inventoryState',
+  'countTrustedOpenSessions',
+  'computeDayRailOpenCounts',
+  'computeSelectedDayVerificationSummary',
+  'watchLabelForSession',
+  'isSessionLive',
+  'isSessionPast',
+  'formatAgeMinutes',
+];
+let SEM = null;
+let FIX = null;
+let NOW_MS = Date.now();
+let activeDay = '';
+let activeLevel = '__all__';
+let openOnly = false;
+let watchedKeys = new Set();
+let initFailed = false;
+
+function showInitError(message, stage) {
+  if (initFailed) return;
+  initFailed = true;
+  console.error('[browse-prototype]', stage || 'init', message);
+  const root = document.getElementById('proto-error-root');
+  const body = document.querySelector('.app-body');
+  const live = document.getElementById('live-panel');
+  if (live) live.innerHTML = '';
+  if (root) {
+    root.hidden = false;
+    root.innerHTML = `<div class="proto-error" role="alert"><strong>Prototype failed to initialize</strong><br>${message}</div>`;
+  }
+  if (body) body.classList.add('proto-init-failed');
+}
+
+function validateSemanticsContract(sem) {
+  const missing = REQUIRED_SEM_FUNCTIONS.filter((name) => typeof sem[name] !== 'function');
+  if (missing.length) {
+    return `Semantics script is incomplete or stale (v${sem.SEMANTICS_API_VERSION || '?'}). Missing: ${missing.join(', ')}. Hard reload or open in a private window. Loaded <code>/lib/browse-ui-semantics.js?v=${PROTO_ASSET_VERSION}</code>.`;
+  }
+  return null;
+}
+
+function formatRelativeTime(iso) {
+  return SEM.formatAgeMinutes(iso ? Math.max(0, Math.round((NOW_MS - new Date(iso).getTime()) / 60000)) : null);
+}
+
+function visibleSessionsForDay(isoDate) {
+  let list = FIX.sessions.filter((s) => s.isoDate === isoDate);
+  if (isoDate === FIX.TODAY) {
+    list = list.filter((s) => !SEM.isSessionLive(s, NOW_MS) && !SEM.isSessionPast(s, NOW_MS));
+  }
+  if (activeLevel !== '__all__') list = list.filter((s) => s.level === activeLevel);
+  if (openOnly) {
+    list = list.filter((s) => SEM.isThresholdTrusted(s) && (SEM.trustedSlots(s) ?? 0) > 0);
+  }
+  return list.sort((a, b) => a.ts - b.ts);
+}
+
+function liveSideHtml(label, side) {
+  if (!side) {
+    return `<div class="live-side"><div class="live-side-label">${label}</div><div class="live-empty">No session currently running</div></div>`;
+  }
+  return `<div class="live-side">
+    <div class="live-side-label">${label}</div>
+    <div class="live-level">${side.level}</div>
+    <div class="live-occupancy">${side.occupancyLine}</div>
+    ${side.spotsRemainingLine ? `<div class="live-spots">${side.spotsRemainingLine}</div>` : ''}
+    <div class="live-verified${side.stale ? ' stale' : ''}">${side.verifiedLine}</div>
+  </div>`;
+}
+
+function renderLivePanel() {
+  const live = SEM.computeLiveNowSummary(FIX.sessions, NOW_MS);
+  const help = `<p class="live-help" id="live-help">${live.helpText}</p>`;
+  const panel = document.getElementById('live-panel');
+  if (!panel) return;
+
+  if (live.mode === 'idle') {
+    panel.innerHTML = `
+      <div class="live-idle-copy">${live.title}</div>
+      ${live.nextSession ? `
+        <div class="live-next-label">Next session</div>
+        <div class="live-next-value">${live.nextSession.time} · ${live.nextSession.level} · ${live.nextSession.waveSide}</div>` : ''}
+      ${help}`;
+    return;
+  }
+
+  panel.innerHTML = `
+    <div class="live-head">
+      <div class="live-title">${live.title}${live.windowLabel ? ` · ${live.windowLabel}` : ''}</div>
+    </div>
+    <div class="live-grid">
+      ${liveSideHtml('Left Wave', live.left)}
+      ${liveSideHtml('Right Wave', live.right)}
+    </div>
+    ${help}`;
+}
+
+function renderDayRail() {
+  const days = SEM.computeDayRailOpenCounts(FIX.sessions, FIX.dayRail, { nowMs: NOW_MS });
+  document.getElementById('day-rail').innerHTML = days.map((d) => `
+    <button type="button" class="day-chip${d.isoDate === activeDay ? ' selected' : ''}${d.watched ? ' watched' : ''}" data-day="${d.isoDate}">
+      <div class="day-wd">${d.label}</div>
+      <div class="day-num">${d.dayNum}</div>
+      <div class="day-open">${d.openCount} open</div>
+    </button>`).join('');
+}
+
+function renderLevelTabs() {
+  const tabs = [{ key: '__all__', label: 'All' }];
+  for (const [name, cfg] of Object.entries(FIX.LEVELS)) tabs.push({ key: name, label: cfg.s });
+  tabs.push({ key: '__more__', label: 'More…' });
+  document.getElementById('level-tabs').innerHTML = tabs.map((t) => `
+    <button type="button" class="filter-tab${activeLevel === t.key ? ' selected' : ''}${t.key === '__more__' ? ' filter-more-tab' : ''}" data-level="${t.key}">${t.label}</button>`).join('');
+}
+
+function dotBarHtml(state) {
+  let dots = '';
+  if (state.kind === 'unverified') {
+    for (let i = 0; i < SEM.DOT_COUNT; i++) dots += '<span class="slot-dot unverified"></span>';
+    return `<div class="slot-bar">${dots}</div>`;
+  }
+  const open = Math.min(Math.max(0, state.slots ?? 0), SEM.DOT_COUNT);
+  const taken = SEM.DOT_COUNT - open;
+  const openClass = (state.kind === 'scarce' || state.kind === 'packed') ? 'scarce' : (state.kind === 'full' ? '' : 'open');
+  for (let i = 0; i < taken; i++) dots += '<span class="slot-dot"></span>';
+  for (let i = 0; i < open; i++) dots += `<span class="slot-dot ${openClass}"></span>`;
+  return `<div class="slot-bar">${dots}</div>`;
+}
+
+function verifiedLabel(s) {
+  if (SEM.isThresholdTrusted(s) && s.threshold_scanned_at) {
+    return `Verified ${formatRelativeTime(s.threshold_scanned_at)}`;
+  }
+  if (s.lastBasicCheckAt) return `Schedule ${formatRelativeTime(s.lastBasicCheckAt)}`;
+  return '';
+}
+
+function sessionCardHtml(s) {
+  const cfg = FIX.LEVELS[s.level] || { s: '?', c: '#64748b' };
+  const state = SEM.inventoryState(s);
+  const watched = watchedKeys.has(s.key);
+  const watch = SEM.watchLabelForSession(s, watched, FIX.alertsEnabled);
+  const watchClass = watch.disabled ? 'off' : (watched ? 'watching' : '');
+
+  return `<article class="sc${watched ? ' watching' : ''}" style="--level-color:${cfg.c}">
+    <div class="sc-accent"></div>
+    <div class="sc-main">
+      <div class="sc-row-top">
+        <div class="sc-time">${(s.time || '').replace(/\s*(am|pm)/i, (m) => m.toLowerCase())}</div>
+        <div class="sc-status ${state.kind}">${state.label}</div>
+      </div>
+      <div class="sc-level">${s.level || s.session_type}</div>
+      <div class="sc-wave">${s.waveSide || 'Wave'}</div>
+      <div class="sc-dots-row">${dotBarHtml(state)}<span class="sc-dot-label">${state.label}</span></div>
+      <div class="sc-verified">${verifiedLabel(s)}</div>
+    </div>
+    <div class="sc-side">
+      <button type="button" class="watch-btn ${watchClass}" data-watch="${s.key}">${watch.label}</button>
+      <a class="book-btn" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
+    </div>
+  </article>`;
+}
+
+function renderSessions() {
+  const list = visibleSessionsForDay(activeDay);
+  const note = '<div class="proto-note">Fixture prototype — visual review only. Production contracts preserved.</div>';
+  document.getElementById('session-list').innerHTML = note + (list.length
+    ? list.map(sessionCardHtml).join('')
+    : '<p style="text-align:center;color:var(--text-muted);padding:32px 14px">No sessions for this day/filter</p>');
+  renderSidebar();
+}
+
+function selectedDayMeta() {
+  const day = FIX.dayRail.find((d) => d.isoDate === activeDay) || { label: activeDay, dayNum: '' };
+  const openCount = SEM.countTrustedOpenSessions(FIX.sessions, activeDay, { nowMs: NOW_MS });
+  const verification = SEM.computeSelectedDayVerificationSummary(
+    FIX.sessions.filter((s) => s.isoDate === activeDay),
+    activeDay,
+    { nowMs: NOW_MS },
+  );
+  return { day, openCount, verification };
+}
+
+function watchingEntries() {
+  return FIX.sessions
+    .filter((s) => watchedKeys.has(s.key))
+    .sort((a, b) => a.ts - b.ts)
+    .map((s) => {
+      const watched = true;
+      const watch = SEM.watchLabelForSession(s, watched, FIX.alertsEnabled);
+      return { session: s, watchLabel: watch.label };
+    });
+}
+
+function renderSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar) return;
+  const { day, openCount, verification } = selectedDayMeta();
+  const watching = watchingEntries();
+
+  sidebar.innerHTML = `
+    <div class="side-card">
+      <h2>Selected day</h2>
+      <div class="side-metric">${openCount}</div>
+      <div class="side-sub">${day.label} ${day.dayNum} · ${openCount === 1 ? 'session open' : 'sessions open'}</div>
+      <div class="side-sub">${verification.headerText}${verification.subText ? `<br>${verification.subText}` : ''}</div>
+    </div>
+    <div class="side-card">
+      <h2>Watching</h2>
+      ${watching.length ? `
+        <ul class="side-list">
+          ${watching.map(({ session, watchLabel }) => `
+            <li><strong>${session.time}</strong> · ${session.level || session.session_type}
+              <div class="side-list-meta">${session.waveSide || 'Wave'} · ${SEM.inventoryState(session).label} · ${watchLabel}</div>
+            </li>`).join('')}
+        </ul>` : '<div class="side-empty">No watched sessions yet.</div>'}
+    </div>
+    <div class="side-card">
+      <h2>Prototype note</h2>
+      <div class="side-sub">Fixture-backed visual review only. Production contracts preserved.</div>
+    </div>`;
+}
+
+function renderAll() {
+  renderLivePanel();
+  renderDayRail();
+  renderLevelTabs();
+  renderSessions();
+}
+
+function onBellClick(sJson) {
+  return toggleWatch(sJson);
+}
+
+function toggleWatch(sJson) {
+  let s;
+  try {
+    s = typeof sJson === 'string' ? JSON.parse(sJson) : sJson;
+  } catch (_) {
+    const key = typeof sJson === 'string' ? sJson : null;
+    if (!key) return;
+    if (watchedKeys.has(key)) watchedKeys.delete(key);
+    else watchedKeys.add(key);
+    renderSessions();
+    return;
+  }
+  const key = s?.key;
+  if (!key) return;
+  if (watchedKeys.has(key)) watchedKeys.delete(key);
+  else watchedKeys.add(key);
+  renderSessions();
+}
+
+function bindEvents() {
+  document.getElementById('day-rail').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-day]');
+    if (!btn) return;
+    activeDay = btn.dataset.day;
+    renderAll();
+  });
+
+  document.getElementById('level-tabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-level]');
+    if (!btn) return;
+    if (btn.dataset.level === '__more__') {
+      openOnly = !openOnly;
+      alert(openOnly ? 'Open only filter enabled (optional, defaults off).' : 'Open only filter disabled.');
+      renderSessions();
+      return;
+    }
+    activeLevel = btn.dataset.level;
+    renderAll();
+  });
+
+  document.getElementById('session-list').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-watch]');
+    if (!btn || btn.classList.contains('off')) return;
+    onBellClick(btn.dataset.watch);
+  });
+}
+
+function initBrowsePrototype() {
+  if (initFailed) return;
+  try {
+    FIX = window.BrowseUiFixtures;
+    SEM = window.BrowseUiSemantics;
+    if (!FIX) {
+      showInitError(`Missing fixture script: <code>/lib/browse-ui-fixtures.js?v=${PROTO_ASSET_VERSION}</code>.`, 'fixtures');
+      return;
+    }
+    if (!SEM) {
+      showInitError(`Missing semantics script: <code>/lib/browse-ui-semantics.js?v=${PROTO_ASSET_VERSION}</code>.`, 'semantics');
+      return;
+    }
+    const contractError = validateSemanticsContract(SEM);
+    if (contractError) {
+      showInitError(contractError, 'semantics-contract');
+      return;
+    }
+    NOW_MS = FIX.nowMs;
+    activeDay = FIX.TODAY;
+    watchedKeys = new Set(Array.from(FIX.watchedKeys || []));
+    bindEvents();
+    renderAll();
+  } catch (err) {
+    showInitError(String(err && err.message ? err.message : err), 'runtime');
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initBrowsePrototype);
+} else {
+  initBrowsePrototype();
+}
+</script>
+</body>
+</html>

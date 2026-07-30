@@ -56,6 +56,16 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use((req, res, next) => {
+  if (req.path === '/browse-prototype.html'
+    || req.path === '/browse-ui-semantics.js'
+    || req.path === '/lib/browse-ui-semantics.js'
+    || req.path === '/lib/browse-ui-fixtures.js') {
+    res.set('Cache-Control', 'no-store');
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/session-data-status.js', (_req, res) => {
   res.type('application/javascript');
@@ -64,6 +74,14 @@ app.get('/session-data-status.js', (_req, res) => {
 app.get('/browse-session-filters.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'browse-session-filters.js'));
+});
+app.get('/browse-ui-semantics.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'browse-ui-semantics.js'));
+});
+app.get('/lib/browse-ui-semantics.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'browse-ui-semantics.js'));
 });
 
 const PORT       = process.env.PORT || 3000;

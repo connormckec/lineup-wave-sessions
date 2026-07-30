@@ -461,10 +461,10 @@ async function runTests() {
     assert.strictEqual(retry.record, false);
   }
 
-  // Six-hour heartbeat remains bounded.
+  // Six-hour heartbeat remains bounded for far-future sessions.
   {
     marketObservations.resetObservationMemoryForTests();
-    const s = verifiedSession({ ts: 1785153600, isoDate: '2026-07-27', key: '1785153600_1' });
+    const s = verifiedSession({ ts: 1787227200, isoDate: '2026-08-20', key: '1787227200_1' });
     await marketObservations.insertMarketObservation(
       mockSupabase().client,
       marketObservations.buildSessionMarketObservationRow({ session: s, observedAt: new Date('2026-07-26T10:00:00.000Z') }),
@@ -474,9 +474,10 @@ async function runTests() {
       marketObservations.buildSessionMarketObservationRow({ session: s, observedAt: new Date('2026-07-26T12:00:00.000Z') }).record,
       false,
     );
-    const heartbeat = marketObservations.buildSessionMarketObservationRow({ session: s, observedAt: new Date('2026-07-26T16:30:00.000Z') });
+    const heartbeat = marketObservations.buildSessionMarketObservationRow({ session: s, observedAt: new Date('2026-07-26T22:30:00.000Z') });
     assert.strictEqual(heartbeat.record, true);
     assert.ok(heartbeat.policy.reasons.includes('heartbeat'));
+    assert.strictEqual(heartbeat.policy.heartbeatTargetMinutes, 720);
   }
 
   // 16. RLS, dedupe, modal, notification-related invariants retained.
