@@ -6,7 +6,7 @@ const path = require('path');
 
 console.log('cache version regression');
 
-const RELEASE_VERSION = '8';
+const RELEASE_VERSION = '9';
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'public/sw.js'), 'utf8');
@@ -26,9 +26,10 @@ function extractConst(source, name) {
 
 {
   const helpers = [
-    '/push-client.js?v=8',
-    '/profile-auth-client.js?v=8',
-    '/browse-session-filters.js?v=8',
+    '/push-client.js?v=9',
+    '/profile-auth-client.js?v=9',
+    '/browse-session-filters.js?v=9',
+    '/browse-ui-semantics.js?v=9',
   ];
   for (const src of helpers) {
     assert.ok(html.includes(`src="${src}"`), `missing script ${src}`);
@@ -73,7 +74,12 @@ function extractConst(source, name) {
 }
 
 {
-  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-25-web-push-v8'"));
+  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-browse-ui-v9'"));
+  assert.ok(html.includes('id="live-panel"'));
+  assert.ok(html.includes('id="day-rail"'));
+  assert.ok(html.includes('class="watch-btn'));
+  assert.ok(html.includes('renderLivePanel'));
+  assert.doesNotMatch(html, /trusted open/i);
 }
 
 {
