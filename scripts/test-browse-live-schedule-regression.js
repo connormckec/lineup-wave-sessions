@@ -320,11 +320,11 @@ function atLocal(isoDate, clock) {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=16'), 'index loads browse-live-schedule');
-  assert.ok(html.includes('/browse-availability-view.js?v=16'), 'index loads availability view');
-  assert.ok(html.includes('/session-capacity-config.js?v=16'), 'index loads capacity config');
-  assert.ok(html.includes('/lineup-config.js?v=16'), 'index loads lineup-config');
-  assert.ok(html.includes('/browse-session-filters.js?v=16'), 'filters load before live schedule');
+  assert.ok(html.includes('/browse-live-schedule.js?v=17'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/browse-availability-view.js?v=17'), 'index loads availability view');
+  assert.ok(html.includes('/session-capacity-config.js?v=17'), 'index loads capacity config');
+  assert.ok(html.includes('/lineup-config.js?v=17'), 'index loads lineup-config');
+  assert.ok(html.includes('/browse-session-filters.js?v=17'), 'filters load before live schedule');
   assert.ok(html.includes('liveNowState'));
   assert.ok(html.includes('loadTodaySessionsForLiveNow'));
   assert.ok(html.includes('logLiveNowDiagnostics'));
