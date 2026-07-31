@@ -52,16 +52,17 @@
   --radius-card:13px;
   --radius-sm:8px;
   --app-max:480px;
-  --full-card-bg:#d8e0ea;
-  --full-card-border:#b0bcc9;
-  --full-card-accent:#475569;
-  --full-card-text:#334155;
-  --full-card-meta:#5b6b7c;
-  --full-badge-bg:#475569;
-  --full-badge-text:#ffffff;
-  --full-book-bg:#e2e8f0;
-  --full-book-border:#c5ced8;
-  --full-book-text:#94a3b8;
+  --full-card-bg:#f1f4f8;
+  --full-card-border:#e2e8f0;
+  --full-card-accent:#b8c4d0;
+  --full-card-text:#3d5166;
+  --full-card-meta:#8fa3b5;
+  --full-card-dot:#dde4ec;
+  --full-badge-bg:#d5dde6;
+  --full-badge-text:#5b6b7c;
+  --full-book-bg:#eef2f6;
+  --full-book-border:#dde4ec;
+  --full-book-text:#a0aec0;
 }
 html,body{height:100%;background:var(--surface);color:var(--text);font-family:var(--font-body);overflow:hidden;overflow-x:hidden}
 #app{
@@ -330,16 +331,20 @@ html,body{height:100%;background:var(--surface);color:var(--text);font-family:va
   margin-bottom:6px;overflow:hidden;
 }
 .sc.watching,.session-card.watching{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft)}
-.session-card.is-full{background:var(--full-card-bg);border-color:var(--full-card-border)}
+.session-card.is-full{
+  background:linear-gradient(180deg,#f6f8fb 0%,var(--full-card-bg) 100%);
+  border-color:var(--full-card-border);
+  box-shadow:none;
+}
 .session-card.is-full .sc-accent{background:var(--full-card-accent)!important}
-.session-card.is-full .sc-time,.session-card.is-full .sc-level,.session-card.is-full .sc-wave{color:var(--full-card-text)}
+.session-card.is-full .sc-time{color:var(--full-card-text)}
+.session-card.is-full .sc-level,.session-card.is-full .sc-wave{color:var(--full-card-text)}
 .session-card.is-full .sc-dot-label,.session-card.is-full .sc-verified{color:var(--full-card-meta)}
-.session-card.is-full .sc-level{color:var(--full-card-text)}
-.session-card.is-full .slot-dot{background:var(--full-card-border)!important}
+.session-card.is-full .slot-dot{background:var(--full-card-dot)!important}
 .session-card.is-full .sc-status.full{
   background:var(--full-badge-bg);color:var(--full-badge-text);
-  padding:2px 8px;border-radius:999px;font-size:10px;font-weight:800;
-  letter-spacing:.06em;text-transform:uppercase;line-height:1.3;
+  padding:1px 6px;border-radius:999px;font-size:9px;font-weight:700;
+  letter-spacing:.05em;text-transform:uppercase;line-height:1.35;
 }
 .session-card.is-full .book-btn.is-disabled{
   background:var(--full-book-bg);border-color:var(--full-book-border);color:var(--full-book-text);
@@ -716,7 +721,7 @@ const STORAGE = {
 };
 
 const SW_CACHE_VERSION = '10';
-const APP_SHELL_BUILD = '2026-07-30-slot-count-v10';
+const APP_SHELL_BUILD = '2026-07-30-full-card-hierarchy-v10';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;

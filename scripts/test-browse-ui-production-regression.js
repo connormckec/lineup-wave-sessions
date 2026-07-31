@@ -38,7 +38,8 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
   assert.match(html, /renderSelectedDateLabel/);
   assert.match(html, /Book now/);
   assert.doesNotMatch(html, /Book at Atlantic Park/);
-  assert.match(html, /--full-card-bg/);
+  assert.match(html, /--full-card-dot/);
+  assert.match(html, /font-size:9px;font-weight:700/);
   assert.match(html, /book-btn is-disabled/);
   assert.match(html, /\.sc-status\.full/);
   assert.match(html, /isFull \? 'full'/);

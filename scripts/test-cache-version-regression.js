@@ -74,7 +74,7 @@ function extractConst(source, name) {
 }
 
 {
-  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-slot-count-v10'"));
+  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-full-card-hierarchy-v10'"));
   assert.ok(html.includes('id="live-panel"'));
   assert.ok(html.includes('id="day-rail"'));
   assert.ok(html.includes('class="watch-btn'));
