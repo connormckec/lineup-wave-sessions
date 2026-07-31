@@ -539,10 +539,11 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/lineup-config.js?v=13"></script>
-<script src="/browse-session-filters.js?v=13"></script>
-<script src="/browse-live-schedule.js?v=13"></script>
-<script src="/browse-ui-semantics.js?v=13"></script>
+<script src="/lineup-config.js?v=14"></script>
+<script src="/browse-session-filters.js?v=14"></script>
+<script src="/browse-live-schedule.js?v=14"></script>
+<script src="/browse-availability-view.js?v=14"></script>
+<script src="/browse-ui-semantics.js?v=14"></script>
 <div id="app">
 
   <header id="header">
@@ -704,6 +705,7 @@ const LB = () => window.LineupBrowse || {};
 const SEM = () => LB().semantics;
 const BLS = () => LB().liveSchedule;
 const BSF = () => LB().sessionFilters;
+const AV = () => LB().availabilityView;
 const bookingTimeZone = () => window.LineupConfig?.BOOKING_TZ || 'America/New_York';
 
 const STORAGE = {
@@ -716,8 +718,8 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '13';
-const APP_SHELL_BUILD = '2026-07-31-live-compact-v13';
+const SW_CACHE_VERSION = '14';
+const APP_SHELL_BUILD = '2026-07-31-availability-view-v14';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
@@ -2046,27 +2048,68 @@ function sessionsForSelectedDate() {
   return asSessionArray(selectedDateSessions);
 }
 
-function browseSessionPool() {
-  if (selectedDateSessions.length) return sessionsForSelectedDate();
-  return surfSessions().filter(s => dateKeyFromSession(s) === activeDayKey);
+function browseSessionPoolForDay(isoDate) {
+  if (isoDate === activeDayKey && selectedDateSessions.length) return sessionsForSelectedDate();
+  return surfSessions(allKnownSessions()).filter((s) => dateKeyFromSession(s) === isoDate);
 }
 
-function visibleBrowseSessions() {
-  let filtered = browseSessionPool().filter(isSurfSession);
+function applyBrowseFilters(sessions, { dayKey = activeDayKey } = {}) {
+  let filtered = sessions.filter(isSurfSession);
   filtered = filtered.filter(matchesWaveFilter);
-  if (activeLevels.size) filtered = filtered.filter(s => activeLevels.has(s.level));
-  filtered = filtered.filter(s => matchesTimeRange(s, filterFromH, filterToH));
-  filtered = filtered.filter(s => isSessionUpcoming(s, activeDayKey));
+  if (activeLevels.size) filtered = filtered.filter((s) => activeLevels.has(s.level));
+  filtered = filtered.filter((s) => matchesTimeRange(s, filterFromH, filterToH));
+  filtered = filtered.filter((s) => isSessionUpcoming(s, dayKey));
   const sem = SEM();
-  if (sem && activeDayKey === todayKey()) {
+  if (sem && dayKey === todayKey()) {
     const nowMs = Date.now();
     filtered = filtered.filter((s) => !sem.isSessionLive(s, nowMs) && !sem.isSessionPast(s, nowMs));
   }
   return filtered;
 }
 
+function visibleBrowseSessionsForDay(isoDate) {
+  return applyBrowseFilters(browseSessionPoolForDay(isoDate), { dayKey: isoDate });
+}
+
+function visibleBrowseSessions() {
+  return visibleBrowseSessionsForDay(activeDayKey);
+}
+
+function sessionAvailabilityViewModel(session) {
+  const av = AV();
+  if (av?.getSessionAvailabilityViewModel) return av.getSessionAvailabilityViewModel(session);
+  return {
+    spotsLeft: session?.slots ?? null,
+    capacity: sessionCapacity(session?.level, session),
+    isOpen: !!session?.available,
+    isFull: session?.available === false,
+    hasTrustedCount: false,
+    spotsLabel: session?.available ? 'Open' : 'Full',
+    statusLabel: session?.available ? 'Open' : 'Full',
+    inventoryKind: session?.available ? 'unverified' : 'full',
+  };
+}
+
+function countOpenSessionsForDay(isoDate) {
+  const av = AV();
+  const sessions = visibleBrowseSessionsForDay(isoDate);
+  if (av?.countOpenSessions) return av.countOpenSessions(sessions);
+  return sessions.filter((s) => sessionAvailabilityViewModel(s).isOpen).length;
+}
+
 function visibleOpenSessions() {
-  return visibleBrowseSessions().filter(s => s.available);
+  return visibleBrowseSessions().filter((s) => sessionAvailabilityViewModel(s).isOpen);
+}
+
+function assertOpenCountConsistency(visible, openCount) {
+  if (typeof console === 'undefined' || !console.assert) return;
+  const av = AV();
+  if (!av?.getSessionAvailabilityViewModel) return;
+  const cardOpenCount = visible.filter((s) => av.getSessionAvailabilityViewModel(s).isOpen).length;
+  console.assert(
+    cardOpenCount === openCount,
+    `[browse] open count mismatch: cards=${cardOpenCount} summary=${openCount}`,
+  );
 }
 
 function browseCountLabel(visible) {
@@ -2074,7 +2117,7 @@ function browseCountLabel(visible) {
   const dateWord = activeDayKey === tk
     ? 'today'
     : (activeDayKey === tomorrowKey() ? 'tomorrow' : dateLabel(activeDayKey));
-  const openCount = visible.filter(s => s.available).length;
+  const openCount = visible.filter((s) => sessionAvailabilityViewModel(s).isOpen).length;
   const total = visible.length;
 
   let countPart;
@@ -2088,7 +2131,7 @@ function browseCountLabel(visible) {
 
   if (activeLevels.size === 1) {
     const level = [...activeLevels][0];
-    const levelOpen = visible.filter(s => s.available && activeLevels.has(s.level)).length;
+    const levelOpen = visible.filter((s) => sessionAvailabilityViewModel(s).isOpen && activeLevels.has(s.level)).length;
     const levelTotal = visible.filter(s => activeLevels.has(s.level)).length;
     if (levelOpen > 0) {
       return `${levelOpen} ${level} session${levelOpen === 1 ? '' : 's'} ${dateWord}`;
@@ -2098,13 +2141,13 @@ function browseCountLabel(visible) {
     }
   }
   if (activeWave === 1) {
-    const wOpen = visible.filter(s => s.available && s.wave === 1).length;
+    const wOpen = visible.filter((s) => sessionAvailabilityViewModel(s).isOpen && s.wave === 1).length;
     const wTotal = visible.filter(s => s.wave === 1).length;
     if (wOpen > 0) return `${wOpen} Left Wave session${wOpen === 1 ? '' : 's'} ${dateWord}`;
     if (wTotal > 0) return `${wTotal} Left Wave session${wTotal === 1 ? '' : 's'} ${dateWord} · none open`;
   }
   if (activeWave === 2) {
-    const wOpen = visible.filter(s => s.available && s.wave === 2).length;
+    const wOpen = visible.filter((s) => sessionAvailabilityViewModel(s).isOpen && s.wave === 2).length;
     const wTotal = visible.filter(s => s.wave === 2).length;
     if (wOpen > 0) return `${wOpen} Right Wave session${wOpen === 1 ? '' : 's'} ${dateWord}`;
     if (wTotal > 0) return `${wTotal} Right Wave session${wTotal === 1 ? '' : 's'} ${dateWord} · none open`;
@@ -2806,9 +2849,11 @@ function renderDayRail() {
   renderSelectedDateLabel();
   updateDateNavButtons();
   const rail = document.getElementById('day-rail');
-  const sem = SEM();
-  if (!rail || !sem) return;
-  const days = sem.computeDayRailOpenCounts(allKnownSessions(), buildDayRailEntries(), { nowMs: Date.now() });
+  if (!rail) return;
+  const days = buildDayRailEntries().map((day) => ({
+    ...day,
+    openCount: countOpenSessionsForDay(day.isoDate),
+  }));
   rail.innerHTML = days.map((d) => `
     <button type="button" class="day-chip${d.isoDate === activeDayKey ? ' selected' : ''}${dayHasWatchedSessions(d.isoDate) ? ' watched' : ''}" data-day="${d.isoDate}">
       <div class="day-wd">${d.label}</div>
@@ -2818,18 +2863,17 @@ function renderDayRail() {
 }
 
 function selectedDayMetaForSidebar() {
-  const sem = SEM();
   const day = buildDayRailEntries().find((d) => d.isoDate === activeDayKey)
     || { label: dateLabel(activeDayKey), dayNum: '' };
-  if (!sem) {
-    return { day, openCount: visibleOpenSessions().length, verification: { headerText: '', subText: null } };
-  }
-  const openCount = sem.countTrustedOpenSessions(allKnownSessions(), activeDayKey, { nowMs: Date.now() });
-  const verification = sem.computeSelectedDayVerificationSummary(
-    allKnownSessions().filter((s) => dateKeyFromSession(s) === activeDayKey),
-    activeDayKey,
-    { nowMs: Date.now() },
-  );
+  const openCount = countOpenSessionsForDay(activeDayKey);
+  const sem = SEM();
+  const verification = sem
+    ? sem.computeSelectedDayVerificationSummary(
+      allKnownSessions().filter((s) => dateKeyFromSession(s) === activeDayKey),
+      activeDayKey,
+      { nowMs: Date.now() },
+    )
+    : { headerText: '', subText: null };
   return { day, openCount, verification };
 }
 
@@ -2875,22 +2919,6 @@ function renderSidebar() {
       <h2>Data status</h2>
       <div class="side-sub">${model.fullText || 'Loading session data…'}</div>
     </div>`;
-}
-
-function dotBarHtmlFromState(state) {
-  const sem = SEM();
-  const dotCount = sem?.DOT_COUNT || 10;
-  let dots = '';
-  if (state.kind === 'unverified') {
-    for (let i = 0; i < dotCount; i++) dots += '<span class="slot-dot unverified"></span>';
-    return `<div class="slot-bar">${dots}</div>`;
-  }
-  const open = Math.min(Math.max(0, state.slots ?? 0), dotCount);
-  const taken = dotCount - open;
-  const openClass = (state.kind === 'scarce' || state.kind === 'packed') ? 'scarce' : (state.kind === 'full' ? '' : 'open');
-  for (let i = 0; i < taken; i++) dots += '<span class="slot-dot"></span>';
-  for (let i = 0; i < open; i++) dots += `<span class="slot-dot ${openClass}"></span>`;
-  return `<div class="slot-bar">${dots}</div>`;
 }
 
 function cardVerifiedLabel(s) {
@@ -3117,6 +3145,7 @@ function renderBrowse() {
   }
 
   filtered.sort((a, b) => a.ts - b.ts);
+  assertOpenCountConsistency(filtered, countOpenSessionsForDay(activeDayKey));
   const refreshingNote = selectedDateMeta.isLoading
     ? '<div class="fallback-note">Refreshing…</div>'
     : '';
@@ -3126,17 +3155,24 @@ function renderBrowse() {
   listEl.innerHTML = refreshingNote + fallbackNote + filtered.map(sessionCardHtml).join('');
 }
 
+function availabilityDotBarHtml(viewModel) {
+  const av = AV();
+  if (av?.buildAvailabilityDotBarHtml) return av.buildAvailabilityDotBarHtml(viewModel);
+  return '';
+}
+
 function sessionCardHtml(s) {
-  const sem = SEM();
+  const vm = sessionAvailabilityViewModel(s);
   const cfg = LEVELS[s.level] || { s: '?', c: '#64748b' };
-  const state = sem ? sem.inventoryState(s) : { kind: s.available ? 'healthy' : 'full', label: s.available ? 'Open' : 'Full', slots: s.slots ?? null };
-  const isFull = state.kind === 'full';
+  const isFull = vm.isFull;
   const watched = isWatched(s.key);
+  const sem = SEM();
   const watch = sem
     ? sem.watchLabelForSession(s, watched, alertsEnabled())
     : { label: watched ? 'Watching' : 'Watch', disabled: !alertsEnabled() };
   const watchClass = watch.disabled ? 'off' : (watched ? 'watching' : '');
-  const statusLabel = isFull ? 'FULL' : state.label;
+  const actionStatus = isFull ? 'FULL' : 'Open';
+  const dotLabel = vm.hasTrustedCount ? (vm.spotsLabel || 'Open') : (isFull ? 'Full' : 'Open');
   const payload = sessionWatchPayload(s);
 
   return `<article class="sc session-card${watched ? ' watching' : ''}${isFull ? ' is-full' : ''}" style="--level-color:${cfg.c}">
@@ -3144,11 +3180,11 @@ function sessionCardHtml(s) {
     <div class="sc-main">
       <div class="sc-row-top">
         <div class="sc-time">${(s.time || '').replace(/\s*(am|pm)/i, (m) => m.toLowerCase())}</div>
-        <div class="sc-status ${isFull ? 'full' : state.kind}">${statusLabel}</div>
+        <div class="sc-status ${isFull ? 'full' : vm.inventoryKind}">${actionStatus}</div>
       </div>
       <div class="sc-level">${s.level || s.session_type || 'Session'}</div>
       <div class="sc-wave">${s.waveSide || waveLabel(s.wave)}</div>
-      <div class="sc-dots-row">${dotBarHtmlFromState(state)}<span class="sc-dot-label">${isFull ? 'Full' : state.label}</span></div>
+      <div class="sc-dots-row">${availabilityDotBarHtml(vm)}<span class="sc-dot-label">${dotLabel}</span></div>
       <div class="sc-verified">${cardVerifiedLabel(s)}</div>
     </div>
     <div class="sc-side">

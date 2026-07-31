@@ -173,7 +173,10 @@ const allSessions = [
 {
   const visible = visibleBrowseSessions(allSessions, { showLessons: false });
   const renderedCount = visible.length;
-  const openCount = visible.filter((s) => s.available).length;
+  const openCount = visible.filter((s) => {
+    const AV = require('../lib/browse-availability-view');
+    return AV.getSessionAvailabilityViewModel(s).isOpen;
+  }).length;
   assert.strictEqual(renderedCount, 2, '8a. visible count matches filtered cards');
   assert.strictEqual(openCount, 2, '8b. open count matches available filtered cards');
 }

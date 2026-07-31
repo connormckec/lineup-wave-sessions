@@ -232,9 +232,10 @@ function atLocal(isoDate, clock) {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=13'), 'index loads browse-live-schedule');
-  assert.ok(html.includes('/lineup-config.js?v=13'), 'index loads lineup-config');
-  assert.ok(html.includes('/browse-session-filters.js?v=13'), 'filters load before live schedule');
+  assert.ok(html.includes('/browse-live-schedule.js?v=14'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/browse-availability-view.js?v=14'), 'index loads availability view');
+  assert.ok(html.includes('/lineup-config.js?v=14'), 'index loads lineup-config');
+  assert.ok(html.includes('/browse-session-filters.js?v=14'), 'filters load before live schedule');
   assert.ok(html.indexOf('/browse-session-filters.js') < html.indexOf('/browse-live-schedule.js'), 'script order');
   assert.ok(html.includes('live-summary'), 'compact live summary markup');
   assert.ok(!html.includes('live-watch-btn'), 'live panel has no watch buttons');

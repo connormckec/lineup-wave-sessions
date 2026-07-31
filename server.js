@@ -77,6 +77,10 @@ app.get('/lineup-config.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'lineup-config.js'));
 });
+app.get('/browse-availability-view.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'browse-availability-view.js'));
+});
 app.get('/browse-session-filters.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'browse-session-filters.js'));
