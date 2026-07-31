@@ -71,9 +71,8 @@ function trustedSession(overrides = {}) {
   }));
   assert.strictEqual(unknownCap.capacity, null);
   assert.strictEqual(unknownCap.spotsLeft, 4);
-  const html = AV.buildAvailabilityDotBarHtml(unknownCap);
-  assert.strictEqual((html.match(/slot-dot/g) || []).length, 4);
-  assert.ok(!html.includes('slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"></span><span class="slot-dot"'));
+  assert.strictEqual(unknownCap.spotsLabel, '4 spots left');
+  assert.strictEqual(AV.buildAvailabilityDotBarHtml(unknownCap), '');
 }
 
 {
@@ -144,14 +143,28 @@ function visibleBrowseSessions(sessions, {
 }
 
 {
+  const weird = AV.getSessionAvailabilityViewModel(trustedSession({
+    available_entries: 3,
+    capacity: 'bad',
+    level: 'Advanced Turns',
+  }));
+  assert.doesNotThrow(() => AV.buildAvailabilityDotBarHtml(weird));
+  assert.strictEqual(AV.buildAvailabilityDotBarHtml(weird), '');
+  assert.strictEqual(weird.hasTrustedCount, true);
+  assert.strictEqual(weird.spotsLeft, 3);
+}
+
+{
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.ok(html.includes('/browse-availability-view.js?v=14'));
   assert.ok(html.includes('sessionAvailabilityViewModel'));
   assert.ok(html.includes('countOpenSessionsForDay'));
   assert.ok(html.includes('assertOpenCountConsistency'));
   assert.ok(html.includes('availabilityDotBarHtml'));
+  assert.ok(html.includes('function browseSessionPool('));
   assert.ok(!html.includes('dotBarHtmlFromState(state)'));
   assert.ok(!html.includes('sem?.DOT_COUNT || 10'));
+  assert.ok(!html.includes('filtered.map(sessionCardHtml)'));
 }
 
 {

@@ -2053,7 +2053,13 @@ function browseSessionPoolForDay(isoDate) {
   return surfSessions(allKnownSessions()).filter((s) => dateKeyFromSession(s) === isoDate);
 }
 
+function browseSessionPool() {
+  return browseSessionPoolForDay(activeDayKey);
+}
+
 function applyBrowseFilters(sessions, { dayKey = activeDayKey } = {}) {
+  // Pipeline: surf sessions → lessons/wave → level → time → upcoming/live exclusion.
+  // Do not filter by isOpen; full sessions stay visible in the main list.
   let filtered = sessions.filter(isSurfSession);
   filtered = filtered.filter(matchesWaveFilter);
   if (activeLevels.size) filtered = filtered.filter((s) => activeLevels.has(s.level));
@@ -3124,7 +3130,7 @@ function renderBrowse() {
     const reason = selectedDateMeta.statusReason;
     let msg;
     if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'fallback_sessions_found' || selectedDateMeta.hasSavedSessions) {
-      msg = 'No sessions match these filters';
+      msg = 'No sessions match these filters.';
     } else if (reason === 'checked_no_sessions') {
       msg = 'No sessions found for this date';
     } else if (reason === 'not_checked' && !selectedDateMeta.isLoading) {
@@ -3144,7 +3150,7 @@ function renderBrowse() {
     return;
   }
 
-  filtered.sort((a, b) => a.ts - b.ts);
+  filtered.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
   assertOpenCountConsistency(filtered, countOpenSessionsForDay(activeDayKey));
   const refreshingNote = selectedDateMeta.isLoading
     ? '<div class="fallback-note">Refreshing…</div>'
@@ -3152,7 +3158,19 @@ function renderBrowse() {
   const fallbackNote = (!selectedDateMeta.isLoading && (selectedDateMeta.isFallback || selectedDateMeta.statusReason === 'fallback_sessions_found'))
     ? '<div class="fallback-note">Showing saved snapshot</div>'
     : '';
-  listEl.innerHTML = refreshingNote + fallbackNote + filtered.map(sessionCardHtml).join('');
+  const cards = [];
+  for (const session of filtered) {
+    try {
+      cards.push(sessionCardHtml(session));
+    } catch (err) {
+      console.warn('[sessionCard]', session?.key, err);
+    }
+  }
+  if (!cards.length && filtered.length) {
+    listEl.innerHTML = '<div class="empty">Could not render sessions.</div>';
+    return;
+  }
+  listEl.innerHTML = refreshingNote + fallbackNote + cards.join('');
 }
 
 function availabilityDotBarHtml(viewModel) {
@@ -3162,9 +3180,10 @@ function availabilityDotBarHtml(viewModel) {
 }
 
 function sessionCardHtml(s) {
+  if (!s) return '';
   const vm = sessionAvailabilityViewModel(s);
   const cfg = LEVELS[s.level] || { s: '?', c: '#64748b' };
-  const isFull = vm.isFull;
+  const isFull = !!vm.isFull;
   const watched = isWatched(s.key);
   const sem = SEM();
   const watch = sem

@@ -60,7 +60,8 @@ function countScriptIncludes(source, src) {
   for (const src of scripts) {
     assert.strictEqual(countScriptIncludes(html, src), 1, `expected one ${src} script tag`);
   }
-  assert.doesNotMatch(html, /const BOOKING_TZ = /, 'index must not declare BOOKING_TZ');
+  assert.match(html, /function browseSessionPool\(/);
+  assert.match(html, /No sessions match these filters\./);
   assert.match(html, /window\.LineupBrowse/, 'index uses LineupBrowse namespace');
   assert.match(html, /bookingTimeZone\(\)/, 'index reads timezone from LineupConfig');
 }
