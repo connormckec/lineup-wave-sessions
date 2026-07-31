@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const adaptiveSchedule = require('../lib/adaptive-threshold-schedule');
+const supportedHorizon = require('../lib/supported-horizon-config');
 const marketObservations = require('../lib/market-observations');
 const sessionChangeEvents = require('../lib/session-change-events');
 
@@ -39,19 +40,19 @@ async function runTests() {
   assert.strictEqual(due.cadenceSource, 'watch_priority');
 }
 
-// 2. Unwatched same-day session becomes due after 10 minutes.
+// 2. Unwatched same-day session becomes due after 30 minutes.
 {
   const now = new Date('2026-07-26T18:00:00.000Z');
   const s = session({
     ts: Math.floor(new Date('2026-07-26T20:00:00.000Z').getTime() / 1000),
-    threshold_scanned_at: '2026-07-26T17:51:00.000Z',
+    threshold_scanned_at: '2026-07-26T17:31:00.000Z',
   });
   const notDue = adaptiveSchedule.evaluateInventorySchedule(s, { watched: false, now });
-  assert.strictEqual(notDue.targetFreshnessMinutes, 10);
+  assert.strictEqual(notDue.targetFreshnessMinutes, 30);
   assert.strictEqual(notDue.due, false);
   const due = adaptiveSchedule.evaluateInventorySchedule(session({
     ...s,
-    threshold_scanned_at: '2026-07-26T17:50:00.000Z',
+    threshold_scanned_at: '2026-07-26T17:29:00.000Z',
   }), { watched: false, now });
   assert.strictEqual(due.due, true);
   assert.strictEqual(due.cadenceSource, 'general_proximity');
@@ -71,28 +72,31 @@ async function runTests() {
   assert.strictEqual(evalResult.due, true);
 }
 
-// 4. Far-future unwatched session does not trigger near-term date scan.
+// 4. Far-future unwatched session beyond supported horizon does not trigger date scan.
 {
   const now = new Date('2026-07-26T18:00:00.000Z');
   const far = session({
-    isoDate: '2026-08-20',
-    dateKey: '2026-08-20',
-    ts: Math.floor(new Date('2026-08-20T12:00:00.000Z').getTime() / 1000),
+    isoDate: '2026-09-01',
+    dateKey: '2026-09-01',
+    ts: Math.floor(new Date('2026-09-01T12:00:00.000Z').getTime() / 1000),
     threshold_scanned_at: null,
   });
+  const horizon = supportedHorizon.resolveSupportedHorizon({ todayIso: '2026-07-26' });
   const dueScan = adaptiveSchedule.collectDueDateScanCandidates([far], {
     watchKeys: new Set(),
     now,
     todayIso: '2026-07-26',
-    daysFromTodayFn: () => 25,
+    daysFromTodayFn: () => 36,
+    horizon,
   });
   assert.strictEqual(dueScan.candidates.length, 0);
   assert.strictEqual(
     adaptiveSchedule.isDateWithinNearTermDateScan({
-      isoDate: '2026-08-20',
+      isoDate: '2026-09-01',
       watched: false,
       todayIso: '2026-07-26',
-      daysFromTodayFn: () => 25,
+      daysFromTodayFn: () => 36,
+      horizon,
     }),
     false,
   );

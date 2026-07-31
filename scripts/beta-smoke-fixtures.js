@@ -4,8 +4,66 @@ function isoDateInTimeZone(timeZone) {
   return new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date());
 }
 
+function addDaysToIso(isoDate, days) {
+  const [y, m, d] = String(isoDate).slice(0, 10).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
+  return dt.toISOString().slice(0, 10);
+}
+
+function minutesFromMidnightEt(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  }).formatToParts(date);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? 0);
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
+  return hour * 60 + minute;
+}
+
+function clockEtFromMinutes(totalMinutes) {
+  const h24 = Math.floor(totalMinutes / 60) % 24;
+  const minute = totalMinutes % 60;
+  const h12 = h24 % 12 || 12;
+  const ampm = h24 < 12 ? 'am' : 'pm';
+  return `${h12}:${String(minute).padStart(2, '0')} ${ampm}`;
+}
+
 function sessionTs(isoDate, clockEt) {
   return Math.floor(Date.parse(`${isoDate}T${clockEt}-04:00`) / 1000);
+}
+
+function sessionTsFromMinutes(isoDate, totalMinutes) {
+  const h24 = Math.floor(totalMinutes / 60) % 24;
+  const minute = totalMinutes % 60;
+  return sessionTs(
+    isoDate,
+    `${String(h24).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`,
+  );
+}
+
+function resolveFixtureSchedule(isoDate = isoDateInTimeZone('America/New_York')) {
+  let fixtureDate = isoDate;
+  let baseMinutes = minutesFromMidnightEt();
+  const latestStart = 22 * 60;
+  const spacing = 60;
+  const neededSpan = spacing * 4;
+  if (baseMinutes + neededSpan > latestStart) {
+    fixtureDate = addDaysToIso(isoDate, 1);
+    baseMinutes = 10 * 60;
+  }
+  const openMinutes = baseMinutes + spacing;
+  const fullMinutes = baseMinutes + spacing * 2;
+  const lessonMinutes = baseMinutes + spacing * 3;
+  const badMinutes = baseMinutes + spacing * 4;
+  return {
+    fixtureDate,
+    openMinutes,
+    fullMinutes,
+    lessonMinutes,
+    badMinutes,
+  };
 }
 
 function trustedFields(overrides = {}) {
@@ -21,10 +79,12 @@ function trustedFields(overrides = {}) {
 }
 
 function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York')) {
-  const openTs = sessionTs(isoDate, '14:00:00');
-  const fullTs = sessionTs(isoDate, '15:00:00');
-  const lessonTs = sessionTs(isoDate, '16:00:00');
-  const badTs = sessionTs(isoDate, '17:00:00');
+  const schedule = resolveFixtureSchedule(isoDate);
+  const fixtureDate = schedule.fixtureDate;
+  const openTs = sessionTsFromMinutes(fixtureDate, schedule.openMinutes);
+  const fullTs = sessionTsFromMinutes(fixtureDate, schedule.fullMinutes);
+  const lessonTs = sessionTsFromMinutes(fixtureDate, schedule.lessonMinutes);
+  const badTs = sessionTsFromMinutes(fixtureDate, schedule.badMinutes);
 
   const openKey = `${openTs}_1`;
   const fullKey = `${fullTs}_2`;
@@ -33,11 +93,11 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   const openSession = {
     key: openKey,
     session_key: openKey,
-    iso_date: isoDate,
-    isoDate,
-    dateKey: isoDate,
+    iso_date: fixtureDate,
+    isoDate: fixtureDate,
+    dateKey: fixtureDate,
     ts: openTs,
-    time: '2:00 pm',
+    time: clockEtFromMinutes(schedule.openMinutes),
     level: 'Progressive',
     wave: 1,
     waveSide: 'Left Wave',
@@ -50,11 +110,11 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   const fullSession = {
     key: fullKey,
     session_key: fullKey,
-    iso_date: isoDate,
-    isoDate,
-    dateKey: isoDate,
+    iso_date: fixtureDate,
+    isoDate: fixtureDate,
+    dateKey: fixtureDate,
     ts: fullTs,
-    time: '3:00 pm',
+    time: clockEtFromMinutes(schedule.fullMinutes),
     level: 'Advanced Turns',
     wave: 2,
     waveSide: 'Right Wave',
@@ -68,11 +128,11 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   const lessonSession = {
     key: lessonKey,
     session_key: lessonKey,
-    iso_date: isoDate,
-    isoDate,
-    dateKey: isoDate,
+    iso_date: fixtureDate,
+    isoDate: fixtureDate,
+    dateKey: fixtureDate,
     ts: lessonTs,
-    time: '4:00 pm',
+    time: clockEtFromMinutes(schedule.lessonMinutes),
     level: 'Progressive Lesson',
     wave: 3,
     waveSide: 'Left Lesson',
@@ -85,9 +145,9 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   const malformedSession = {
     key: 'malformed-card-row',
     session_key: 'malformed-card-row',
-    iso_date: isoDate,
-    isoDate,
-    dateKey: isoDate,
+    iso_date: fixtureDate,
+    isoDate: fixtureDate,
+    dateKey: fixtureDate,
     ts: badTs,
     time: { invalid: 'object breaks replace()' },
     level: 'Progressive',
@@ -122,8 +182,8 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   };
 
   function sessionsResponse(date) {
-    const dateKey = date || isoDate;
-    const rows = dateKey === isoDate ? sessions : [];
+    const dateKey = date || fixtureDate;
+    const rows = dateKey === fixtureDate ? sessions : [];
     return {
       ok: true,
       date: dateKey,
@@ -146,9 +206,9 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
     const byDate = {};
     for (const day of enumerateDates(startDate, endDate)) {
       byDate[day] = {
-        statusReason: day === isoDate ? 'saved_sessions_found' : 'not_checked',
-        sessionsCount: day === isoDate ? sessions.length : 0,
-        lastCheckedAt: day === isoDate ? statusPayload.lastSuccessfulScrape : null,
+        statusReason: day === fixtureDate ? 'saved_sessions_found' : 'not_checked',
+        sessionsCount: day === fixtureDate ? sessions.length : 0,
+        lastCheckedAt: day === fixtureDate ? statusPayload.lastSuccessfulScrape : null,
       };
     }
     return {
@@ -165,10 +225,10 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
       id: 'watch-smoke-1',
       session_key: openKey,
       key: openKey,
-      iso_date: isoDate,
-      dateKey: isoDate,
+      iso_date: fixtureDate,
+      dateKey: fixtureDate,
       ts: openTs,
-      time: '2:00 pm',
+      time: clockEtFromMinutes(schedule.openMinutes),
       level: 'Progressive',
       wave: 1,
       waveSide: 'Left Wave',
@@ -179,7 +239,7 @@ function buildBetaSmokeFixtures(isoDate = isoDateInTimeZone('America/New_York'))
   }
 
   return {
-    isoDate,
+    isoDate: fixtureDate,
     openKey,
     fullKey,
     lessonKey,

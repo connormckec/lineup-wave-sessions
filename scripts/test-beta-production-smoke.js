@@ -14,6 +14,7 @@ const TEST_PORT = 3099;
 const PROFILE_CODE = 'test-profile-alpha-001';
 const FIXTURE_DATE = isoDateInTimeZone('America/New_York');
 const FIXTURES = buildBetaSmokeFixtures(FIXTURE_DATE);
+const ACTIVE_FIXTURE_DATE = FIXTURES.isoDate;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,8 +67,8 @@ function createMockState() {
         id: `watch-${Date.now()}`,
         session_key: payload.session_key || payload.key,
         key: payload.session_key || payload.key,
-        iso_date: payload.iso_date || payload.dateKey || FIXTURE_DATE,
-        dateKey: payload.dateKey || payload.iso_date || FIXTURE_DATE,
+        iso_date: payload.iso_date || payload.dateKey || ACTIVE_FIXTURE_DATE,
+        dateKey: payload.dateKey || payload.iso_date || ACTIVE_FIXTURE_DATE,
         ts: payload.ts || payload.start_ts,
         time: payload.time,
         level: payload.level || payload.session_type,
@@ -202,7 +203,7 @@ async function waitForBrowseReady(page) {
   await page.waitForFunction(() => (
     typeof window.LineupBrowse?.semantics?.computeLiveNowSummary === 'function'
     && document.getElementById('session-list')
-    && document.querySelectorAll('#session-list .sc').length > 0
+    && document.querySelectorAll('#session-list .sc').length >= 2
   ), { timeout: 15000 });
 }
 
@@ -253,7 +254,7 @@ async function collectBrowseState(page) {
         localStorage.setItem('ap_profile_code', profileCode);
         localStorage.setItem('ap_show_lessons', '0');
         localStorage.removeItem('ap_watchlist');
-      }, { isoDate: FIXTURE_DATE, profileCode: PROFILE_CODE });
+      }, { isoDate: ACTIVE_FIXTURE_DATE, profileCode: PROFILE_CODE });
 
       await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
       await waitForBrowseReady(page);

@@ -4,6 +4,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const adaptiveSchedule = require('../lib/adaptive-threshold-schedule');
+const supportedHorizon = require('../lib/supported-horizon-config');
 const maintenanceQueries = require('../lib/maintenance-queries');
 const thresholdDatePipeline = require('../lib/threshold-date-pipeline');
 const thresholdWorkerClaim = require('../lib/threshold-worker-claim');
@@ -30,12 +31,15 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
   return Math.round((a - b) / (24 * 3600 * 1000));
 }
 
-// 1. General horizon extends to 168 hours (not 72).
+const defaultHorizon = supportedHorizon.resolveSupportedHorizon({ todayIso: '2026-07-27' });
+
+// 1. General horizon matches canonical scrape window (28 days default).
 {
-  assert.strictEqual(adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL, 168);
+  assert.strictEqual(adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL, defaultHorizon.thresholdScanMaxHours);
+  assert.strictEqual(adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL, 28 * 24);
 }
 
-// 2. Ordinary session 94 hours away uses 120-minute cadence and is near-term eligible.
+// 2. Ordinary session 94 hours away uses 360-minute cadence and is eligible.
 {
   const now = new Date('2026-07-27T12:00:00.000Z');
   const ts = Math.floor(new Date('2026-07-31T10:00:00.000Z').getTime() / 1000);
@@ -47,7 +51,7 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
   });
   const evalResult = adaptiveSchedule.evaluateInventorySchedule(s, { watched: false, now });
   assert.ok((evalResult.hoursUntilStart ?? 0) > 72 && (evalResult.hoursUntilStart ?? 0) <= 168, 'session is in 72–168h band');
-  assert.strictEqual(evalResult.targetFreshnessMinutes, 120);
+  assert.strictEqual(evalResult.targetFreshnessMinutes, 360);
   assert.strictEqual(evalResult.due, true);
 
   const dueScan = adaptiveSchedule.collectDueDateScanCandidates([s], {
@@ -55,12 +59,13 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
     now,
     todayIso: '2026-07-27',
     daysFromTodayFn,
+    horizon: defaultHorizon,
   });
   assert.strictEqual(dueScan.candidates.length, 1);
   assert.strictEqual(dueScan.candidates[0].isoDate, '2026-07-31');
 }
 
-// 3. Ordinary session 170 hours away is not near-term eligible.
+// 3. Ordinary session 170 hours away is eligible within full horizon with 1440-minute cadence.
 {
   const now = new Date('2026-07-27T12:00:00.000Z');
   const ts = Math.floor(new Date('2026-08-03T14:00:00.000Z').getTime() / 1000);
@@ -71,13 +76,18 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
     threshold_scanned_at: null,
   });
   assert.ok((adaptiveSchedule.hoursUntilSessionStart(s, now) ?? 0) > 168);
+  assert.strictEqual(
+    adaptiveSchedule.evaluateInventorySchedule(s, { watched: false, now }).targetFreshnessMinutes,
+    1440,
+  );
   const dueScan = adaptiveSchedule.collectDueDateScanCandidates([s], {
     watchKeys: new Set(),
     now,
     todayIso: '2026-07-27',
     daysFromTodayFn,
+    horizon: defaultHorizon,
   });
-  assert.strictEqual(dueScan.candidates.length, 0);
+  assert.strictEqual(dueScan.candidates.length, 1);
   assert.strictEqual(
     adaptiveSchedule.isDateWithinNearTermDateScan({
       isoDate: '2026-08-03',
@@ -85,8 +95,9 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
       todayIso: '2026-07-27',
       daysFromTodayFn,
       hoursUntilStart: adaptiveSchedule.hoursUntilSessionStart(s, now),
+      horizon: defaultHorizon,
     }),
-    false,
+    true,
   );
 }
 
@@ -112,13 +123,14 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
     now,
     todayIso: '2026-07-27',
     daysFromTodayFn,
+    horizon: defaultHorizon,
   });
   assert.ok(dueScan.topCandidate);
   assert.strictEqual(dueScan.topCandidate.isoDate, '2026-08-02');
   assert.ok(dueScan.topCandidate.watchedDueCount >= 1);
 }
 
-// 5. <=72-hour general cadence remains unchanged (10m same-day, 30m inside 72h).
+// 5. <=72-hour general cadence uses 30m same-day and 120m inside 72h.
 {
   const now = new Date('2026-07-27T18:00:00.000Z');
   const sameDay = session({
@@ -131,11 +143,11 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
   });
   assert.strictEqual(
     adaptiveSchedule.evaluateInventorySchedule(sameDay, { watched: false, now }).targetFreshnessMinutes,
-    10,
+    30,
   );
   assert.strictEqual(
     adaptiveSchedule.evaluateInventorySchedule(within72, { watched: false, now }).targetFreshnessMinutes,
-    30,
+    120,
   );
 }
 
@@ -152,20 +164,21 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
       watched: false,
       due: true,
       hoursUntilStart: 94,
-      targetFreshnessMinutes: 120,
+      targetFreshnessMinutes: 360,
       actualFreshnessMinutes: 3000,
       cadenceSource: 'general_proximity',
     }],
   };
   const diag = maintenanceQueries.buildSelectedDateDiagnostics(candidate, {
     remainingDueDateCount: 3,
-    selectionReason: 'general_most_overdue',
+    selectionReason: 'general_normalized_overdue',
+    horizon: defaultHorizon,
   });
   assert.strictEqual(diag.isoDate, '2026-07-31');
   assert.strictEqual(diag.hoursUntilEarliestSession, 94);
-  assert.strictEqual(diag.targetFreshnessMinutes, 120);
+  assert.strictEqual(diag.targetFreshnessMinutes, 360);
   assert.strictEqual(diag.actualFreshnessMinutes, 3000);
-  assert.strictEqual(diag.selectionReason, 'general_most_overdue');
+  assert.ok(diag.normalizedOverdueRatio > 1);
   assert.strictEqual(diag.remainingDueDateCount, 3);
 }
 
@@ -268,6 +281,7 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
     now,
     todayIso: '2026-07-27',
     daysFromTodayFn,
+    horizon: defaultHorizon,
   });
   assert.ok(dueScan.candidates.length >= 3);
   assert.ok(dueScan.topCandidate);

@@ -17,6 +17,9 @@ const adaptiveSchedule = require('./lib/adaptive-threshold-schedule');
 const thresholdDatePipeline = require('./lib/threshold-date-pipeline');
 const thresholdNearTermScheduler = require('./lib/threshold-near-term-scheduler');
 const maintenanceQueries = require('./lib/maintenance-queries');
+const supportedHorizonConfig = require('./lib/supported-horizon-config');
+const calendarNavigation = require('./lib/calendar-navigation');
+const thresholdScanContract = require('./lib/threshold-scan-contract');
 const trustedSessionState = require('./lib/trusted-session-state');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
@@ -524,7 +527,20 @@ function sessionDateKey(s) {
 }
 
 function scrapeWindowDays() {
-  return Math.max(SCRAPE_WEEKS_AHEAD, effectiveWeeksAhead || 1) * 7;
+  return getRuntimeSupportedHorizon().supportedHorizonDays;
+}
+
+function getRuntimeSupportedHorizon(todayIso = getParkTodayIso()) {
+  return supportedHorizonConfig.resolveSupportedHorizon({
+    todayIso,
+    scrapeWeeksAhead: SCRAPE_WEEKS_AHEAD,
+    effectiveWeeksAhead,
+    maxBookingHorizonDays: MAX_BOOKING_HORIZON_DAYS,
+  });
+}
+
+function logThresholdDateScanNavigation(payload) {
+  console.log(JSON.stringify({ thresholdDateScanNavigation: payload }));
 }
 
 function sessionWithinScrapeWindow(s) {
@@ -3910,13 +3926,7 @@ function navigationDirectionForEmptyHeaders(diag, validationTarget) {
 }
 
 function navigationDirectionForVisibleHeaders(visibleHeaders, validationTarget) {
-  if (!visibleHeaders?.length || !validationTarget) return null;
-  if (visibleHeaders.includes(validationTarget)) return null;
-  const min = visibleHeaders[0];
-  const max = visibleHeaders[visibleHeaders.length - 1];
-  if (validationTarget < min) return 'prev';
-  if (validationTarget > max) return 'next';
-  return null;
+  return calendarNavigation.navigationDirectionForVisibleHeaders(visibleHeaders, validationTarget);
 }
 
 function parseVisibleWeekFromMonthAndDayHeaders(monthLabel, dayHeaders) {
@@ -11425,6 +11435,26 @@ async function runDebugEntriesLeftFullScanContract(page, {
   minThreshold = 1,
   maxThreshold = THRESHOLD_SCAN_MAX_DEFAULT,
 } = {}) {
+  if (navigation && navigation.targetDateVisibleFromHeaders !== true) {
+    const navError = navigation.navigationError || 'target_date_not_visible';
+    return {
+      thresholdsScanned: [],
+      visibleTileCountsByThreshold: {},
+      exactCount: 0,
+      atLeastCount: 0,
+      noMatchCount: 0,
+      thresholdStopReason: navError,
+      thresholdScanMaxReached: null,
+      zeroTilesAtThreshold: null,
+      thresholdParseDiagnostics: [],
+      fullScanContractOk: false,
+      inferences: [],
+      maxTested: 0,
+      error: navError,
+      targetDateEvidence: { ok: false, failureReason: navError },
+    };
+  }
+
   const minT = Math.max(1, Number(minThreshold) || 1);
   const maxT = Math.max(
     minT,
@@ -11498,7 +11528,7 @@ async function runDebugEntriesLeftFullScanContract(page, {
   const { inferences, exactCount, atLeastCount, noMatchCount } = inferenceSummary;
 
   const countsNonIncreasing = thresholdCountsNonIncreasing(visibleTileCountsByThreshold, thresholdsScanned);
-  const fullScanContractOk = !scanFailed
+  let fullScanContractOk = !scanFailed
     && thresholdsScanned.length > 0
     && countsNonIncreasing
     && exactCount > 0;
@@ -11512,6 +11542,20 @@ async function runDebugEntriesLeftFullScanContract(page, {
     error = 'visible_tile_counts_increased';
   } else if (exactCount <= 0) {
     error = 'no_exact_inferences';
+  }
+
+  const allTiles = [...tileByIdentity.values()];
+  const { currentSessions } = await fetchGate8CurrentSessionsForIsoDate(isoDate);
+  const targetDateEvidence = thresholdScanContract.validateTargetDateScanEvidence({
+    targetIsoDate: isoDate,
+    visibleHeaders: navigation?.visibleIsoDatesFromHeaders || [],
+    tiles: allTiles,
+    inferences,
+    sessionsOnTargetDate: currentSessions.length,
+  });
+  if (fullScanContractOk && !targetDateEvidence.ok) {
+    fullScanContractOk = false;
+    error = targetDateEvidence.failureReason || 'target_date_identity_mismatch';
   }
 
   return {
@@ -11528,6 +11572,7 @@ async function runDebugEntriesLeftFullScanContract(page, {
     inferences,
     maxTested,
     error,
+    targetDateEvidence,
   };
 }
 
@@ -12398,9 +12443,25 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
   if (!error && thresholdWriteSafe && rowsPrepared.length === 0) {
     error = 'no_rows_prepared_for_write';
   }
+  const prepEvidence = thresholdScanContract.validatePreparedUpdatesForTargetDate(rowsPrepared, isoDate);
+  if (thresholdWriteSafe && !prepEvidence.ok) {
+    error = prepEvidence.failureReason || 'target_date_identity_mismatch';
+  }
+  const contractOk = fullScanRun.fullScanContractOk === true && !error;
+  if (navigation?.navigationLog) {
+    logThresholdDateScanNavigation({
+      ...navigation.navigationLog,
+      targetIsoDate: isoDate,
+      targetDateTileCount: fullScanRun.targetDateEvidence?.targetDateTileCount ?? null,
+      parsedTargetDateSessionCount: fullScanRun.targetDateEvidence?.parsedTargetDateSessionCount ?? null,
+      preparedUpdateCount: rowsPrepared.length,
+      completionReason: contractOk ? 'scan_complete' : null,
+      failureReason: error,
+    });
+  }
 
   return {
-    fullScanContractOk: fullScanRun.fullScanContractOk,
+    fullScanContractOk: contractOk,
     exactCount: fullScanRun.exactCount,
     atLeastCount: fullScanRun.atLeastCount,
     noMatchCount: fullScanRun.noMatchCount,
@@ -12421,6 +12482,8 @@ async function runDebugEntriesLeftThresholdWriteContract(page, {
     unmatchedInferenceSample: matchDiagnostics?.unmatchedInferenceSample ?? [],
     unmatchedCurrentSessionSample: matchDiagnostics?.unmatchedCurrentSessionSample ?? [],
     error,
+    navigation,
+    targetDateEvidence: fullScanRun.targetDateEvidence ?? null,
   };
 }
 
@@ -12447,7 +12510,9 @@ async function navigateGate8ThresholdDate(page, isoDate, weekMode = true) {
     };
   }
   if (!nav.targetDateVisibleFromHeaders) {
-    return { ok: false, nav, error: 'target_date_not_visible' };
+    const navError = nav.navigationError || 'target_date_not_visible';
+    if (nav.navigationLog) logThresholdDateScanNavigation(nav.navigationLog);
+    return { ok: false, nav, error: navError };
   }
 
   await normalizeBookingFiltersOnPage(page).catch(() => {});
@@ -13383,7 +13448,10 @@ async function runGate8DateWriteContractWithRecovery({
   if (recovery.result?.kind === 'nav_error') {
     return {
       launched,
-      writeRun: buildGate8NavFailureWriteRun(recovery.result.error, recovery),
+      writeRun: {
+        ...buildGate8NavFailureWriteRun(recovery.result.error, recovery),
+        navigation: recovery.result.nav ?? null,
+      },
       scanAttemptCount: recovery.scanAttemptCount,
       recoveredFromCrash: recovery.recoveredFromCrash,
       crashReason: recovery.crashReason,
@@ -14380,6 +14448,59 @@ async function enqueueNextMaintenanceDryScan({
   return { ok: true, enqueuedJobs };
 }
 
+async function fetchGeneralScanAdmissionState({
+  withinMs = thresholdDatePipeline.GENERAL_SCAN_ADMISSION_WINDOW_MS,
+} = {}) {
+  if (!supabase) {
+    return thresholdDatePipeline.evaluateGeneralScanAdmission({ recentGeneralEnqueueCount: 0 });
+  }
+  const since = new Date(Date.now() - withinMs).toISOString();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, created_at, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE)
+    .in('status', ['queued', 'running', 'completed'])
+    .gte('created_at', since)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(error.message);
+
+  const generalJobs = (data || []).filter(
+    (job) => Number(job.results_json?.watchedDueCount ?? 0) === 0,
+  );
+  return thresholdDatePipeline.evaluateGeneralScanAdmission({
+    recentGeneralEnqueueCount: generalJobs.length,
+    lastGeneralEnqueueAt: generalJobs[0]?.created_at ?? null,
+  });
+}
+
+async function fetchRecentFarGeneralDateScanCount(todayIso, {
+  withinMs = thresholdDatePipeline.FAR_GENERAL_SCAN_BUDGET_MS,
+} = {}) {
+  if (!supabase) return 0;
+  const since = new Date(Date.now() - withinMs).toISOString();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, dates, created_at, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE)
+    .in('status', ['queued', 'running', 'completed'])
+    .gte('created_at', since);
+  if (error) throw new Error(error.message);
+
+  let count = 0;
+  for (const job of data || []) {
+    const isoDate = job.dates?.[0] || job.results_json?.targetIsoDate;
+    if (!isoDate) continue;
+    const watchedDueCount = Number(job.results_json?.watchedDueCount ?? 0);
+    if (watchedDueCount > 0) continue;
+    const createdDay = dateKeyInBookingTz(new Date(job.created_at));
+    const daysAhead = Math.round(
+      (parseDateKey(isoDate) - parseDateKey(createdDay)) / 86_400_000,
+    );
+    if (daysAhead > 7) count += 1;
+  }
+  return count;
+}
+
 async function fetchActiveDateThresholdScanIsoDates() {
   if (!supabase) return new Set();
   const { data, error } = await supabase
@@ -14496,7 +14617,8 @@ function computeOldestInventoryAges(evaluations = []) {
 async function fetchNearTermSchedulingSessions(instrument = null) {
   if (!supabase) return [];
   const todayIso = getParkTodayIso();
-  const bounds = maintenanceQueries.computeNearTermSchedulingBounds(todayIso, addDaysToParkIso);
+  const horizon = getRuntimeSupportedHorizon(todayIso);
+  const bounds = maintenanceQueries.computeNearTermSchedulingBounds(todayIso, addDaysToParkIso, horizon);
   const runQuery = instrument?.runInstrumentedQuery
     ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
     : async (_name, fn) => ({ ok: true, value: await fn() });
@@ -14520,6 +14642,7 @@ async function fetchNearTermSchedulingSessions(instrument = null) {
 async function fetchNearTermDueSummary(instrument = null) {
   const now = new Date();
   const todayIso = getParkTodayIso();
+  const horizon = getRuntimeSupportedHorizon(todayIso);
   const watchKeys = watchedSessionKeys();
   const sessions = await fetchNearTermSchedulingSessions(instrument);
   const dueScan = maintenanceQueries.collectDueScanFromSchedulingSessions(sessions, {
@@ -14527,8 +14650,58 @@ async function fetchNearTermDueSummary(instrument = null) {
     todayIso,
     daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
     now,
+    horizon,
   });
-  return maintenanceQueries.compactDueScanSummary(dueScan);
+  const recentFarGeneralScanCount = supabase
+    ? await fetchRecentFarGeneralDateScanCount(todayIso)
+    : 0;
+  const generalScanAdmission = supabase
+    ? await fetchGeneralScanAdmissionState()
+    : thresholdDatePipeline.evaluateGeneralScanAdmission({ recentGeneralEnqueueCount: 0 });
+  const selection = thresholdDatePipeline.selectDueDateScanCandidate(dueScan.candidates, {
+    daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+    todayIso,
+    recentFarGeneralScanCount,
+    generalScanAdmission,
+  });
+  const dueScanWithSelection = {
+    ...dueScan,
+    topCandidate: selection.selected,
+  };
+  return {
+    ...maintenanceQueries.compactDueScanSummary(dueScanWithSelection),
+    horizon: {
+      earliestSupportedDate: horizon.earliestSupportedDate,
+      latestSupportedDate: horizon.latestSupportedDate,
+      supportedHorizonDays: horizon.supportedHorizonDays,
+      thresholdScanMaxHours: horizon.thresholdScanMaxHours,
+    },
+    remainingOverdueByCadenceTier: supportedHorizonConfig.remainingOverdueCountByCadenceTier(dueScan.candidates),
+    recentFarGeneralScanCount,
+    farGeneralHourlyBudget: thresholdDatePipeline.FAR_GENERAL_SCAN_BUDGET_PER_HOUR,
+    generalScanAdmission,
+    deferredFarGeneralScan: selection.deferredFarCandidate
+      ? {
+        isoDate: selection.deferredFarCandidate.isoDate,
+        reason: 'far_general_hourly_budget_exhausted',
+        generalPriorityBand: thresholdDatePipeline.resolveGeneralPriorityBand(
+          selection.deferredFarCandidate,
+          { daysFromTodayFn: (isoDate) => daysFromToday(isoDate), todayIso },
+        ),
+      }
+      : null,
+    deferredGeneralScanAdmission: selection.deferredGeneralAdmissionCandidate
+      ? {
+        isoDate: selection.deferredGeneralAdmissionCandidate.isoDate,
+        reason: generalScanAdmission.reason || 'general_scan_budget_exhausted',
+        nextEligibleGeneralScanAt: generalScanAdmission.nextEligibleGeneralScanAt,
+        generalPriorityBand: thresholdDatePipeline.resolveGeneralPriorityBand(
+          selection.deferredGeneralAdmissionCandidate,
+          { daysFromTodayFn: (isoDate) => daysFromToday(isoDate), todayIso },
+        ),
+      }
+      : null,
+  };
 }
 
 async function buildAdaptiveScheduleDiagnostics({
@@ -14558,11 +14731,13 @@ async function buildAdaptiveScheduleDiagnostics({
   const todayIso = getParkTodayIso();
   const watchKeys = watchedSessionKeys();
   const sessions = await fetchNearTermSchedulingSessions(instrument);
+  const horizon = getRuntimeSupportedHorizon(todayIso);
   const dueScan = maintenanceQueries.collectDueScanFromSchedulingSessions(sessions, {
     watchKeys,
     todayIso,
     daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
     now,
+    horizon,
   });
 
   const activeDateScansFetched = await runQuery('active_date_threshold_scans', () => fetchActiveDateThresholdScanIsoDates());
@@ -14714,6 +14889,9 @@ async function enqueueNearTermDateThresholdScan(isoDate, {
     maxThreshold: maxT,
     dryRun: true,
     writeEnabled: false,
+    watchedDueCount,
+    generalDueCount,
+    selectionReason: reason,
   });
   return {
     jobId: enqueued.id,
@@ -14823,7 +15001,11 @@ async function runNearTermMaintenanceTick({
       action: 'none_needed',
       reason: top
         ? 'due_date_already_queued'
-        : (dueBacklog > 0 ? 'due_backlog_no_near_term_candidate' : 'no_due_near_term_dates'),
+        : (dueSummary.deferredGeneralScanAdmission
+          ? dueSummary.deferredGeneralScanAdmission.reason
+          : (dueSummary.deferredFarGeneralScan
+            ? dueSummary.deferredFarGeneralScan.reason
+            : (dueBacklog > 0 ? 'due_backlog_no_near_term_candidate' : 'no_due_near_term_dates'))),
       unhealthy: dueBacklog > 0 && !top,
       dueSummary,
       ...range,
@@ -14840,7 +15022,21 @@ async function runNearTermMaintenanceTick({
   await kickThresholdScanJobWorkerIfIdle();
   const selectedDateDiagnostics = maintenanceQueries.buildSelectedDateDiagnostics(top, {
     remainingDueDateCount: Math.max(0, (dueSummary.dueDateCount || 0) - 1),
-    selectionReason: top.watchedDueCount > 0 ? 'watched_due_priority' : 'general_most_overdue',
+    selectionReason: top.watchedDueCount > 0
+      ? 'watched_due_priority'
+      : `general_band_${thresholdDatePipeline.resolveGeneralPriorityBand(top, {
+        daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+        todayIso: getParkTodayIso(),
+      })}_normalized_overdue`,
+    horizon: dueSummary.horizon || getRuntimeSupportedHorizon(),
+    remainingOverdueByCadenceTier: dueSummary.remainingOverdueByCadenceTier || null,
+    generalPriorityBand: thresholdDatePipeline.resolveGeneralPriorityBand(top, {
+      daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+      todayIso: getParkTodayIso(),
+    }),
+    deferredFarGeneralScan: dueSummary.deferredFarGeneralScan || null,
+    deferredGeneralScanAdmission: dueSummary.deferredGeneralScanAdmission || null,
+    generalScanAdmission: dueSummary.generalScanAdmission || null,
   });
   const result = maintenanceQueries.buildNearTermTickCompactResult({
     ok: true,
@@ -15143,6 +15339,9 @@ async function enqueueThresholdScanJob({
   maxThreshold = THRESHOLD_JOB_MAX_THRESHOLD,
   dryRun = true,
   writeEnabled = false,
+  watchedDueCount = 0,
+  generalDueCount = 0,
+  selectionReason = null,
 } = {}) {
   if (!supabase) {
     throw new Error('supabase_not_configured');
@@ -15195,6 +15394,9 @@ async function enqueueThresholdScanJob({
       preparedUpdates: [],
       preparedUpdatesCount: 0,
       stage: 'queued',
+      watchedDueCount: Number(watchedDueCount) || 0,
+      generalDueCount: Number(generalDueCount) || 0,
+      selectionReason: selectionReason || null,
     };
   }
   const payload = {
@@ -18741,8 +18943,25 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
     return headers;
   }
 
+  const horizon = getRuntimeSupportedHorizon();
+  const maxSteps = horizon.maxNavigationSteps;
+  const navigationAttempts = [];
+  let initialVisibleHeaders = null;
+
   let visible = await readVisibleDates();
-  if (weekContainsTarget(visible)) return diag;
+  initialVisibleHeaders = [...(visible || [])];
+  if (weekContainsTarget(visible)) {
+    diag.navigationAttempts = navigationAttempts;
+    diag.navigationLog = calendarNavigation.buildThresholdDateScanNavigationLog({
+      targetIsoDate: validationTarget,
+      horizon,
+      initialHeaders: initialVisibleHeaders,
+      navigationAttempts,
+      targetDateVisible: true,
+      completionReason: 'target_already_visible',
+    });
+    return diag;
+  }
   if (shouldAbortNavigationForEmptyDayHeaders(diag, {
     requestedIsoDate: validationTarget,
     navigationIsoDate,
@@ -18756,7 +18975,19 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
   const reopenDiag = await collectPageDiagnostics(page, 'navigation_reopen_booking');
   pushThresholdAuditStep(auditContext, 'page_opened', { ok: true, reason: 'navigation_reopen', ...reopenDiag });
   visible = await readVisibleDates();
-  if (weekContainsTarget(visible)) return diag;
+  if (!initialVisibleHeaders?.length) initialVisibleHeaders = [...(visible || [])];
+  if (weekContainsTarget(visible)) {
+    diag.navigationAttempts = navigationAttempts;
+    diag.navigationLog = calendarNavigation.buildThresholdDateScanNavigationLog({
+      targetIsoDate: validationTarget,
+      horizon,
+      initialHeaders: initialVisibleHeaders,
+      navigationAttempts,
+      targetDateVisible: true,
+      completionReason: 'target_visible_after_reopen',
+    });
+    return diag;
+  }
   if (shouldAbortNavigationForEmptyDayHeaders(diag, {
     requestedIsoDate: validationTarget,
     navigationIsoDate,
@@ -18764,7 +18995,6 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
     return finalizeDayHeaderParseFailure(diag);
   }
 
-  const maxSteps = effectiveWeeksAhead + 3;
   for (let step = 0; step < maxSteps; step++) {
     if (shouldAbortNavigationForEmptyDayHeaders(diag, {
       requestedIsoDate: validationTarget,
@@ -18779,18 +19009,67 @@ async function navigateCalendarToShowDate(page, navigationIsoDate, {
     }
     if (!direction) break;
 
+    const beforeHeaders = [...(visible || [])];
     const clicked = direction === 'next'
       ? await advanceCalendarWeek(page, auditContext)
       : await retreatCalendarWeek(page, auditContext);
-    if (!clicked) break;
+    const headersAfterClick = await readVisibleDates();
+    navigationAttempts.push(calendarNavigation.createNavigationAttempt({
+      attemptNumber: step + 1,
+      direction,
+      controlClicked: direction === 'next' ? '.glyphicon-chevron-right' : '.glyphicon-chevron-left',
+      beforeHeaders,
+      afterHeaders: headersAfterClick,
+      clickSucceeded: clicked,
+    }));
+    if (!clicked) {
+      diag.navigationError = 'calendar_navigation_stalled';
+      diag.targetDateVisible = false;
+      diag.targetDateVisibleFromHeaders = false;
+      diag.navigationAttempts = navigationAttempts;
+      diag.navigationLog = calendarNavigation.buildThresholdDateScanNavigationLog({
+        targetIsoDate: validationTarget,
+        horizon,
+        initialHeaders: initialVisibleHeaders,
+        navigationAttempts,
+        targetDateVisible: false,
+        failureReason: 'calendar_navigation_stalled',
+      });
+      return diag;
+    }
     if (direction === 'next') diag.clickedNextWeekCount++;
-    visible = await readVisibleDates();
-    if (weekContainsTarget(visible)) return diag;
+    visible = headersAfterClick;
+    if (weekContainsTarget(visible)) {
+      diag.navigationAttempts = navigationAttempts;
+      diag.navigationLog = calendarNavigation.buildThresholdDateScanNavigationLog({
+        targetIsoDate: validationTarget,
+        horizon,
+        initialHeaders: initialVisibleHeaders,
+        navigationAttempts,
+        targetDateVisible: true,
+        completionReason: 'target_visible_after_navigation',
+      });
+      return diag;
+    }
   }
 
-  diag.navigationError = 'target_date_not_visible_after_navigation';
+  diag.navigationError = calendarNavigation.mapNavigationFailureReason({
+    targetVisible: false,
+    step: maxSteps,
+    maxSteps,
+    headerParseFailed: false,
+  }) || 'target_date_not_visible';
   diag.targetDateVisible = false;
   diag.targetDateVisibleFromHeaders = false;
+  diag.navigationAttempts = navigationAttempts;
+  diag.navigationLog = calendarNavigation.buildThresholdDateScanNavigationLog({
+    targetIsoDate: validationTarget,
+    horizon,
+    initialHeaders: initialVisibleHeaders,
+    navigationAttempts,
+    targetDateVisible: false,
+    failureReason: diag.navigationError,
+  });
   const finalDiag = await collectPageDiagnostics(page, 'navigation_exhausted');
   applyPageDiagnosticsTo(diag, finalDiag);
   pushThresholdAuditStep(auditContext, 'timeout_or_success', {
@@ -23091,6 +23370,13 @@ const calendarFixtureHelpers = {
   getMondayWeekStartIso,
   safeCloseBrowser,
   THRESHOLD_FILTER_SETTLE_MS,
+  runGate8DateWriteContractWithRecovery,
+  getRuntimeSupportedHorizon,
+  getParkTodayIso,
+  addDaysToParkIso,
+  seedSessionsForGate8DryRun(sessions) {
+    return mergeSessionsIntoStore(sessions, { onlyMissing: false });
+  },
 };
 
 if (require.main === module) {

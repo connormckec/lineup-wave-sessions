@@ -63,6 +63,70 @@ console.log('threshold worker claim regression');
   assert.strictEqual(sorted[1].id, 'older-week');
 }
 
+// 3b. Apply-prepared outranks watched and general date scans.
+{
+  const applyJob = {
+    id: 'apply-job',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_APPLY,
+    created_at: '2026-07-26T18:00:00.000Z',
+    results_json: { sourceJobId: 'source-1' },
+  };
+  const watchedDate = {
+    id: 'watched-date',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_DATE,
+    created_at: '2026-07-26T16:00:00.000Z',
+    dates: ['2026-07-28'],
+    results_json: { watchedDueCount: 1, targetIsoDate: '2026-07-28' },
+  };
+  const generalNear = {
+    id: 'general-near',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_DATE,
+    created_at: '2026-07-26T15:00:00.000Z',
+    dates: ['2026-07-29'],
+    results_json: { watchedDueCount: 0, targetIsoDate: '2026-07-29' },
+  };
+  const sorted = [generalNear, watchedDate, applyJob].sort(
+    (a, b) => twc.compareThresholdScanJobPriority(a, b, TODAY),
+  );
+  assert.strictEqual(sorted[0].id, 'apply-job');
+  assert.strictEqual(sorted[1].id, 'watched-date');
+  assert.strictEqual(sorted[2].id, 'general-near');
+}
+
+// 3c. Watched date scan outranks general bands; <=72h general outranks >14d.
+{
+  const farGeneral = {
+    id: 'far-general',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_DATE,
+    created_at: '2026-07-26T14:00:00.000Z',
+    dates: ['2026-08-15'],
+    results_json: { watchedDueCount: 0, targetIsoDate: '2026-08-15' },
+  };
+  const nearGeneral = {
+    id: 'near-general',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_DATE,
+    created_at: '2026-07-26T18:00:00.000Z',
+    dates: ['2026-07-29'],
+    results_json: { watchedDueCount: 0, targetIsoDate: '2026-07-29' },
+  };
+  const watchedDate = {
+    id: 'watched-date-2',
+    mode: twc.THRESHOLD_SCAN_JOB_MODE_DATE,
+    created_at: '2026-07-26T19:00:00.000Z',
+    dates: ['2026-08-10'],
+    results_json: { watchedDueCount: 2, targetIsoDate: '2026-08-10' },
+  };
+  const sorted = [farGeneral, nearGeneral, watchedDate].sort(
+    (a, b) => twc.compareThresholdScanJobPriority(a, b, TODAY),
+  );
+  assert.strictEqual(sorted[0].id, 'watched-date-2');
+  assert.strictEqual(sorted[1].id, 'near-general');
+  assert.strictEqual(sorted[2].id, 'far-general');
+  assert.strictEqual(twc.getThresholdScanJobPriorityBucket(watchedDate, TODAY), 1);
+  assert.strictEqual(twc.getThresholdScanJobPriorityBucket(nearGeneral, TODAY), 2);
+  assert.strictEqual(twc.getThresholdScanJobPriorityBucket(farGeneral, TODAY), 5);
+}
+
 // 4. Ineligible jobs return documented skip reasons.
 {
   const unsupported = weekDryRunJob({ mode: 'legacy_unknown_mode' });
