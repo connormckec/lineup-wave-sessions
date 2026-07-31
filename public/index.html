@@ -901,19 +901,21 @@ function normalizeIsoDate(value) {
   return m ? m[1] : todayKey();
 }
 
-let selectedDateSessions = [];
-let selectedDateMeta = {
-  statusReason: null,
-  sessionsCount: 0,
-  dataSource: null,
-  isLoading: false,
-  lastFetchError: null,
-  endpoint: null,
-  isScrapeInProgress: false,
-  hasSavedSessions: false,
-  isFallback: false,
-  lastBasicCheckAt: null,
-  lastCheckedForDate: null,
+const browseState = {
+  selectedDateSessions: [],
+  meta: {
+    statusReason: null,
+    sessionsCount: 0,
+    dataSource: null,
+    isLoading: false,
+    lastFetchError: null,
+    endpoint: null,
+    isScrapeInProgress: false,
+    hasSavedSessions: false,
+    isFallback: false,
+    lastBasicCheckAt: null,
+    lastCheckedForDate: null,
+  },
 };
 
 let selectedDateFetchToken = 0;
@@ -945,8 +947,8 @@ function dateCoverageRangeForPicker() {
 function syncSelectedDateIntoCoverage() {
   if (!activeDayKey) return;
   const mapped = {
-    statusReason: selectedDateMeta.statusReason,
-    sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+    statusReason: browseState.meta.statusReason,
+    sessionsCount: browseState.meta.sessionsCount ?? browseState.selectedDateSessions.length,
     lastCheckedAt: data.lastSuccessfulScrape || null,
   };
   dateCoverageState.byDate = mergeSelectedDateCoverage(
@@ -959,8 +961,8 @@ function syncSelectedDateIntoCoverage() {
 function coverageStatusForDate(dateKey) {
   if (dateKey === activeDayKey) {
     const fromSelected = coverageStatusFromSelectedDateMeta({
-      statusReason: selectedDateMeta.statusReason,
-      sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+      statusReason: browseState.meta.statusReason,
+      sessionsCount: browseState.meta.sessionsCount ?? browseState.selectedDateSessions.length,
       lastCheckedAt: data.lastSuccessfulScrape || null,
     });
     if (fromSelected?.status === 'has_sessions') return 'has_sessions';
@@ -1080,8 +1082,8 @@ async function loadDateCoverage({ force = false } = {}) {
       : byDate;
     dateCoverageState = {
       byDate: mergeSelectedDateCoverage(mergedByDate, activeDayKey, {
-        statusReason: selectedDateMeta.statusReason,
-        sessionsCount: selectedDateMeta.sessionsCount ?? selectedDateSessions.length,
+        statusReason: browseState.meta.statusReason,
+        sessionsCount: browseState.meta.sessionsCount ?? browseState.selectedDateSessions.length,
         lastCheckedAt: payload.fetchedAt || data.lastSuccessfulScrape || null,
       }),
       status: 'ready',
@@ -1113,9 +1115,9 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
   const dateKey = normalizeIsoDate(isoDate);
   const token = ++selectedDateFetchToken;
   const endpoint = `/api/sessions?date=${encodeURIComponent(dateKey)}`;
-  const prevSessions = selectedDateSessions.slice();
-  selectedDateMeta = {
-    ...selectedDateMeta,
+  const prevSessions = browseState.selectedDateSessions.slice();
+  browseState.meta = {
+    ...browseState.meta,
     isLoading: true,
     endpoint,
     lastFetchError: null,
@@ -1124,10 +1126,10 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
 
   const failsafe = setTimeout(() => {
     if (token !== selectedDateFetchToken) return;
-    if (selectedDateMeta.isLoading) {
-      selectedDateMeta.isLoading = false;
-      selectedDateMeta.lastFetchError = selectedDateMeta.lastFetchError || 'Load timed out (5s)';
-      selectedDateMeta.statusReason = selectedDateSessions.length ? 'saved_sessions_found' : 'error';
+    if (browseState.meta.isLoading) {
+      browseState.meta.isLoading = false;
+      browseState.meta.lastFetchError = browseState.meta.lastFetchError || 'Load timed out (5s)';
+      browseState.meta.statusReason = browseState.selectedDateSessions.length ? 'saved_sessions_found' : 'error';
       safeRenderAll();
     }
   }, BOOT_FAILSAFE_MS);
@@ -1144,13 +1146,13 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     }
 
     if (payload.statusReason === 'schema_error' || payload.schemaError) {
-      selectedDateSessions = normalizeSessions(payload.sessions || []);
-      selectedDateMeta = {
+      browseState.selectedDateSessions = normalizeSessions(payload.sessions || []);
+      browseState.meta = {
         statusReason: 'schema_error',
-        sessionsCount: payload.sessionsCount ?? selectedDateSessions.length,
+        sessionsCount: payload.sessionsCount ?? browseState.selectedDateSessions.length,
         dataSource: payload.dataSource || 'schema-missing',
         wasDateChecked: payload.wasDateChecked,
-        hasSavedSessions: payload.hasSavedSessions ?? selectedDateSessions.length > 0,
+        hasSavedSessions: payload.hasSavedSessions ?? browseState.selectedDateSessions.length > 0,
         isScrapeInProgress: !!payload.isScrapeInProgress,
         isLoading: false,
         lastFetchError: formatApiError(payload),
@@ -1159,19 +1161,19 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
         lastBasicCheckAt: payload.lastBasicCheckAt ?? null,
         lastCheckedForDate: payload.lastCheckedForDate ?? null,
       };
-      if (selectedDateSessions.length) {
+      if (browseState.selectedDateSessions.length) {
         const byKey = new Map(asSessionArray(data.sessions).map(s => [s.key, s]));
-        for (const s of selectedDateSessions) byKey.set(s.key, s);
+        for (const s of browseState.selectedDateSessions) byKey.set(s.key, s);
         data.sessions = [...byKey.values()];
       }
-      console.warn('[dateSessions] schema missing', { date: dateKey, dataSource: selectedDateMeta.dataSource });
+      console.warn('[dateSessions] schema missing', { date: dateKey, dataSource: browseState.meta.dataSource });
       syncSelectedDateIntoCoverage();
       return;
     }
 
     const sessions = normalizeSessions(payload.sessions || []);
-    selectedDateSessions = sessions;
-    selectedDateMeta = {
+    browseState.selectedDateSessions = sessions;
+    browseState.meta = {
       statusReason: payload.statusReason || (sessions.length ? 'saved_sessions_found' : 'not_checked'),
       sessionsCount: payload.sessionsCount ?? sessions.length,
       dataSource: payload.dataSource || null,
@@ -1194,8 +1196,8 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     console.log('[dateSessions]', {
       date: dateKey,
       count: sessions.length,
-      statusReason: selectedDateMeta.statusReason,
-      dataSource: selectedDateMeta.dataSource,
+      statusReason: browseState.meta.statusReason,
+      dataSource: browseState.meta.dataSource,
       fetchMs,
       apiDurationMs: payload.apiDurationMs,
       supabaseQueryMs: payload.supabaseQueryMs,
@@ -1203,20 +1205,20 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
     syncSelectedDateIntoCoverage();
   } catch (err) {
     if (token !== selectedDateFetchToken) return;
-    selectedDateMeta.lastFetchError = formatApiError(err?.message || String(err));
-    selectedDateMeta.isLoading = false;
-    if (!selectedDateSessions.length && prevSessions.length) {
-      selectedDateSessions = prevSessions;
+    browseState.meta.lastFetchError = formatApiError(err?.message || String(err));
+    browseState.meta.isLoading = false;
+    if (!browseState.selectedDateSessions.length && prevSessions.length) {
+      browseState.selectedDateSessions = prevSessions;
     }
-    if (!selectedDateSessions.length) {
-      selectedDateMeta.statusReason = isSchemaMissingMessage(selectedDateMeta.lastFetchError) ? 'schema_error' : 'error';
+    if (!browseState.selectedDateSessions.length) {
+      browseState.meta.statusReason = isSchemaMissingMessage(browseState.meta.lastFetchError) ? 'schema_error' : 'error';
     }
     console.error('[dateSessions]', dateKey, err);
     syncSelectedDateIntoCoverage();
   } finally {
     clearTimeout(failsafe);
     if (token === selectedDateFetchToken) {
-      selectedDateMeta.isLoading = false;
+      browseState.meta.isLoading = false;
       safeRenderAll();
     }
   }
@@ -1233,7 +1235,7 @@ function onSelectedDateChange(isoDate) {
 function logRenderDebug(label) {
   const count = asSessionArray(data.sessions).length;
   const forDate = sessionsForSelectedDate().length;
-  console.log(`[${label}] sessions=${count} selectedDate=${activeDayKey} forDate=${forDate} reason=${selectedDateMeta.statusReason} source=${selectedDateMeta.dataSource || data.dataSource || '?'}`);
+  console.log(`[${label}] sessions=${count} selectedDate=${activeDayKey} forDate=${forDate} reason=${browseState.meta.statusReason} source=${browseState.meta.dataSource || data.dataSource || '?'}`);
 }
 
 function showStatusMessage(html) {
@@ -1834,7 +1836,7 @@ function isSessionPast(session, nowMs = Date.now()) {
 
 function liveScheduleDataUnavailable() {
   if (bootState === 'error' && !allKnownSessions().length) return true;
-  if (selectedDateMeta.statusReason === 'error' && !allKnownSessions().length) return true;
+  if (browseState.meta.statusReason === 'error' && !allKnownSessions().length) return true;
   if (bootState === 'loading' && uiLoading && !allKnownSessions().length) return false;
   return false;
 }
@@ -2045,16 +2047,16 @@ function isSessionUpcoming(s, selectedDateKey) {
 }
 
 function sessionsForSelectedDate() {
-  return asSessionArray(selectedDateSessions);
+  return asSessionArray(browseState.selectedDateSessions);
 }
 
-function browseSessionPoolForDay(isoDate) {
-  if (isoDate === activeDayKey && selectedDateSessions.length) return sessionsForSelectedDate();
+function getBrowseSessionsForDay(isoDate) {
+  if (isoDate === activeDayKey) {
+    return Array.isArray(browseState.selectedDateSessions)
+      ? browseState.selectedDateSessions
+      : [];
+  }
   return surfSessions(allKnownSessions()).filter((s) => dateKeyFromSession(s) === isoDate);
-}
-
-function browseSessionPool() {
-  return browseSessionPoolForDay(activeDayKey);
 }
 
 function applyBrowseFilters(sessions, { dayKey = activeDayKey } = {}) {
@@ -2074,7 +2076,7 @@ function applyBrowseFilters(sessions, { dayKey = activeDayKey } = {}) {
 }
 
 function visibleBrowseSessionsForDay(isoDate) {
-  return applyBrowseFilters(browseSessionPoolForDay(isoDate), { dayKey: isoDate });
+  return applyBrowseFilters(getBrowseSessionsForDay(isoDate), { dayKey: isoDate });
 }
 
 function visibleBrowseSessions() {
@@ -2396,11 +2398,11 @@ async function debugReloadSessions() {
   const msgEl = document.getElementById('reset-state-msg');
   try {
     await loadSelectedDateSessions(activeDayKey, { silent: false });
-    console.log('[debugReload] first 3 sessions:', selectedDateSessions.slice(0, 3));
-    console.log('[debugReload] meta', selectedDateMeta);
+    console.log('[debugReload] first 3 sessions:', browseState.selectedDateSessions.slice(0, 3));
+    console.log('[debugReload] meta', browseState.meta);
     finishLoading('ready');
     if (msgEl) {
-      msgEl.textContent = `Debug reload: ${selectedDateSessions.length} sessions for ${activeDayKey} (${selectedDateMeta.statusReason}).`;
+      msgEl.textContent = `Debug reload: ${browseState.selectedDateSessions.length} sessions for ${activeDayKey} (${browseState.meta.statusReason}).`;
       msgEl.style.color = '#00c9a7';
     }
   } catch (e) {
@@ -2455,8 +2457,8 @@ function updateDateNavButtons() {
 }
 
 function sessionCountForDate(dateKey) {
-  if (dateKey === activeDayKey && selectedDateSessions.length) {
-    return selectedDateSessions.length;
+  if (dateKey === activeDayKey && browseState.selectedDateSessions.length) {
+    return browseState.selectedDateSessions.length;
   }
   return surfSessions().filter(s => dateKeyFromSession(s) === dateKey).length;
 }
@@ -2688,7 +2690,7 @@ async function refreshStatusInBackground({ silent = true } = {}) {
 async function refresh({ silent = false } = {}) {
   const btn = document.getElementById('refresh-btn');
   if (btn && !silent) btn.classList.add('spinning');
-  const prevSessions = selectedDateSessions.slice();
+  const prevSessions = browseState.selectedDateSessions.slice();
   try {
     await loadSelectedDateSessions(activeDayKey, { silent: true });
     triggerBackgroundDetailRefresh(activeDayKey);
@@ -2704,14 +2706,14 @@ async function refresh({ silent = false } = {}) {
     lastFetchError = err?.message || String(err);
     console.error('[refresh]', err);
     finishLoading(prevSessions.length ? 'ready' : 'error');
-    if (!selectedDateSessions.length && prevSessions.length) {
-      selectedDateSessions = prevSessions;
+    if (!browseState.selectedDateSessions.length && prevSessions.length) {
+      browseState.selectedDateSessions = prevSessions;
     }
     showStatusMessage(
       `<span class="check-time">${deriveSessionDataStatus({
         ...buildSessionDataStatusInput(),
-        hasUsableSessions: selectedDateSessions.length > 0,
-        lastFetchError: lastFetchError || selectedDateMeta.lastFetchError,
+        hasUsableSessions: browseState.selectedDateSessions.length > 0,
+        lastFetchError: lastFetchError || browseState.meta.lastFetchError,
       }).fullText}</span>`
     );
     safeRenderAll();
@@ -2745,7 +2747,7 @@ function allKnownSessions() {
     const n = normalizeSessionRow(s);
     if (n) byKey.set(n.key, n);
   }
-  for (const s of selectedDateSessions) {
+  for (const s of browseState.selectedDateSessions) {
     const n = normalizeSessionRow(s);
     if (n) byKey.set(n.key, n);
   }
@@ -2768,7 +2770,7 @@ function watchedKeysForDay(isoDate) {
   const keys = new Set();
   for (const w of watchlistForUi()) {
     const key = w.session_key || w.key;
-    const session = data.sessions.find((s) => s.key === key) || selectedDateSessions.find((s) => s.key === key) || w;
+    const session = data.sessions.find((s) => s.key === key) || browseState.selectedDateSessions.find((s) => s.key === key) || w;
     const dk = dateKeyFromSession(session) || w.iso_date || w.isoDate;
     if (dk === isoDate && key) keys.add(key);
   }
@@ -3014,27 +3016,27 @@ function onBellClick(sJson) {
 
 function buildSessionDataStatusInput() {
   const loadedCount = asSessionArray(data.sessions).length;
-  const selectedCount = selectedDateSessions.length;
+  const selectedCount = browseState.selectedDateSessions.length;
   const hasUsableSessions = selectedCount > 0
-    || (selectedDateMeta.hasSavedSessions && selectedDateMeta.statusReason === 'saved_sessions_found')
-    || (selectedDateMeta.sessionsCount > 0 && selectedDateMeta.statusReason === 'saved_sessions_found');
+    || (browseState.meta.hasSavedSessions && browseState.meta.statusReason === 'saved_sessions_found')
+    || (browseState.meta.sessionsCount > 0 && browseState.meta.statusReason === 'saved_sessions_found');
   return {
-    dataSource: selectedDateMeta.dataSource || data.dataSource || data.source,
-    isFallback: !!selectedDateMeta.isFallback,
-    statusReason: selectedDateMeta.statusReason,
+    dataSource: browseState.meta.dataSource || data.dataSource || data.source,
+    isFallback: !!browseState.meta.isFallback,
+    statusReason: browseState.meta.statusReason,
     isRefreshing: !!(data.scrapeInProgress
-      || selectedDateMeta.isScrapeInProgress
-      || (selectedDateMeta.isLoading && hasUsableSessions)),
+      || browseState.meta.isScrapeInProgress
+      || (browseState.meta.isLoading && hasUsableSessions)),
     isLoading: !!(
       (uiLoading && !selectedCount && !loadedCount)
-      || (selectedDateMeta.isLoading && !selectedCount && !loadedCount)
+      || (browseState.meta.isLoading && !selectedCount && !loadedCount)
     ),
     hasUsableSessions,
-    lastFetchError: selectedDateMeta.lastFetchError || lastFetchError,
+    lastFetchError: browseState.meta.lastFetchError || lastFetchError,
     lastScrapeError: data.lastScrapeError || null,
     isUsingCachedData: !!data.isUsingCachedData,
-    checkedAt: selectedDateMeta.lastBasicCheckAt
-      || selectedDateMeta.lastCheckedForDate
+    checkedAt: browseState.meta.lastBasicCheckAt
+      || browseState.meta.lastCheckedForDate
       || data.lastSuccessfulScrape
       || data.lastCheck
       || null,
@@ -3053,7 +3055,7 @@ function renderStatusBar() {
   }
 
   if (bootState === 'error'
-    && !selectedDateSessions.length
+    && !browseState.selectedDateSessions.length
     && !asSessionArray(data.sessions).length
     && !data.lastSuccessfulScrape) {
     txt.textContent = '';
@@ -3071,6 +3073,10 @@ function renderBrowse() {
   const listEl = document.getElementById('session-list');
   if (!listEl) return;
 
+  const browseSessionPool = Array.isArray(browseState.selectedDateSessions)
+    ? browseState.selectedDateSessions
+    : [];
+
   renderDayRail();
 
   if (waveChipsEl) {
@@ -3084,7 +3090,7 @@ function renderBrowse() {
       `<button type="button" class="lessons-link${showLessons ? ' on' : ''}" id="lessons-toggle">${showLessons ? 'Hide lessons' : 'Show lessons'}</button>`;
   }
 
-  let levelScope = browseSessionPool().filter(isSurfSession);
+  let levelScope = browseSessionPool.filter(isSurfSession);
   levelScope = levelScope.filter(matchesWaveFilter);
   const levels = sortLevels([...new Set(levelScope.map((s) => s.level).filter(Boolean))]);
 
@@ -3099,47 +3105,47 @@ function renderBrowse() {
     ].join('');
   }
 
-  if (selectedDateMeta.isLoading && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
+  if (browseState.meta.isLoading && !browseState.selectedDateSessions.length && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
     return;
   }
 
-  if (uiLoading && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
+  if (uiLoading && !browseState.selectedDateSessions.length && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Loading sessions…</div>';
     return;
   }
 
-  if (!selectedDateSessions.length && selectedDateMeta.statusReason === 'schema_error') {
+  if (!browseState.selectedDateSessions.length && browseState.meta.statusReason === 'schema_error') {
     listEl.innerHTML = '<div class="empty">Database schema missing. Run supabase/schema.sql in the Supabase SQL editor.</div>';
     return;
   }
 
-  if (!selectedDateSessions.length && selectedDateMeta.statusReason === 'error') {
-    listEl.innerHTML = `<div class="empty">${formatApiError(selectedDateMeta.lastFetchError)}<br>Try Debug reload sessions in Settings.</div>`;
+  if (!browseState.selectedDateSessions.length && browseState.meta.statusReason === 'error') {
+    listEl.innerHTML = `<div class="empty">${formatApiError(browseState.meta.lastFetchError)}<br>Try Debug reload sessions in Settings.</div>`;
     return;
   }
 
-  if (bootState === 'error' && !selectedDateSessions.length && !asSessionArray(data.sessions).length) {
+  if (bootState === 'error' && !browseState.selectedDateSessions.length && !asSessionArray(data.sessions).length) {
     listEl.innerHTML = '<div class="empty">Could not load sessions. Check connection or tap Reset local app cache in Settings.</div>';
     return;
   }
 
-  let filtered = visibleBrowseSessions();
+  let filtered = applyBrowseFilters(browseSessionPool, { dayKey: activeDayKey });
   if (!filtered.length) {
-    const poolCount = browseSessionPool().filter(isSurfSession).length;
-    const reason = selectedDateMeta.statusReason;
+    const poolCount = browseSessionPool.filter(isSurfSession).length;
+    const reason = browseState.meta.statusReason;
     let msg;
-    if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'fallback_sessions_found' || selectedDateMeta.hasSavedSessions) {
+    if (poolCount > 0 || reason === 'saved_sessions_found' || reason === 'fallback_sessions_found' || browseState.meta.hasSavedSessions) {
       msg = 'No sessions match these filters.';
     } else if (reason === 'checked_no_sessions') {
       msg = 'No sessions found for this date';
-    } else if (reason === 'not_checked' && !selectedDateMeta.isLoading) {
+    } else if (reason === 'not_checked' && !browseState.meta.isLoading) {
       msg = 'Not checked yet';
     } else if (reason === 'schema_error') {
-      msg = formatApiError(selectedDateMeta.lastFetchError);
+      msg = formatApiError(browseState.meta.lastFetchError);
     } else if (reason === 'error') {
-      msg = formatApiError(selectedDateMeta.lastFetchError);
-    } else if (selectedDateMeta.isLoading) {
+      msg = formatApiError(browseState.meta.lastFetchError);
+    } else if (browseState.meta.isLoading) {
       msg = 'Loading sessions…';
     } else if (activeDayKey === todayKey()) {
       msg = 'No upcoming sessions today';
@@ -3152,10 +3158,10 @@ function renderBrowse() {
 
   filtered.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
   assertOpenCountConsistency(filtered, countOpenSessionsForDay(activeDayKey));
-  const refreshingNote = selectedDateMeta.isLoading
+  const refreshingNote = browseState.meta.isLoading
     ? '<div class="fallback-note">Refreshing…</div>'
     : '';
-  const fallbackNote = (!selectedDateMeta.isLoading && (selectedDateMeta.isFallback || selectedDateMeta.statusReason === 'fallback_sessions_found'))
+  const fallbackNote = (!browseState.meta.isLoading && (browseState.meta.isFallback || browseState.meta.statusReason === 'fallback_sessions_found'))
     ? '<div class="fallback-note">Showing saved snapshot</div>'
     : '';
   const cards = [];
@@ -3305,9 +3311,9 @@ function renderDebugState() {
     ['Selected date (park)', activeDayKey || getParkTodayIso()],
     ['Browser local date', browserLocalDateIso()],
     ['App Eastern today', getParkTodayIso()],
-    ['Selected date endpoint', selectedDateMeta.endpoint || '—'],
-    ['Returned sessions', String(selectedDateMeta.sessionsCount ?? selectedDateSessions.length)],
-    ['Status reason', selectedDateMeta.statusReason || '—'],
+    ['Selected date endpoint', browseState.meta.endpoint || '—'],
+    ['Returned sessions', String(browseState.meta.sessionsCount ?? browseState.selectedDateSessions.length)],
+    ['Status reason', browseState.meta.statusReason || '—'],
     ['Selected-date coverage state', coverageStatusForDate(activeDayKey)],
     ['Coverage endpoint', dateCoverageState.endpoint || '—'],
     ['Coverage status', dateCoverageState.status || '—'],
@@ -3319,7 +3325,7 @@ function renderDebugState() {
     ['Coverage rows scanned', dateCoverageState.rowCountScanned == null ? '—' : String(dateCoverageState.rowCountScanned)],
     ['Coverage date count', String(Object.keys(dateCoverageState.byDate || {}).length)],
     ['Coverage requested range', dateCoverageState.requestedRange || '—'],
-    ['dataSource', selectedDateMeta.dataSource || data.dataSource || data.source || '—'],
+    ['dataSource', browseState.meta.dataSource || data.dataSource || data.source || '—'],
     ['lastSuccessfulScrape', fmtTime(data.lastSuccessfulScrape)],
     ['schemaHealth', data.schemaHealth?.missingTables?.length
       ? `missing: ${data.schemaHealth.missingTables.join(', ')}`
@@ -3327,9 +3333,9 @@ function renderDebugState() {
     ['detailCoverage', data.detailCoveragePercent != null ? `${data.detailCoveragePercent}%` : '—'],
     ['sessionsWithSlots', String(data.sessionsWithSlotsCount ?? '—')],
     ['detailEnrichment', data.detailEnrichmentInProgress ? 'running' : (data.lastDetailEnrichmentAt || '—')],
-    ['lastFetchError', selectedDateMeta.lastFetchError || lastFetchError || '—'],
+    ['lastFetchError', browseState.meta.lastFetchError || lastFetchError || '—'],
     ['lastRenderError', lastRenderError || '—'],
-    ['Date loading', selectedDateMeta.isLoading ? 'yes' : 'no'],
+    ['Date loading', browseState.meta.isLoading ? 'yes' : 'no'],
     ['serviceWorker', swActive ? 'active' : 'inactive'],
   ];
   grid.innerHTML = rows.map(([k, v]) =>
@@ -3679,7 +3685,7 @@ initTimeSelects();
     });
 
     await loadSelectedDateSessions(activeDayKey, { silent: false });
-    finishLoading(selectedDateSessions.length ? 'ready' : 'loading');
+    finishLoading(browseState.selectedDateSessions.length ? 'ready' : 'loading');
     safeRenderAll();
 
     refreshStatusInBackground({ silent: true }).catch((err) => {
@@ -3706,7 +3712,7 @@ initTimeSelects();
     scheduleRefreshPoll();
     scheduleLivePanelRefresh();
   } catch (err) {
-    if (selectedDateSessions.length) {
+    if (browseState.selectedDateSessions.length) {
       finishLoading('ready');
       safeRenderAll();
       scheduleRefreshPoll();

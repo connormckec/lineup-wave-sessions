@@ -60,7 +60,11 @@ function countScriptIncludes(source, src) {
   for (const src of scripts) {
     assert.strictEqual(countScriptIncludes(html, src), 1, `expected one ${src} script tag`);
   }
-  assert.match(html, /function browseSessionPool\(/);
+  assert.match(html, /const browseState = \{/);
+  assert.match(html, /function getBrowseSessionsForDay\(/);
+  assert.match(html, /const browseSessionPool = Array\.isArray\(browseState\.selectedDateSessions\)/);
+  assert.doesNotMatch(html, /function browseSessionPool\(/);
+  assert.doesNotMatch(html, /browseSessionPool\(\)/);
   assert.match(html, /No sessions match these filters\./);
   assert.match(html, /window\.LineupBrowse/, 'index uses LineupBrowse namespace');
   assert.match(html, /bookingTimeZone\(\)/, 'index reads timezone from LineupConfig');
@@ -125,7 +129,19 @@ function countScriptIncludes(source, src) {
       && typeof window.LineupBrowse?.sessionFilters?.isLessonSession === 'function'
       && document.getElementById('live-panel')
       && document.getElementById('sidebar')
+      && document.getElementById('session-list')
     ), { timeout: 15000 });
+
+    await page.waitForFunction(() => {
+      const list = document.getElementById('session-list');
+      if (!list) return false;
+      const text = list.textContent || '';
+      return list.querySelector('.sc')
+        || text.includes('No sessions match these filters.')
+        || text.includes('Loading sessions')
+        || text.includes('No sessions found')
+        || text.includes('Not checked yet');
+    }, { timeout: 15000 });
 
     const state = await page.evaluate(() => ({
       bootReady: document.body?.dataset?.bootState || null,
@@ -135,14 +151,17 @@ function countScriptIncludes(source, src) {
       sidebarText: document.getElementById('sidebar')?.textContent?.trim() || '',
       browseVisible: !document.getElementById('pane-browse')?.hidden,
       lessonsLabel: document.getElementById('lessons-toggle')?.textContent?.trim() || '',
-      sessionCards: document.querySelectorAll('.sc').length,
+      sessionCards: document.querySelectorAll('#session-list .sc').length,
+      sessionListText: document.getElementById('session-list')?.textContent?.trim() || '',
       lineupBrowseReady: !!window.LineupBrowse?.semantics && !!window.LineupBrowse?.sessionFilters,
     }));
 
     const allErrors = [...pageErrors, ...consoleErrors];
     const syntaxErrors = allErrors.filter((msg) => /SyntaxError|already been declared/i.test(msg));
+    const browsePoolErrors = allErrors.filter((msg) => /browseSessionPool is not defined|ReferenceError.*browseSessionPool/i.test(msg));
 
     assert.strictEqual(syntaxErrors.length, 0, `syntax errors: ${syntaxErrors.join(' | ')}`);
+    assert.strictEqual(browsePoolErrors.length, 0, `browseSessionPool errors: ${browsePoolErrors.join(' | ')}`);
     assert.ok(state.lineupBrowseReady, 'LineupBrowse helpers initialized');
     assert.ok(state.livePanelText.length > 0, 'live panel rendered');
     assert.ok(state.sidebarText.length > 0, 'sidebar rendered');
@@ -150,6 +169,11 @@ function countScriptIncludes(source, src) {
     assert.ok(state.dayRailCount >= 1 || state.levelTabsCount >= 1, 'browse filters/day rail rendered');
     assert.ok(state.browseVisible, 'browse pane visible');
     assert.match(state.lessonsLabel, /Show lessons|Hide lessons/, 'lessons toggle rendered');
+    assert.ok(
+      state.sessionCards > 0
+      || /No sessions match these filters\.|Loading sessions|No sessions found|Not checked yet/.test(state.sessionListText),
+      'session list rendered a card row or explicit empty/loading state',
+    );
 
     await context.close();
     await browser.close();

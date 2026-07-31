@@ -161,7 +161,11 @@ function visibleBrowseSessions(sessions, {
   assert.ok(html.includes('countOpenSessionsForDay'));
   assert.ok(html.includes('assertOpenCountConsistency'));
   assert.ok(html.includes('availabilityDotBarHtml'));
-  assert.ok(html.includes('function browseSessionPool('));
+  assert.ok(html.includes('const browseState = {'));
+  assert.ok(html.includes('function getBrowseSessionsForDay('));
+  assert.ok(html.includes('const browseSessionPool = Array.isArray(browseState.selectedDateSessions)'));
+  assert.ok(!html.includes('function browseSessionPool('));
+  assert.ok(!html.includes('browseSessionPool()'));
   assert.ok(!html.includes('dotBarHtmlFromState(state)'));
   assert.ok(!html.includes('sem?.DOT_COUNT || 10'));
   assert.ok(!html.includes('filtered.map(sessionCardHtml)'));

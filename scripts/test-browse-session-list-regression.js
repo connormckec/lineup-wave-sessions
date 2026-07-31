@@ -166,11 +166,46 @@ function applyBrowseFilters(sessions, {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.match(html, /function browseSessionPool\(/);
-  assert.match(html, /function browseSessionPoolForDay\(/);
+  assert.match(html, /const browseState = \{/);
+  assert.match(html, /function getBrowseSessionsForDay\(/);
+  assert.match(html, /const browseSessionPool = Array\.isArray\(browseState\.selectedDateSessions\)/);
+  assert.doesNotMatch(html, /function browseSessionPool\(/);
+  assert.doesNotMatch(html, /function browseSessionPoolForDay\(/);
+  assert.doesNotMatch(html, /browseSessionPool\(\)/);
   assert.ok(!html.includes('filtered.map(sessionCardHtml)'));
   assert.ok(html.includes('No sessions match these filters.'));
   assert.ok(html.includes('for (const session of filtered)'));
+}
+
+{
+  function deriveBrowseSessionPool(state) {
+    return Array.isArray(state.selectedDateSessions)
+      ? state.selectedDateSessions
+      : [];
+  }
+
+  const beforeLoad = { selectedDateSessions: [], meta: { isLoading: true } };
+  assert.doesNotThrow(() => deriveBrowseSessionPool(beforeLoad).filter(() => true));
+  assert.strictEqual(deriveBrowseSessionPool(beforeLoad).length, 0);
+  assert.strictEqual(deriveBrowseSessionPool({ selectedDateSessions: null }).length, 0);
+  assert.strictEqual(deriveBrowseSessionPool({}).length, 0);
+
+  const loaded = {
+    selectedDateSessions: Array.from({ length: 56 }, (_, i) => trustedSession({
+      key: `loaded-${i}`,
+      available_entries: i % 5,
+      available: i % 7 !== 0,
+      capacity: 18,
+      ts: FUTURE_TS + i * 60,
+    })),
+    meta: { statusReason: 'saved_sessions_found', sessionsCount: 56 },
+  };
+  assert.strictEqual(deriveBrowseSessionPool(loaded).length, 56);
+  const visible = applyBrowseFilters(deriveBrowseSessionPool(loaded), { showLessons: false });
+  assert.ok(visible.length > 0);
+  assert.ok(visible.some((s) => AV.getSessionAvailabilityViewModel(s).isOpen));
+  assert.ok(visible.some((s) => AV.getSessionAvailabilityViewModel(s).isFull));
+  assert.ok(visible.length >= AV.countOpenSessions(visible));
 }
 
 console.log('browse session list regression: ok');
