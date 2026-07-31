@@ -231,11 +231,37 @@ function atLocal(isoDate, clock) {
 }
 
 {
+  const lesson930 = mkWaveSession({
+    key: 'lesson-930',
+    time: '9:30 am',
+    tileText: 'From : 9:30 am - To : 11:00 am',
+    wave: 3,
+    waveSide: 'Left Lesson',
+    level: 'Beginner (lesson only)',
+  });
+  const wave1000 = mkWaveSession({
+    key: 'wave-1000',
+    time: '10:00 am',
+    tileText: 'From : 9:30 am - To : 11:00 am',
+    wave: 1,
+    waveSide: 'Left Wave',
+    level: 'Intermediate',
+  });
+  const nowMs = atLocal(DAY, '10:22 am');
+  assert.strictEqual(live.isStandardWaveSession(lesson930), false);
+  assert.strictEqual(live.pickLiveSessionForSide([lesson930, wave1000], 'left', nowMs)?.key, 'wave-1000');
+  assert.strictEqual(live.formatClockRange(wave1000), '10:00–11:00 am');
+  const summary = SEM.computeLiveNowSummary([lesson930, wave1000], nowMs);
+  assert.strictEqual(summary.left?.session?.key, 'wave-1000');
+}
+
+{
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=14'), 'index loads browse-live-schedule');
-  assert.ok(html.includes('/browse-availability-view.js?v=14'), 'index loads availability view');
-  assert.ok(html.includes('/lineup-config.js?v=14'), 'index loads lineup-config');
-  assert.ok(html.includes('/browse-session-filters.js?v=14'), 'filters load before live schedule');
+  assert.ok(html.includes('/browse-live-schedule.js?v=15'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/browse-availability-view.js?v=15'), 'index loads availability view');
+  assert.ok(html.includes('/session-capacity-config.js?v=15'), 'index loads capacity config');
+  assert.ok(html.includes('/lineup-config.js?v=15'), 'index loads lineup-config');
+  assert.ok(html.includes('/browse-session-filters.js?v=15'), 'filters load before live schedule');
   assert.ok(html.indexOf('/browse-session-filters.js') < html.indexOf('/browse-live-schedule.js'), 'script order');
   assert.ok(html.includes('live-summary'), 'compact live summary markup');
   assert.ok(!html.includes('live-watch-btn'), 'live panel has no watch buttons');

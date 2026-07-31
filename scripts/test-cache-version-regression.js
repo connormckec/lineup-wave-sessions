@@ -6,7 +6,7 @@ const path = require('path');
 
 console.log('cache version regression');
 
-const RELEASE_VERSION = '14';
+const RELEASE_VERSION = '15';
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'public/sw.js'), 'utf8');
@@ -28,11 +28,12 @@ function extractConst(source, name) {
   const helpers = [
     '/push-client.js?v=10',
     '/profile-auth-client.js?v=10',
-    '/lineup-config.js?v=14',
-    '/browse-live-schedule.js?v=14',
-    '/browse-session-filters.js?v=14',
-    '/browse-availability-view.js?v=14',
-    '/browse-ui-semantics.js?v=14',
+    '/lineup-config.js?v=15',
+    '/session-capacity-config.js?v=15',
+    '/browse-live-schedule.js?v=15',
+    '/browse-session-filters.js?v=15',
+    '/browse-availability-view.js?v=15',
+    '/browse-ui-semantics.js?v=15',
   ];
   for (const src of helpers) {
     assert.ok(html.includes(`src="${src}"`), `missing script ${src}`);

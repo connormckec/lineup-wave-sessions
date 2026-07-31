@@ -77,6 +77,10 @@ app.get('/lineup-config.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'lineup-config.js'));
 });
+app.get('/session-capacity-config.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'session-capacity-config.js'));
+});
 app.get('/browse-availability-view.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'browse-availability-view.js'));
@@ -21053,6 +21057,28 @@ app.get('/api/admin/notifications/diagnostics', async (req, res) => {
     return res.json({ ok: true, ...payload });
   } catch (err) {
     console.error('[notifications/diagnostics]', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/notifications/watch-diagnostics', async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    }
+    const userKey = String(req.query.userKey || req.query.user_key || '').trim();
+    const sessionKey = String(req.query.sessionKey || req.query.session_key || '').trim();
+    if (!userKey || !sessionKey) {
+      return res.status(400).json({ ok: false, error: 'userKey_and_sessionKey_required' });
+    }
+    const payload = await notificationDiagnostics.buildWatchSessionDiagnostics(supabase, {
+      userKey,
+      sessionKey,
+      deliveryProvider: notificationRuntimeConfig.notificationDeliveryProvider,
+    });
+    return res.json(payload);
+  } catch (err) {
+    console.error('[notifications/watch-diagnostics]', err.message);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });

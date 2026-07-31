@@ -1,5 +1,5 @@
 /* Lineup service worker v8 — static cache + Web Push handlers */
-const CACHE_VERSION = '14';
+const CACHE_VERSION = '15';
 const STATIC_CACHE = `lineup-static-v${CACHE_VERSION}`;
 
 const STATIC_ASSETS = [

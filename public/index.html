@@ -352,6 +352,8 @@ html,body{height:100%;background:var(--surface);color:var(--text);font-family:va
 .sc-level{font-family:var(--font-display);font-size:13px;font-weight:700;color:var(--level-color,var(--text));letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sc-wave{font-size:11px;color:var(--text-secondary);font-weight:500}
 .sc-dots-row{display:flex;align-items:center;gap:6px;margin-top:1px}
+.wc-dots-row{display:flex;align-items:center;gap:6px;margin-top:2px}
+.wc-dot-label{font-size:11px;color:var(--sub)}
 .slot-bar{display:flex;gap:2px;align-items:center}
 .slot-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--dot-taken)}
 .slot-dot.open{background:var(--dot-open)}.slot-dot.scarce{background:var(--dot-scarce)}.slot-dot.unverified{background:var(--dot-unverified)}
@@ -539,11 +541,12 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/lineup-config.js?v=14"></script>
-<script src="/browse-session-filters.js?v=14"></script>
-<script src="/browse-live-schedule.js?v=14"></script>
-<script src="/browse-availability-view.js?v=14"></script>
-<script src="/browse-ui-semantics.js?v=14"></script>
+<script src="/lineup-config.js?v=15"></script>
+<script src="/session-capacity-config.js?v=15"></script>
+<script src="/browse-session-filters.js?v=15"></script>
+<script src="/browse-live-schedule.js?v=15"></script>
+<script src="/browse-availability-view.js?v=15"></script>
+<script src="/browse-ui-semantics.js?v=15"></script>
 <div id="app">
 
   <header id="header">
@@ -718,7 +721,7 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '14';
+const SW_CACHE_VERSION = '15';
 const APP_SHELL_BUILD = '2026-07-31-availability-view-v14';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
@@ -1862,7 +1865,7 @@ function normalizeSessionDate(session) {
 
 function normalizeWatchItem(w) {
   const sessionKey = w.session_key || w.key;
-  const live = data.sessions.find(s => s.key === sessionKey);
+  const live = resolveWatchedSessionRecord({ ...w, key: sessionKey, session_key: sessionKey });
   const iso = w.iso_date || w.isoDate || w.dateKey || (live ? dateKeyFromSession(live) : null)
     || (w.start_ts || w.ts ? new Intl.DateTimeFormat('en-CA', { timeZone: bookingTimeZone() }).format(new Date((w.start_ts || w.ts) * 1000)) : null);
   return normalizeSessionDate({
@@ -1880,6 +1883,13 @@ function normalizeWatchItem(w) {
     wave: w.wave ?? live?.wave ?? null,
     slots: live?.slots ?? w.slots ?? null,
     available: live?.available ?? w.available,
+    available_entries: live?.available_entries ?? w.available_entries,
+    thresholdInferredSlots: live?.thresholdInferredSlots ?? w.thresholdInferredSlots,
+    threshold_scan_verified: live?.threshold_scan_verified ?? w.threshold_scan_verified,
+    thresholdScanVerified: live?.thresholdScanVerified ?? w.thresholdScanVerified,
+    slot_status: live?.slot_status ?? w.slot_status,
+    slot_source: live?.slot_source ?? w.slot_source,
+    threshold_scanned_at: live?.threshold_scanned_at ?? w.threshold_scanned_at,
     lastDetailedCheckAt: live?.lastDetailedCheckAt ?? w.lastDetailedCheckAt ?? null,
     lastBasicCheckAt: live?.lastBasicCheckAt ?? w.lastBasicCheckAt ?? null,
   });
@@ -1927,10 +1937,18 @@ function saveShowLessonsPreference(value) {
 }
 
 function sessionCapacity(level, session) {
-  if (session?.capacity != null) return session.capacity;
-  if (level === 'Progressive') return 18;
-  if (level === 'Pro Turns') return 10;
-  return 12;
+  if (session && BSF()?.isLessonSession?.(session)) return null;
+  const resolver = window.LineupCapacity?.resolveCapacityForLevel;
+  if (resolver) return resolver(level || session?.level || session?.session_type);
+  return null;
+}
+
+function resolveWatchedSessionRecord(watchItem) {
+  const sessionKey = watchItem?.session_key || watchItem?.key;
+  if (!sessionKey) return watchItem;
+  return browseState.selectedDateSessions.find((s) => s.key === sessionKey)
+    || data.sessions.find((s) => s.key === sessionKey)
+    || watchItem;
 }
 
 function formatPrice(s) {
@@ -2083,19 +2101,27 @@ function visibleBrowseSessions() {
   return visibleBrowseSessionsForDay(activeDayKey);
 }
 
-function sessionAvailabilityViewModel(session) {
+function sessionOccupancyViewModel(session) {
   const av = AV();
+  if (av?.getSessionOccupancyViewModel) return av.getSessionOccupancyViewModel(session);
   if (av?.getSessionAvailabilityViewModel) return av.getSessionAvailabilityViewModel(session);
   return {
     spotsLeft: session?.slots ?? null,
     capacity: sessionCapacity(session?.level, session),
+    bookedCount: null,
     isOpen: !!session?.available,
     isFull: session?.available === false,
+    hasTrustedSlots: false,
     hasTrustedCount: false,
     spotsLabel: session?.available ? 'Open' : 'Full',
     statusLabel: session?.available ? 'Open' : 'Full',
     inventoryKind: session?.available ? 'unverified' : 'full',
+    diagnosticWarnings: [],
   };
+}
+
+function sessionAvailabilityViewModel(session) {
+  return sessionOccupancyViewModel(session);
 }
 
 function countOpenSessionsForDay(isoDate) {
@@ -2783,9 +2809,10 @@ function dayHasWatchedSessions(isoDate) {
 
 function sessionsForLiveNow() {
   const today = todayKey();
-  const pool = allKnownSessions();
-  const todaySessions = pool.filter((s) => dateKeyFromSession(s) === today);
-  return todaySessions.length ? todaySessions : pool;
+  const pool = allKnownSessions().filter((s) => dateKeyFromSession(s) === today);
+  const ls = BLS();
+  const standard = pool.filter((s) => ls?.isStandardWaveSession?.(s));
+  return standard.length ? standard : pool;
 }
 
 function sessionWatchPayload(s) {
@@ -3246,36 +3273,35 @@ function renderWatching() {
   el.innerHTML = list.map(w => {
     const item = normalizeWatchItem(w);
     const cfg  = LEVELS[item.level || item.session_type] || { s:'?', c:'#5d8aa8' };
-    const sessionKey = item.session_key || item.key;
-    const live = data.sessions.find(s => s.key === sessionKey) || item;
-    const hist = data.history[sessionKey] || {};
-    const slots = live?.slots ?? item.slots ?? hist.slots;
+    const live = resolveWatchedSessionRecord(item);
+    const vm = sessionOccupancyViewModel(live);
     const side = live?.waveSide || item.waveSide || item.wave_side || (live?.wave != null ? waveLabel(live.wave) : waveLabel(item.wave));
-    const booked = formatBookedLine(live, hist);
+    const dotLabel = vm.hasTrustedSlots ? (vm.spotsLabel || (vm.isFull ? 'Full' : 'Open')) : (live?.available === false ? 'Full' : 'Open');
+    const dotsHtml = availabilityDotBarHtml(vm);
     const price = formatPrice(live);
     let statusHtml = '<div class="wc-status" style="color:var(--sub)">Latest data unavailable</div>';
 
     if (live && live.key) {
-      const display = sessionConditionDisplay(live, hist);
-      if (live.available) {
-        statusHtml = conditionBadgeHtml(display);
+      if (vm.hasTrustedSlots) {
+        statusHtml = `<div class="wc-dots-row">${dotsHtml}<span class="wc-dot-label">${dotLabel}</span></div>`;
+      } else if (live.available) {
+        statusHtml = conditionBadgeHtml({ primary: 'Open', sub: 'details unavailable', desktop: 'Open · details unavailable', color: '#00c9a7', slots: null });
       } else {
-        statusHtml = conditionBadgeHtml({ primary: 'Packed', sub: 'On watch', desktop: 'Packed · on watch', color: '#5d8aa8' });
+        statusHtml = conditionBadgeHtml({ primary: 'Packed', sub: 'On watch', desktop: 'Packed · on watch', color: '#5d8aa8', slots: 0 });
       }
     }
 
-    const slotsText = booked ? ` · ${booked}` : '';
     const priceText = price ? ` · ${price}` : '';
     const iso = item.iso_date || dateKeyFromSession(item);
     const dateLine = getRelativeDateLabel(iso);
-    const fresh = freshnessLabel(live);
+    const verified = cardVerifiedLabel(live);
     const bookUrl = BOOKING_URL;
 
     return `<div class="wc" style="--wc-accent:${cfg.c}">
       <div class="wc-top">
         <div>
           <div class="wc-title" style="color:${cfg.c}">${item.level || item.session_type}</div>
-          <div class="wc-meta">${dateLine} · ${(item.time || '').toUpperCase()} · ${side}${slotsText}${priceText}${fresh ? ` · ${fresh}` : ''}</div>
+          <div class="wc-meta">${dateLine} · ${(item.time || '').toUpperCase()} · ${side}${priceText}${verified ? ` · ${verified}` : ''}</div>
         </div>
         <button class="rm-btn" onclick="removeWatch('${w.id}')">Drop</button>
       </div>

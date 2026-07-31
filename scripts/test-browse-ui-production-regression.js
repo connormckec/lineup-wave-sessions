@@ -10,10 +10,11 @@ console.log('browse ui production regression');
 const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
 
 {
-  assert.match(html, /\/lineup-config\.js\?v=14/);
-  assert.match(html, /\/browse-availability-view\.js\?v=14/);
-  assert.match(html, /\/browse-ui-semantics\.js\?v=14/);
-  assert.match(html, /\/browse-live-schedule\.js\?v=14/);
+  assert.match(html, /\/lineup-config\.js\?v=15/);
+  assert.match(html, /\/session-capacity-config\.js\?v=15/);
+  assert.match(html, /\/browse-availability-view\.js\?v=15/);
+  assert.match(html, /\/browse-ui-semantics\.js\?v=15/);
+  assert.match(html, /\/browse-live-schedule\.js\?v=15/);
   assert.match(html, /window\.LineupBrowse/);
   assert.match(html, /id="live-panel"/);
   assert.match(html, /id="day-rail"/);

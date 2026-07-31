@@ -50,16 +50,16 @@ function trustedSession(overrides = {}) {
 }
 
 {
-  const vm17 = AV.getSessionAvailabilityViewModel(trustedSession({
-    available_entries: 17,
-    thresholdInferredSlots: 17,
-    capacity: 18,
+  const vm12 = AV.getSessionAvailabilityViewModel(trustedSession({
+    level: 'Advanced Turns',
+    available_entries: 11,
+    thresholdInferredSlots: 11,
   }));
-  assert.strictEqual(vm17.spotsLeft, 17);
-  assert.strictEqual(vm17.capacity, 18);
-  const html = AV.buildAvailabilityDotBarHtml(vm17);
-  assert.strictEqual((html.match(/class="slot-dot open/g) || []).length, 17);
-  assert.strictEqual((html.match(/class="slot-dot/g) || []).length, 18);
+  assert.strictEqual(vm12.spotsLeft, 11);
+  assert.strictEqual(vm12.capacity, 12);
+  const html12 = AV.buildAvailabilityDotBarHtml(vm12);
+  assert.strictEqual((html12.match(/class="slot-dot open/g) || []).length, 11);
+  assert.strictEqual((html12.match(/class="slot-dot/g) || []).length, 12);
 }
 
 {
@@ -149,14 +149,13 @@ function visibleBrowseSessions(sessions, {
     level: 'Advanced Turns',
   }));
   assert.doesNotThrow(() => AV.buildAvailabilityDotBarHtml(weird));
-  assert.strictEqual(AV.buildAvailabilityDotBarHtml(weird), '');
-  assert.strictEqual(weird.hasTrustedCount, true);
-  assert.strictEqual(weird.spotsLeft, 3);
+  assert.ok(AV.buildAvailabilityDotBarHtml(weird).includes('slot-dot'));
+  assert.strictEqual(weird.capacity, 12);
 }
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-availability-view.js?v=14'));
+  assert.ok(html.includes('/browse-availability-view.js?v=15'));
   assert.ok(html.includes('sessionAvailabilityViewModel'));
   assert.ok(html.includes('countOpenSessionsForDay'));
   assert.ok(html.includes('assertOpenCountConsistency'));
@@ -192,6 +191,7 @@ function visibleBrowseSessions(sessions, {
   vm.createContext(sandbox);
   for (const rel of [
     'lib/lineup-config.js',
+    'lib/session-capacity-config.js',
     'lib/browse-session-filters.js',
     'lib/browse-live-schedule.js',
     'lib/browse-availability-view.js',
@@ -199,7 +199,7 @@ function visibleBrowseSessions(sessions, {
   ]) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, '..', rel), 'utf8'), sandbox, { filename: rel });
   }
-  assert.strictEqual(typeof sandbox.LineupBrowse?.availabilityView?.getSessionAvailabilityViewModel, 'function');
+  assert.strictEqual(typeof sandbox.LineupBrowse?.availabilityView?.getSessionOccupancyViewModel, 'function');
 }
 
 console.log('browse availability view regression: ok');
