@@ -25,7 +25,15 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
   assert.doesNotMatch(html, /Live waves/i);
   assert.doesNotMatch(html, /id="level-chips"/);
   assert.doesNotMatch(html, /class="bell-btn/);
-  assert.doesNotMatch(html, /onclick="onBellClick/);
+  assert.match(html, /Atlantic Park<\/p>/);
+  assert.doesNotMatch(html, /Atlantic Park sessions/);
+  assert.match(html, /id="date-prev"/);
+  assert.match(html, /id="date-next"/);
+  assert.match(html, /session-card\.is-full/);
+  assert.match(html, /sessionsForLiveNow/);
+  assert.match(html, /watchButtonHtml/);
+  assert.match(html, /aria-label="Previous day"/);
+  assert.match(html, /aria-label="Next day"/);
 }
 
 {
