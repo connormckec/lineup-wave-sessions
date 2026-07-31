@@ -165,7 +165,7 @@ function assertDotBar(session, { gray, teal }) {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/session-capacity-config.js?v=15'));
+  assert.ok(html.includes('/session-capacity-config.js?v=16'));
   assert.ok(html.includes('sessionOccupancyViewModel'));
   assert.ok(html.includes('resolveWatchedSessionRecord'));
   assert.ok(!html.includes('live-watch-btn'));

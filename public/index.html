@@ -541,12 +541,12 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/lineup-config.js?v=15"></script>
-<script src="/session-capacity-config.js?v=15"></script>
-<script src="/browse-session-filters.js?v=15"></script>
-<script src="/browse-live-schedule.js?v=15"></script>
-<script src="/browse-availability-view.js?v=15"></script>
-<script src="/browse-ui-semantics.js?v=15"></script>
+<script src="/lineup-config.js?v=16"></script>
+<script src="/session-capacity-config.js?v=16"></script>
+<script src="/browse-session-filters.js?v=16"></script>
+<script src="/browse-live-schedule.js?v=16"></script>
+<script src="/browse-availability-view.js?v=16"></script>
+<script src="/browse-ui-semantics.js?v=16"></script>
 <div id="app">
 
   <header id="header">
@@ -721,7 +721,7 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '15';
+const SW_CACHE_VERSION = '16';
 const APP_SHELL_BUILD = '2026-07-31-availability-view-v14';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
@@ -869,6 +869,8 @@ function normalizeSessionRow(s) {
   const level = s.level || s.session_type || null;
   const time = s.time || s.start_time || null;
   const wave = s.wave != null ? +s.wave : null;
+  const waveSide = s.waveSide || s.wave_side
+    || (wave === 1 ? 'Left Wave' : wave === 2 ? 'Right Wave' : null);
   return {
     ...s,
     key,
@@ -879,6 +881,8 @@ function normalizeSessionRow(s) {
     session_type: level,
     time,
     wave: Number.isFinite(wave) ? wave : s.wave,
+    waveSide,
+    wave_side: waveSide,
     detailStatus: s.detailStatus || s.detail_status || null,
     detailVerified: s.detailVerified === true || s.raw?.detailVerified === true,
     detailConfidence: s.detailConfidence || s.raw?.detailConfidence || null,
@@ -919,6 +923,14 @@ const browseState = {
     lastBasicCheckAt: null,
     lastCheckedForDate: null,
   },
+};
+
+const liveNowState = {
+  todayIso: null,
+  sessions: [],
+  isLoading: false,
+  lastFetchError: null,
+  fetchToken: 0,
 };
 
 let selectedDateFetchToken = 0;
@@ -1206,6 +1218,7 @@ async function loadSelectedDateSessions(isoDate, { silent = false } = {}) {
       supabaseQueryMs: payload.supabaseQueryMs,
     });
     syncSelectedDateIntoCoverage();
+    syncLiveNowSessionsFromSelectedDate(dateKey);
   } catch (err) {
     if (token !== selectedDateFetchToken) return;
     browseState.meta.lastFetchError = formatApiError(err?.message || String(err));
@@ -1231,6 +1244,7 @@ function onSelectedDateChange(isoDate) {
   activeDayKey = normalizeIsoDate(isoDate);
   saveActiveDayKey(activeDayKey);
   loadSelectedDateSessions(activeDayKey);
+  loadTodaySessionsForLiveNow({ silent: false });
   renderBrowse();
   updateDateNavButtons();
 }
@@ -2655,6 +2669,7 @@ function scheduleLivePanelRefresh() {
     const tk = todayKey();
     if (tk !== lastLiveDayKey) {
       lastLiveDayKey = tk;
+      loadTodaySessionsForLiveNow({ silent: false }).catch((err) => console.warn('[liveNowToday]', err));
     }
     renderLivePanel();
     if (activeDayKey === todayKey()) renderBrowse();
@@ -2719,6 +2734,7 @@ async function refresh({ silent = false } = {}) {
   const prevSessions = browseState.selectedDateSessions.slice();
   try {
     await loadSelectedDateSessions(activeDayKey, { silent: true });
+    await loadTodaySessionsForLiveNow({ silent: true });
     triggerBackgroundDetailRefresh(activeDayKey);
     refreshStatusInBackground({ silent: true }).then(() => {
       loadDateCoverage({ force: true }).finally(() => {
@@ -2757,6 +2773,7 @@ function scheduleFocusRefresh() {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
+    loadTodaySessionsForLiveNow({ silent: false }).catch((err) => console.warn('[liveNowToday]', err));
     renderLivePanel();
     if (activeDayKey === todayKey()) renderBrowse();
     scheduleFocusRefresh();
@@ -2807,12 +2824,63 @@ function dayHasWatchedSessions(isoDate) {
   return watchedKeysForDay(isoDate).size > 0;
 }
 
+function syncLiveNowSessionsFromSelectedDate(dateKey) {
+  const today = todayKey();
+  if (normalizeIsoDate(dateKey) !== today) return;
+  liveNowState.todayIso = today;
+  liveNowState.sessions = normalizeSessions(browseState.selectedDateSessions);
+}
+
+async function loadTodaySessionsForLiveNow({ silent = true } = {}) {
+  const today = todayKey();
+  liveNowState.todayIso = today;
+
+  if (activeDayKey === today && browseState.selectedDateSessions.length) {
+    syncLiveNowSessionsFromSelectedDate(today);
+    if (!silent) renderLivePanel();
+    return;
+  }
+
+  const token = ++liveNowState.fetchToken;
+  liveNowState.isLoading = true;
+  try {
+    const res = await fetchApi(`/api/sessions?date=${encodeURIComponent(today)}`, {}, 20000);
+    const payload = await res.json();
+    if (token !== liveNowState.fetchToken) return;
+    if (!res.ok) throw new Error(formatApiError(payload));
+    const incoming = normalizeSessions(payload.sessions || []);
+    const byKey = new Map(liveNowState.sessions.map((s) => [s.key, s]));
+    for (const s of incoming) byKey.set(s.key, s);
+    liveNowState.sessions = [...byKey.values()];
+    liveNowState.lastFetchError = null;
+  } catch (err) {
+    if (token !== liveNowState.fetchToken) return;
+    liveNowState.lastFetchError = err?.message || String(err);
+    console.warn('[liveNowToday]', liveNowState.lastFetchError);
+  } finally {
+    if (token === liveNowState.fetchToken) {
+      liveNowState.isLoading = false;
+      if (!silent) renderLivePanel();
+    }
+  }
+}
+
 function sessionsForLiveNow() {
   const today = todayKey();
-  const pool = allKnownSessions().filter((s) => dateKeyFromSession(s) === today);
+  if (liveNowState.todayIso === today && liveNowState.sessions.length) {
+    return liveNowState.sessions;
+  }
+  return allKnownSessions().filter((s) => dateKeyFromSession(s) === today);
+}
+
+function logLiveNowDiagnostics(sessions, nowMs = Date.now()) {
   const ls = BLS();
-  const standard = pool.filter((s) => ls?.isStandardWaveSession?.(s));
-  return standard.length ? standard : pool;
+  if (!ls?.debugLiveNowCandidates) return;
+  const enabled = localStorage.getItem('LIVE_NOW_DEBUG') === '1'
+    || new URLSearchParams(window.location.search).get('liveNowDebug') === '1';
+  if (!enabled) return;
+  const report = ls.debugLiveNowCandidates(sessions, nowMs);
+  console.log('[liveNow]', report);
 }
 
 function sessionWatchPayload(s) {
@@ -2859,7 +2927,10 @@ function renderLivePanel() {
     panel.innerHTML = '<div class="live-empty">Live session data unavailable</div>';
     return;
   }
-  const live = computeLiveNowFallback(sessionsForLiveNow(), Date.now());
+  const nowMs = Date.now();
+  const pool = sessionsForLiveNow();
+  logLiveNowDiagnostics(pool, nowMs);
+  const live = computeLiveNowFallback(pool, nowMs);
   panel.className = `live-panel${live.mode === 'idle' ? ' is-idle' : ' is-live'}`;
   const help = `<p class="live-help">${live.helpText}</p>`;
   if (live.mode === 'idle') {
@@ -3711,6 +3782,7 @@ initTimeSelects();
     });
 
     await loadSelectedDateSessions(activeDayKey, { silent: false });
+    await loadTodaySessionsForLiveNow({ silent: true });
     finishLoading(browseState.selectedDateSessions.length ? 'ready' : 'loading');
     safeRenderAll();
 

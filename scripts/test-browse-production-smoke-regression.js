@@ -51,12 +51,12 @@ function countScriptIncludes(source, src) {
 
 {
   const scripts = [
-    '/lineup-config.js?v=15',
-    '/session-capacity-config.js?v=15',
-    '/browse-session-filters.js?v=15',
-    '/browse-live-schedule.js?v=15',
-    '/browse-availability-view.js?v=15',
-    '/browse-ui-semantics.js?v=15',
+    '/lineup-config.js?v=16',
+    '/session-capacity-config.js?v=16',
+    '/browse-session-filters.js?v=16',
+    '/browse-live-schedule.js?v=16',
+    '/browse-availability-view.js?v=16',
+    '/browse-ui-semantics.js?v=16',
   ];
   for (const src of scripts) {
     assert.strictEqual(countScriptIncludes(html, src), 1, `expected one ${src} script tag`);

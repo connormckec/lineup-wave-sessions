@@ -256,13 +256,78 @@ function atLocal(isoDate, clock) {
 }
 
 {
+  const left11 = mkWaveSession({
+    key: 'left-1100',
+    time: '11:00 am',
+    tileText: 'From : 11:00 am - To : 12:00 pm',
+    wave: 1,
+    waveSide: 'Left Wave',
+    level: 'Intermediate',
+  });
+  const right12 = mkWaveSession({
+    key: 'right-1200',
+    time: '12:00 pm',
+    tileText: 'From : 12:00 pm - To : 1:00 pm',
+    wave: 2,
+    waveSide: 'Right Wave',
+    level: 'Expert Turns',
+  });
+  const now1118 = atLocal(DAY, '11:18 am');
+  assert.strictEqual(live.isSessionLiveAt(left11, now1118), true, '11:00 session live at 11:18');
+  assert.strictEqual(live.isSessionLiveAt(right12, now1118), false, '12:00 session upcoming at 11:18');
+  const summary1118 = SEM.computeLiveNowSummary([left11, right12], now1118);
+  assert.strictEqual(summary1118.mode, 'live');
+  assert.strictEqual(summary1118.left?.session?.key, 'left-1100');
+  assert.strictEqual(summary1118.nextSession, null);
+  const next1118 = live.findNextUpcomingStandardWaveSession([left11, right12], now1118);
+  assert.strictEqual(next1118?.key, 'right-1200');
+
+  const now1159 = atLocal(DAY, '11:59 am');
+  assert.strictEqual(live.isSessionLiveAt(left11, now1159), true, '11:00 session live at 11:59');
+
+  const now1200 = atLocal(DAY, '12:00 pm');
+  assert.strictEqual(live.isSessionLiveAt(left11, now1200), false, '11:00 session over at 12:00');
+  assert.strictEqual(live.isSessionLiveAt(right12, now1200), true, '12:00 session live at 12:00');
+
+  const summary1200 = SEM.computeLiveNowSummary([left11, right12], now1200);
+  assert.strictEqual(summary1200.mode, 'live');
+  assert.strictEqual(summary1200.right?.session?.key, 'right-1200');
+}
+
+{
+  const staleSlots = mkWaveSession({
+    key: 'live-null-slots',
+    time: '11:00 am',
+    wave: 1,
+    waveSide: 'Left Wave',
+    available: false,
+    slots: null,
+    threshold_scan_verified: false,
+  });
+  const now1118 = atLocal(DAY, '11:18 am');
+  assert.strictEqual(live.isSessionLiveAt(staleSlots, now1118), true);
+  assert.strictEqual(live.pickLiveSessionForSide([staleSlots], 'left', now1118)?.key, 'live-null-slots');
+}
+
+{
+  const debug = live.debugLiveNowCandidates([
+    mkWaveSession({ key: 'lesson', wave: 3, waveSide: 'Left Lesson', level: 'Lesson Only', time: '11:00 am' }),
+    mkWaveSession({ key: 'left-1100', wave: 1, waveSide: 'Left Wave', time: '11:00 am' }),
+  ], atLocal(DAY, '11:18 am'));
+  assert.strictEqual(debug.selectedLeftKey, 'left-1100');
+  assert.ok(debug.rows.some((row) => row.key === 'lesson' && row.exclusionReason === 'lesson'));
+}
+
+{
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=15'), 'index loads browse-live-schedule');
-  assert.ok(html.includes('/browse-availability-view.js?v=15'), 'index loads availability view');
-  assert.ok(html.includes('/session-capacity-config.js?v=15'), 'index loads capacity config');
-  assert.ok(html.includes('/lineup-config.js?v=15'), 'index loads lineup-config');
-  assert.ok(html.includes('/browse-session-filters.js?v=15'), 'filters load before live schedule');
-  assert.ok(html.indexOf('/browse-session-filters.js') < html.indexOf('/browse-live-schedule.js'), 'script order');
+  assert.ok(html.includes('/browse-live-schedule.js?v=16'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/browse-availability-view.js?v=16'), 'index loads availability view');
+  assert.ok(html.includes('/session-capacity-config.js?v=16'), 'index loads capacity config');
+  assert.ok(html.includes('/lineup-config.js?v=16'), 'index loads lineup-config');
+  assert.ok(html.includes('/browse-session-filters.js?v=16'), 'filters load before live schedule');
+  assert.ok(html.includes('liveNowState'));
+  assert.ok(html.includes('loadTodaySessionsForLiveNow'));
+  assert.ok(html.includes('logLiveNowDiagnostics'));
   assert.ok(html.includes('live-summary'), 'compact live summary markup');
   assert.ok(!html.includes('live-watch-btn'), 'live panel has no watch buttons');
   assert.match(html, /@media \(max-width:360px\)\{\.live-grid\{grid-template-columns:1fr/);

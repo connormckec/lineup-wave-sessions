@@ -155,7 +155,7 @@ function visibleBrowseSessions(sessions, {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-availability-view.js?v=15'));
+  assert.ok(html.includes('/browse-availability-view.js?v=16'));
   assert.ok(html.includes('sessionAvailabilityViewModel'));
   assert.ok(html.includes('countOpenSessionsForDay'));
   assert.ok(html.includes('assertOpenCountConsistency'));
