@@ -38,7 +38,37 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
   assert.match(html, /renderSelectedDateLabel/);
   assert.match(html, /Book now/);
   assert.doesNotMatch(html, /Book at Atlantic Park/);
+  assert.match(html, /--full-card-bg/);
+  assert.match(html, /book-btn is-disabled/);
+  assert.match(html, /\.sc-status\.full/);
+  assert.match(html, /isFull \? 'full'/);
+  assert.match(html, /opts\.year = 'numeric'/);
   assert.match(html, /aria-label="Next day"/);
+}
+
+{
+  function browserLocalDateIso(from = new Date()) {
+    return `${from.getFullYear()}-${String(from.getMonth() + 1).padStart(2, '0')}-${String(from.getDate()).padStart(2, '0')}`;
+  }
+
+  function formatSelectedDateBrowseLabel(isoDate, now = new Date()) {
+    if (!isoDate) return '';
+    const [y, mo, da] = isoDate.split('-').map(Number);
+    const ref = new Date(y, mo - 1, da, 12, 0, 0);
+    const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+    if (y !== now.getFullYear()) opts.year = 'numeric';
+    const formatted = new Intl.DateTimeFormat('en-US', opts).format(ref);
+    if (isoDate === browserLocalDateIso(now)) return `Today · ${formatted}`;
+    return formatted;
+  }
+
+  const today = new Date(2026, 6, 30, 12, 0, 0);
+  assert.match(formatSelectedDateBrowseLabel('2026-07-30', today), /^Today · /);
+  assert.match(formatSelectedDateBrowseLabel('2026-07-30', today), /Jul 30/);
+  assert.strictEqual(formatSelectedDateBrowseLabel('2026-07-31', today), 'Fri, Jul 31');
+  assert.strictEqual(formatSelectedDateBrowseLabel('2026-08-01', today), 'Sat, Aug 1');
+  assert.match(formatSelectedDateBrowseLabel('2027-07-30', today), /2027/);
+  assert.doesNotMatch(formatSelectedDateBrowseLabel('2026-07-30', today), /^Today$/);
 }
 
 {
