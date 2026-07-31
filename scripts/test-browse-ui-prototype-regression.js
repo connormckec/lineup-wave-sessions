@@ -81,16 +81,16 @@ async function withTestServer(fn) {
     },
   ], nowMs);
   assert.strictEqual(live.mode, 'live');
-  assert.match(live.left.occupancyLine, /Estimated 7 surfers/);
+  assert.match(live.left.summaryLine, /5 spots left/);
 }
 
 // 4. Prototype HTML uses versioned canonical script paths and single error root.
 {
   const html = fs.readFileSync(path.join(__dirname, '../public/browse-prototype.html'), 'utf8');
   const semanticsSrc = fs.readFileSync(path.join(__dirname, '../lib/browse-ui-semantics.js'), 'utf8');
-  assert.match(html, /\/browse-ui-semantics\.js\?v=12/);
-  assert.match(html, /\/lineup-config\.js\?v=12/);
-  assert.match(html, /\/browse-live-schedule\.js\?v=12/);
+  assert.match(html, /\/browse-ui-semantics\.js\?v=13/);
+  assert.match(html, /\/lineup-config\.js\?v=13/);
+  assert.match(html, /\/browse-live-schedule\.js\?v=13/);
   assert.match(html, /\/lib\/browse-ui-fixtures\.js\?v=2/);
   assert.match(html, /id="proto-error-root"/);
   assert.match(html, /validateSemanticsContract/);

@@ -91,30 +91,21 @@ html,body{height:100%;background:var(--surface);color:var(--text);font-family:va
 #refresh-btn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2}
 #refresh-btn.spinning svg{animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.live-panel{margin:8px 0 0;padding:10px 12px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:var(--radius-sm)}
-.live-panel.is-idle{padding:8px 12px}
-.live-panel.is-idle .live-idle-copy{font-size:12px;font-weight:700;letter-spacing:.06em;margin-bottom:4px}
-.live-panel.is-idle .live-help{margin-top:6px;padding-top:6px;border-top-color:rgba(255,255,255,.08)}
+.live-panel{margin:6px 0 0;padding:6px 10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:var(--radius-sm)}
+.live-panel.is-idle{padding:5px 10px}
+.live-panel.is-idle .live-idle-copy{font-size:11px;font-weight:700;letter-spacing:.05em;margin-bottom:2px}
+.live-panel.is-idle .live-help{margin-top:4px;padding-top:0;border-top:none}
 .live-panel:empty{display:none}
-.live-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px}
-.live-title{font-family:var(--font-display);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#fff}
-.live-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
-.live-side{min-width:0;display:flex;flex-direction:column;gap:4px}
-.live-side-card{padding:8px 0 0;border-top:1px solid rgba(255,255,255,.1)}
-.live-side-card:first-child{border-top:none;padding-top:0}
-.live-time{font-size:10px;color:rgba(255,255,255,.68);font-variant-numeric:tabular-nums}
-.live-watch-btn{margin-top:6px;align-self:flex-start}
-.live-side-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.48);margin-bottom:4px}
-.live-level{font-family:var(--font-display);font-size:15px;font-weight:700;line-height:1.15;color:#fff;margin-bottom:3px}
-.live-occupancy{font-size:11px;font-weight:600;color:rgba(255,255,255,.92);line-height:1.35}
-.live-spots{font-size:10px;color:rgba(255,255,255,.68);margin-top:2px;line-height:1.3}
-.live-verified{font-size:10px;color:rgba(255,255,255,.58);margin-top:3px;font-variant-numeric:tabular-nums}
-.live-verified.stale{color:#fbbf24}
-.live-empty{font-size:11px;color:rgba(255,255,255,.55);line-height:1.35;font-style:italic}
-.live-idle-copy{font-family:var(--font-display);font-size:16px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#fff;margin-bottom:8px}
-.live-next-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.48);margin-bottom:3px}
-.live-next-value{font-size:12px;font-weight:600;color:rgba(255,255,255,.92);line-height:1.35}
-.live-help{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.1);font-size:9px;line-height:1.4;color:rgba(255,255,255,.45)}
+.live-head{margin-bottom:4px}
+.live-title{font-family:var(--font-display);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.92);line-height:1.2}
+.live-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px}
+.live-side{min-width:0;display:flex;flex-direction:column;gap:1px}
+.live-side-label{font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.45);line-height:1.2}
+.live-summary{font-size:11px;font-weight:600;color:rgba(255,255,255,.9);line-height:1.25}
+.live-detail{font-size:9px;color:rgba(255,255,255,.52);line-height:1.25;font-variant-numeric:tabular-nums}
+.live-detail.stale{color:#fbbf24}
+.live-empty{font-size:10px;color:rgba(255,255,255,.5);line-height:1.25;font-style:italic}
+.live-help{margin-top:4px;font-size:8px;line-height:1.25;color:rgba(255,255,255,.38)}
 
 .app-body{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 #content{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;background:var(--surface);position:relative}
@@ -503,7 +494,7 @@ input.field:focus{border-color:var(--accent)}
 .time-field label{color:var(--text-secondary)}
 .time-field select{width:100%;background:var(--surface-elevated);border:1px solid var(--card-border);border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px;font-family:var(--font-body);outline:none;appearance:none}
 .btn-show{width:100%;padding:13px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:var(--font-display);font-size:15px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer}
-@media (max-width:360px){.live-grid{grid-template-columns:1fr;gap:8px}}
+@media (max-width:360px){.live-grid{grid-template-columns:1fr;gap:6px}}
 @media (max-width:420px){
   .sc,.session-card{grid-template-columns:4px 1fr}
   .sc-side,.sc-actions{grid-column:2;flex-direction:column;padding:0 8px 8px 8px;min-width:0;width:100%}
@@ -516,8 +507,7 @@ input.field:focus{border-color:var(--accent)}
 @media (min-width:768px){
   :root{--app-max:720px}
   .sc-side,.sc-actions{min-width:104px}
-  .live-grid{gap:12px 20px}
-  .live-level{font-size:16px}
+  .live-grid{gap:6px 16px}
 }
 @media (min-width:1024px){
   :root{--app-max:1360px}
@@ -533,7 +523,7 @@ input.field:focus{border-color:var(--accent)}
   .nav-btn svg{width:18px;height:18px}
   #refresh-btn{grid-column:3}
   #status-meta{display:none}
-  .live-panel{margin-top:10px}
+  .live-panel{margin-top:6px}
   .app-body{flex-direction:row;align-items:stretch;gap:20px;padding:0 24px 24px;min-height:520px}
   #content{flex:1.35;min-width:0;border:1px solid var(--card-border);border-radius:var(--radius-card);background:var(--card)}
   #sidebar{display:block;flex:0 0 320px;min-width:280px;max-width:340px;overflow-y:auto;padding-top:8px}
@@ -549,10 +539,10 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/lineup-config.js?v=12"></script>
-<script src="/browse-live-schedule.js?v=12"></script>
-<script src="/browse-session-filters.js?v=12"></script>
-<script src="/browse-ui-semantics.js?v=12"></script>
+<script src="/lineup-config.js?v=13"></script>
+<script src="/browse-session-filters.js?v=13"></script>
+<script src="/browse-live-schedule.js?v=13"></script>
+<script src="/browse-ui-semantics.js?v=13"></script>
 <div id="app">
 
   <header id="header">
@@ -726,8 +716,8 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '12';
-const APP_SHELL_BUILD = '2026-07-31-browse-script-isolation-v12';
+const SW_CACHE_VERSION = '13';
+const APP_SHELL_BUILD = '2026-07-31-live-compact-v13';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
@@ -2774,20 +2764,12 @@ function watchButtonHtml(s, className = 'watch-btn') {
 
 function liveSideHtml(label, side) {
   if (!side || !side.session) {
-    return `<div class="live-side"><div class="live-side-label">${label}</div><div class="live-empty">No session running</div></div>`;
+    return `<div class="live-side"><div class="live-side-label">${label}</div><div class="live-empty">No session</div></div>`;
   }
-  const s = side.session;
-  const timeLabel = side.timeRange || s.time || '';
-  const availability = side.spotsRemainingLine
-    ? `${side.occupancyLine} · ${side.spotsRemainingLine}`
-    : side.occupancyLine;
-  return `<div class="live-side live-side-card">
+  return `<div class="live-side">
     <div class="live-side-label">${label}</div>
-    <div class="live-level">${side.level || s.level || s.session_type || 'Session'}</div>
-    <div class="live-time">${timeLabel}${side.stateLabel ? ` · ${side.stateLabel}` : ''}</div>
-    <div class="live-occupancy">${availability}</div>
-    <div class="live-verified${side.stale ? ' stale' : ''}">${side.verifiedLine}</div>
-      ${watchButtonHtml(s, 'watch-btn live-watch-btn')}
+    <div class="live-summary">${side.summaryLine || side.level || 'Session'}</div>
+    ${side.detailLine ? `<div class="live-detail${side.stale ? ' stale' : ''}">${side.detailLine}</div>` : ''}
   </div>`;
 }
 

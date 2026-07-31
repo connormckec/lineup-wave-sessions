@@ -152,14 +152,94 @@ function atLocal(isoDate, clock) {
 }
 
 {
+  const wave830 = mkWaveSession({
+    time: '8:30 am',
+    tileText: 'From : 8:30 am - To : 10:00 am',
+    wave: 1,
+    waveSide: 'Left Wave',
+  });
+  const window830 = live.resolveSessionWindow(wave830);
+  assert.strictEqual(window830.endMs - window830.startMs, 60 * 60 * 1000, '8:30 wave ends at 9:30 not grouped 10:00 tile');
+  assert.strictEqual(live.formatClockRange(wave830), '8:30–9:30 am');
+  assert.strictEqual(live.isSessionLiveAt(wave830, atLocal(DAY, '9:20 am')), true);
+  assert.strictEqual(live.isSessionLiveAt(wave830, atLocal(DAY, '9:30 am')), false);
+}
+
+{
+  const wave900 = mkWaveSession({
+    time: '9:00 am',
+    tileText: 'From : 9:00 am - To : 10:00 am',
+    wave: 2,
+    waveSide: 'Right Wave',
+  });
+  const window900 = live.resolveSessionWindow(wave900);
+  assert.strictEqual(window900.endMs - window900.startMs, 60 * 60 * 1000, '9:00 wave ends at 10:00');
+  assert.strictEqual(live.isSessionLiveAt(wave900, atLocal(DAY, '9:45 am')), true);
+  assert.strictEqual(live.isSessionLiveAt(wave900, atLocal(DAY, '10:00 am')), false);
+}
+
+{
+  const mismatchedTile = mkWaveSession({
+    time: '8:30 am',
+    tileText: 'From : 8:00 am - To : 10:00 am',
+    wave: 1,
+    waveSide: 'Left Wave',
+  });
+  const window = live.resolveSessionWindow(mismatchedTile);
+  assert.strictEqual(window.endMs - window.startMs, 60 * 60 * 1000, 'mismatched tileText does not extend wave session');
+}
+
+{
+  const left830 = mkWaveSession({
+    key: 'left-830',
+    wave: 1,
+    waveSide: 'Left Wave',
+    time: '8:30 am',
+    tileText: 'From : 8:30 am - To : 10:00 am',
+  });
+  const right830 = mkWaveSession({
+    key: 'right-830',
+    wave: 2,
+    waveSide: 'Right Wave',
+    time: '8:30 am',
+    tileText: 'From : 8:30 am - To : 10:00 am',
+  });
+  assert.strictEqual(
+    live.formatClockRange(left830),
+    live.formatClockRange(right830),
+    'left and right share the same corrected live window label',
+  );
+}
+
+{
+  const nowMs = atLocal(DAY, '9:00 am');
+  const staleFull = mkWaveSession({
+    key: 'stale-full',
+    wave: 1,
+    waveSide: 'Left Wave',
+    level: 'Advanced Turns',
+    available: false,
+    threshold_scan_verified: true,
+    slot_source: 'entries_left_threshold_scan',
+    available_entries: 4,
+    slot_status: 'exact',
+    threshold_scanned_at: new Date(nowMs - 30 * 60 * 1000).toISOString(),
+  });
+  const side = SEM.buildLiveSidePresentation(staleFull, nowMs);
+  assert.match(side.summaryLine, /Advanced Turns · Full/);
+  assert.match(side.detailLine, /Currently listed as full · Last verified 4 spots remaining/);
+}
+
+{
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=12'), 'index loads browse-live-schedule');
-  assert.ok(html.includes('/lineup-config.js?v=12'), 'index loads lineup-config');
-  assert.ok(html.includes('LineupBrowse'), 'index uses LineupBrowse namespace');
-  assert.ok(html.includes('liveScheduleDataUnavailable'), 'index distinguishes unavailable vs idle');
-  assert.ok(html.includes('No session live right now'), 'idle copy updated');
-  assert.ok(html.includes('scheduleLivePanelRefresh'), 'minute refresh wired');
-  assert.ok(!html.includes('No session currently running'), 'removed old idle copy');
+  assert.ok(html.includes('/browse-live-schedule.js?v=13'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/lineup-config.js?v=13'), 'index loads lineup-config');
+  assert.ok(html.includes('/browse-session-filters.js?v=13'), 'filters load before live schedule');
+  assert.ok(html.indexOf('/browse-session-filters.js') < html.indexOf('/browse-live-schedule.js'), 'script order');
+  assert.ok(html.includes('live-summary'), 'compact live summary markup');
+  assert.ok(!html.includes('live-watch-btn'), 'live panel has no watch buttons');
+  assert.match(html, /@media \(max-width:360px\)\{\.live-grid\{grid-template-columns:1fr/);
+  assert.match(html, /\.live-grid\{display:grid;grid-template-columns:1fr 1fr/);
 }
 
 console.log('browse live schedule regression: ok');

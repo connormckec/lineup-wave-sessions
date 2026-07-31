@@ -10,9 +10,9 @@ console.log('browse ui production regression');
 const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
 
 {
-  assert.match(html, /\/lineup-config\.js\?v=12/);
-  assert.match(html, /\/browse-ui-semantics\.js\?v=12/);
-  assert.match(html, /\/browse-live-schedule\.js\?v=12/);
+  assert.match(html, /\/lineup-config\.js\?v=13/);
+  assert.match(html, /\/browse-ui-semantics\.js\?v=13/);
+  assert.match(html, /\/browse-live-schedule\.js\?v=13/);
   assert.match(html, /window\.LineupBrowse/);
   assert.match(html, /id="live-panel"/);
   assert.match(html, /id="day-rail"/);
@@ -128,8 +128,8 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
   assert.strictEqual(live.mode, 'live');
   assert.ok(live.left);
   assert.ok(live.right);
-  assert.match(live.left.occupancyLine, /Estimated 7 surfers/);
-  assert.strictEqual(live.right.stateLabel, 'Full');
+  assert.match(live.left.summaryLine, /Advanced Turns · 5 spots left/);
+  assert.strictEqual(live.right.summaryLine, 'Progressive · Full');
 }
 
 console.log('browse ui production regression: ok');
