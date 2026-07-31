@@ -10,7 +10,7 @@ console.log('browse ui production regression');
 const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
 
 {
-  assert.match(html, /\/browse-ui-semantics\.js\?v=9/);
+  assert.match(html, /\/browse-ui-semantics\.js\?v=10/);
   assert.match(html, /id="live-panel"/);
   assert.match(html, /id="day-rail"/);
   assert.match(html, /id="level-tabs"/);
@@ -95,7 +95,10 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
       capacity: 12,
       available: true,
       available_entries: 5,
+      thresholdInferredSlots: 5,
       threshold_scan_verified: true,
+      slot_status: 'exact',
+      thresholdConfidence: 'exact',
       slot_source: 'entries_left_threshold_scan',
       threshold_scanned_at: new Date(nowMs - 8 * 60 * 1000).toISOString(),
     },
@@ -108,7 +111,10 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
       capacity: 10,
       available: false,
       available_entries: 0,
+      thresholdInferredSlots: 0,
       threshold_scan_verified: true,
+      slot_status: 'exact',
+      thresholdConfidence: 'exact',
       slot_source: 'entries_left_threshold_scan',
       threshold_scanned_at: new Date(nowMs - 5 * 60 * 1000).toISOString(),
     },

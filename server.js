@@ -17,6 +17,7 @@ const adaptiveSchedule = require('./lib/adaptive-threshold-schedule');
 const thresholdDatePipeline = require('./lib/threshold-date-pipeline');
 const thresholdNearTermScheduler = require('./lib/threshold-near-term-scheduler');
 const maintenanceQueries = require('./lib/maintenance-queries');
+const trustedSessionState = require('./lib/trusted-session-state');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
@@ -1677,7 +1678,7 @@ function buildDateDetailQueueDiagnostics(isoDate, sessions) {
   const retryableFailed = failed.filter(s => !isDetailPermanentFailure(s));
   const permanentFailed = failed.filter(s => isDetailPermanentFailure(s));
   const queueEligible = open.filter(s => sessionDetailQueueEligible(s));
-  const withVerifiedSlots = verified.filter(s => s.slots != null);
+  const withVerifiedSlots = list.filter((s) => trustedSessionState.hasCanonicalSlotCount(s));
 
   return {
     sessionsCount: list.length,
@@ -1816,7 +1817,7 @@ async function processAllAvailableDetailQueue({ limitPerDate = 20, reason = 'adm
 function buildDateDetailDiagnostics(isoDate, sessions) {
   const list = asSessionArray(sessions);
   const available = list.filter(s => s.available);
-  const withSlots = list.filter(s => s.slots != null);
+  const withSlots = list.filter((s) => trustedSessionState.hasCanonicalSlotCount(s) || s.slots != null);
   const withCapacity = list.filter(s => s.capacity != null);
   const withBooked = list.filter(s => s.estimatedBooked != null);
   const failedDetails = list.filter(s => {
@@ -3161,23 +3162,20 @@ function resolveTrustedSlotDisplay(s) {
     ? s.slots
     : null;
 
-  if (thresholdSlotsTrusted(s)) {
-    const inferred = getThresholdInferredSlots(s)
-      ?? thresholdFieldOnSession(s, 'available_entries');
+  const canonicalSlots = trustedSessionState.resolveCanonicalSlotCount(s);
+  if (canonicalSlots != null && trustedSessionState.isTrustedThresholdSlotResult(s)) {
     const conf = thresholdConfidenceOnSession(s)
       || thresholdFieldOnSession(s, 'slot_status');
     const maxTested = getThresholdScanMaxTested(s);
     const slotSource = thresholdFieldOnSession(s, 'slot_source') || 'entries_left_threshold_scan';
-    if (inferred != null) {
-      return {
-        slots: inferred,
-        source: slotSource === 'entries_left_threshold_scan' ? 'entries_left_threshold_scan' : 'threshold',
-        confidence: conf,
-        atLeast: conf === 'at_least',
-        slotsDisplay: conf === 'at_least' ? `${maxTested}+` : String(inferred),
-        thresholdScanMaxTested: maxTested,
-      };
-    }
+    return {
+      slots: canonicalSlots,
+      source: slotSource === 'entries_left_threshold_scan' ? 'entries_left_threshold_scan' : 'threshold',
+      confidence: conf,
+      atLeast: conf === 'at_least',
+      slotsDisplay: conf === 'at_least' ? `${maxTested}+` : String(canonicalSlots),
+      thresholdScanMaxTested: maxTested,
+    };
   }
 
   if (modalVerified && modalSlots != null) {
@@ -4315,7 +4313,8 @@ function applyDetailSourceFields(entry, session, validation) {
 }
 
 function clearUnverifiedDetailMetrics(entry) {
-  entry.slots = null;
+  const canonical = trustedSessionState.resolveCanonicalSlotCount(entry);
+  entry.slots = canonical != null ? canonical : null;
   entry.capacity = null;
   entry.estimatedBooked = null;
   entry.fillRate = null;
@@ -4344,13 +4343,17 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
   const out = { ...s };
   const verified = sessionDetailVerified(s);
   const trustedDisplay = resolveTrustedSlotDisplay(s);
+  const canonicalSlots = trustedSessionState.resolveCanonicalSlotCount(s);
   const parserOutput = out.detailParseOutput || out.raw?.detailParseOutput
     || buildParserOutputFromText(out.detailRawText || out.raw?.detailRawText || '');
 
   out.thresholdInferredSlots = getThresholdInferredSlots(s);
   out.thresholdMaxVisible = thresholdFieldOnSession(s, 'thresholdMaxVisible');
   out.thresholdScanVerified = sessionThresholdScanVerified(s);
-  out.thresholdScanAt = thresholdFieldOnSession(s, 'thresholdScanAt');
+  out.thresholdScanAt = thresholdFieldOnSession(s, 'thresholdScanAt')
+    ?? thresholdFieldOnSession(s, 'threshold_scanned_at');
+  out.threshold_scanned_at = thresholdFieldOnSession(s, 'threshold_scanned_at')
+    ?? thresholdFieldOnSession(s, 'thresholdScanAt');
   out.thresholdScanMaxTested = getThresholdScanMaxTested(s);
   out.thresholdScanMethod = thresholdFieldOnSession(s, 'thresholdScanMethod');
   out.thresholdConfidence = thresholdConfidenceOnSession(s);
@@ -4365,33 +4368,46 @@ function sanitizeSessionForApi(s, { debug = false } = {}) {
   out.threshold_scan_at = thresholdFieldOnSession(s, 'threshold_scan_at') ?? thresholdFieldOnSession(s, 'thresholdScanAt');
   const cmp = slotsComparisonFields(s);
   out.modalSlots = cmp.modalSlots;
-  out.thresholdSlots = cmp.thresholdSlots;
+  out.thresholdSlots = cmp.thresholdSlots ?? canonicalSlots;
   out.slotsAgree = cmp.slotsAgree;
 
   if (!debug) {
-    if (trustedDisplay.source === 'threshold') {
-      out.slots = trustedDisplay.slots;
+    const thresholdTrusted = trustedSessionState.isTrustedThresholdSlotResult(s)
+      && trustedSessionState.hasTrustedSlotStatus(s);
+    if (thresholdTrusted && canonicalSlots != null) {
+      if (out.slots == null) out.slots = canonicalSlots;
+      out.thresholdSlots = canonicalSlots;
       out.capacity = null;
       out.estimatedBooked = null;
       out.fillRate = null;
     } else if (verified) {
       if (isDefaultLikeDetailValues(out.slots, out.capacity, out.estimatedBooked)) {
-        out.slots = null;
-        out.capacity = null;
-        out.estimatedBooked = null;
-        out.fillRate = null;
-        out.detailVerified = false;
-        out.detailConfidence = 'default_suppressed';
+        if (canonicalSlots != null && out.slots == null) out.slots = canonicalSlots;
+        else {
+          out.slots = out.slots ?? null;
+          out.capacity = null;
+          out.estimatedBooked = null;
+          out.fillRate = null;
+        }
+        if (out.slots == null) {
+          out.detailVerified = false;
+          out.detailConfidence = 'default_suppressed';
+        }
       }
     } else {
-      if (out.detailStatus !== 'checked_packed' || !verified) {
-        out.slots = null;
-        out.capacity = null;
-        out.estimatedBooked = null;
-        out.fillRate = null;
-        out.priceText = null;
-        out.priceMin = null;
-        out.priceMax = null;
+      if (canonicalSlots != null && out.slots == null) {
+        out.slots = canonicalSlots;
+        out.thresholdSlots = canonicalSlots;
+      } else if (out.detailStatus !== 'checked_packed' || !verified) {
+        if (!thresholdTrusted) {
+          out.slots = null;
+          out.capacity = null;
+          out.estimatedBooked = null;
+          out.fillRate = null;
+          out.priceText = null;
+          out.priceMin = null;
+          out.priceMax = null;
+        }
       }
       if (!modalAssociationVerifiedOnSession(s)) {
         out.detailRawText = null;
@@ -4886,7 +4902,7 @@ async function buildThresholdWeekDiagnostic(startDate, endDate) {
 
 function detailCoverageStats() {
   const all = allStoredSessions();
-  const withSlots = all.filter(s => s.slots != null);
+  const withSlots = all.filter((s) => trustedSessionState.hasCanonicalSlotCount(s));
   const withCapacity = all.filter(s => s.capacity != null);
   const withPrice = all.filter(s => s.priceText || s.priceMin != null);
   const needing = all.filter(s => sessionQualifiesForDetailEnrichment(s));

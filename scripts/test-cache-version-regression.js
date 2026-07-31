@@ -6,7 +6,7 @@ const path = require('path');
 
 console.log('cache version regression');
 
-const RELEASE_VERSION = '9';
+const RELEASE_VERSION = '10';
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'public/sw.js'), 'utf8');
@@ -26,16 +26,16 @@ function extractConst(source, name) {
 
 {
   const helpers = [
-    '/push-client.js?v=9',
-    '/profile-auth-client.js?v=9',
-    '/browse-session-filters.js?v=9',
-    '/browse-ui-semantics.js?v=9',
+    '/push-client.js?v=10',
+    '/profile-auth-client.js?v=10',
+    '/browse-session-filters.js?v=10',
+    '/browse-ui-semantics.js?v=10',
   ];
   for (const src of helpers) {
     assert.ok(html.includes(`src="${src}"`), `missing script ${src}`);
   }
-  assert.ok(!html.includes('/push-client.js?v=1'), 'stale push-client version');
-  assert.ok(!html.includes('/profile-auth-client.js?v=4'), 'stale profile-auth version');
+  assert.ok(!html.includes('/push-client.js?v=1"'), 'stale push-client version');
+  assert.ok(!html.includes('/profile-auth-client.js?v=4"'), 'stale profile-auth version');
   assert.ok(!html.match(/browse-session-filters\.js"/), 'browse-session-filters must use query version');
 }
 
@@ -74,7 +74,7 @@ function extractConst(source, name) {
 }
 
 {
-  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-browse-ui-v9'"));
+  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-slot-count-v10'"));
   assert.ok(html.includes('id="live-panel"'));
   assert.ok(html.includes('id="day-rail"'));
   assert.ok(html.includes('class="watch-btn'));

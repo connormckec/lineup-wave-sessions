@@ -46,7 +46,7 @@ async function withTestServer(fn) {
 // 1. Canonical semantics exports computeLiveNowSummary.
 {
   assert.strictEqual(typeof SEM.computeLiveNowSummary, 'function');
-  assert.strictEqual(SEM.SEMANTICS_API_VERSION, '2');
+  assert.strictEqual(SEM.SEMANTICS_API_VERSION, '3');
 }
 
 // 2. Full sessions remain watchable with standard labels.
@@ -72,7 +72,10 @@ async function withTestServer(fn) {
       capacity: 12,
       available: true,
       available_entries: 5,
+      thresholdInferredSlots: 5,
       threshold_scan_verified: true,
+      slot_status: 'exact',
+      thresholdConfidence: 'exact',
       slot_source: 'entries_left_threshold_scan',
       threshold_scanned_at: new Date(nowMs - 8 * 60 * 1000).toISOString(),
     },
@@ -140,7 +143,7 @@ async function withTestServer(fn) {
       assert.strictEqual(state.error, null, `init error: ${state.error}`);
       assert.strictEqual(state.errorCount, 0);
       assert.strictEqual(state.semType, 'function');
-      assert.strictEqual(state.semVersion, '2');
+      assert.strictEqual(state.semVersion, '3');
       assert.match(state.liveText, /LIVE NOW/i);
       assert.ok(state.dayRailCount >= 5);
       assert.ok(state.filterCount >= 5);

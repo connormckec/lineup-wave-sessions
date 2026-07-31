@@ -266,8 +266,8 @@ function mockSupabase(initial = {}) {
 {
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   const sw = fs.readFileSync(path.join(__dirname, '../public/sw.js'), 'utf8');
-  assert.ok(html.includes('SW_CACHE_VERSION = \'9\''));
-  assert.ok(sw.includes("const CACHE_VERSION = '9'"));
+  assert.ok(html.includes('SW_CACHE_VERSION = \'10\''));
+  assert.ok(sw.includes("const CACHE_VERSION = '10'"));
   assert.ok(!html.includes('requestPermission()') || html.includes('enablePushNotifications'));
   assert.ok(!/Notification\.requestPermission\(\)/.test(html.replace(/enablePushNotifications[\s\S]{0,500}/, '')));
   assert.ok(html.includes('push-notifications-block'));
