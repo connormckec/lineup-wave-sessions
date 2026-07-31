@@ -16,6 +16,7 @@ const thresholdWorkerClaim = require('./lib/threshold-worker-claim');
 const adaptiveSchedule = require('./lib/adaptive-threshold-schedule');
 const thresholdDatePipeline = require('./lib/threshold-date-pipeline');
 const thresholdNearTermScheduler = require('./lib/threshold-near-term-scheduler');
+const maintenanceQueries = require('./lib/maintenance-queries');
 const adminAuth = require('./lib/admin-auth');
 const publicSessionEnrich = require('./lib/public-session-enrich');
 const sessionDateCoverage = require('./lib/session-date-coverage');
@@ -13640,7 +13641,7 @@ async function persistThresholdWeekJobStage(jobId, baseJson, patch = {}) {
   return resultsJson;
 }
 
-async function buildThresholdCoverageForRange(startDate, endDate) {
+async function buildThresholdCoverageForRange(startDate, endDate, instrument = null) {
   if (!startDate || !endDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
     return { ok: false, error: 'invalid_start_or_end_date', startDate, endDate, dates: [] };
   }
@@ -13648,39 +13649,41 @@ async function buildThresholdCoverageForRange(startDate, endDate) {
     return { ok: false, error: 'startDate_after_endDate', startDate, endDate, dates: [] };
   }
 
-  await ensureSessionsForStatus();
-  const dates = [];
-  const coverageDates = [];
-  let cur = startDate;
-  while (cur <= endDate) {
-    coverageDates.push(cur);
-    cur = addDaysToParkIso(cur, 1);
-    if (coverageDates.length > 120) break;
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
+
+  if (!supabase) {
+    return { ok: false, error: 'supabase_not_configured', startDate, endDate, dates: [] };
   }
 
-  for (const isoDate of coverageDates) {
-    const { currentSessions } = await fetchGate8CurrentSessionsForIsoDate(isoDate);
-    let thresholdRows = 0;
-    let latestThresholdScannedAt = null;
-    for (const session of currentSessions) {
-      if (thresholdSlotsTrusted(session) || sessionThresholdScanVerified(session)) {
-        thresholdRows += 1;
-      }
-      const scannedAt = thresholdFieldOnSession(session, 'threshold_scanned_at')
-        ?? thresholdFieldOnSession(session, 'thresholdScanAt');
-      if (scannedAt && (!latestThresholdScannedAt || scannedAt > latestThresholdScannedAt)) {
-        latestThresholdScannedAt = scannedAt;
-      }
-    }
-    dates.push({
-      isoDate,
-      sessionsCount: currentSessions.length,
-      thresholdRows,
-      hasSavedSessions: currentSessions.length > 0,
-      hasThresholdCounts: thresholdRows > 0,
-      latestThresholdScannedAt,
-    });
+  const fetched = await runQuery('coverage_current_sessions_range', async () => {
+    const { data, error } = await supabase
+      .from('current_sessions')
+      .select('iso_date, raw, available')
+      .eq('park', PARK)
+      .gte('iso_date', startDate)
+      .lte('iso_date', endDate)
+      .order('iso_date', { ascending: true })
+      .limit(5000);
+    if (error) throw error;
+    return data || [];
+  });
+  if (!fetched.ok) {
+    return { ok: false, error: fetched.message || 'coverage_query_failed', startDate, endDate, dates: [] };
   }
+
+  const dates = maintenanceQueries.aggregateCoverageRows(fetched.value, {
+    startDate,
+    endDate,
+    enumerateDateKeysFn: enumerateDateKeys,
+    thresholdRowsTrustedFn: thresholdSlotsTrusted,
+    thresholdScannedAtFn: (session) => (
+      thresholdFieldOnSession(session, 'threshold_scanned_at')
+      ?? thresholdFieldOnSession(session, 'thresholdScanAt')
+    ),
+    sessionThresholdVerifiedFn: sessionThresholdScanVerified,
+  });
 
   return { ok: true, startDate, endDate, dates };
 }
@@ -13795,37 +13798,52 @@ function compactReadyToApplyCandidate(job) {
   };
 }
 
-async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate = null) {
+async function evaluateCompletedDryScansReadyToApply(startDate = null, endDate = null, {
+  dryScanLimit = 50,
+  applyJobLimit = 50,
+  instrument = null,
+} = {}) {
   if (!supabase) {
     return { ready: [], candidatesRaw: [], excluded: [] };
   }
 
-  const now = Date.now();
-  const [dryResult, applyResult] = await Promise.all([
-    supabase
-      .from('threshold_scan_jobs')
-      .select('id, status, mode, dry_run, error, completed_at, dates, results_json')
-      .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_DATE])
-      .eq('status', 'completed')
-      .order('completed_at', { ascending: false })
-      .limit(200),
-    supabase
-      .from('threshold_scan_jobs')
-      .select('id, status, mode, error, completed_at, results_json')
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
-      .eq('status', 'completed')
-      .order('completed_at', { ascending: false })
-      .limit(200),
-  ]);
-  if (dryResult.error) throw new Error(dryResult.error.message);
-  if (applyResult.error) throw new Error(applyResult.error.message);
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
 
-  const applyJobs = (applyResult.data || []).filter((job) => !job.error);
+  const now = Date.now();
+  const preparedCutoffIso = new Date(now - THRESHOLD_PREPARED_SCAN_MAX_AGE_MS).toISOString();
+  const fetched = await runQuery('ready_to_apply_dry_and_apply_jobs', async () => {
+    const [dryResult, applyResult] = await Promise.all([
+      supabase
+        .from('threshold_scan_jobs')
+        .select('id, status, mode, dry_run, error, completed_at, dates, results_json')
+        .in('mode', [THRESHOLD_SCAN_JOB_MODE_WEEK, THRESHOLD_SCAN_JOB_MODE_DATE])
+        .eq('status', 'completed')
+        .gte('completed_at', preparedCutoffIso)
+        .order('completed_at', { ascending: false })
+        .limit(Math.max(1, dryScanLimit)),
+      supabase
+        .from('threshold_scan_jobs')
+        .select('id, status, mode, error, completed_at, results_json')
+        .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
+        .eq('status', 'completed')
+        .gte('completed_at', preparedCutoffIso)
+        .order('completed_at', { ascending: false })
+        .limit(Math.max(1, applyJobLimit)),
+    ]);
+    if (dryResult.error) throw new Error(dryResult.error.message);
+    if (applyResult.error) throw new Error(applyResult.error.message);
+    return { dryRows: dryResult.data || [], applyRows: applyResult.data || [] };
+  });
+  if (!fetched.ok) throw fetched.error;
+
+  const applyJobs = (fetched.value.applyRows || []).filter((job) => !job.error);
   const candidatesRaw = [];
   const excluded = [];
   const ready = [];
 
-  for (const job of dryResult.data || []) {
+  for (const job of fetched.value.dryRows || []) {
     const resultsJson = job.results_json || {};
     const candidate = compactReadyToApplyCandidate(job);
     candidatesRaw.push(candidate);
@@ -13923,8 +13941,8 @@ async function fetchCompletedDryScansReadyToApply(startDate = null, endDate = nu
   return evaluation.ready;
 }
 
-async function buildMaintenanceRecommendations(startDate, endDate) {
-  const coverage = await buildThresholdCoverageForRange(startDate, endDate);
+async function buildMaintenanceRecommendations(startDate, endDate, { instrument = null, includeDateArrays = true } = {}) {
+  const coverage = await buildThresholdCoverageForRange(startDate, endDate, instrument);
   if (!coverage.ok) return coverage;
 
   const generatedAt = new Date().toISOString();
@@ -13974,7 +13992,11 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
       write: false,
     }));
 
-  const readyToApplyEvaluation = await evaluateCompletedDryScansReadyToApply(startDate, endDate);
+  const readyToApplyEvaluation = await evaluateCompletedDryScansReadyToApply(startDate, endDate, {
+    dryScanLimit: includeDateArrays ? 50 : 20,
+    applyJobLimit: includeDateArrays ? 50 : 20,
+    instrument,
+  });
   const completedDryScansReadyToApply = readyToApplyEvaluation.ready;
 
   const base = {
@@ -13991,11 +14013,11 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
       weeksNeedingThresholdScan: recommendedJobs.length,
       weeksReadyToApply: completedDryScansReadyToApply.length,
     },
-    dates,
+    dates: includeDateArrays ? dates : undefined,
     recommendedJobs,
     completedDryScansReadyToApply,
-    readyToApplyCandidatesRaw: readyToApplyEvaluation.candidatesRaw,
-    readyToApplyExcluded: readyToApplyEvaluation.excluded,
+    readyToApplyCandidatesRaw: includeDateArrays ? readyToApplyEvaluation.candidatesRaw : undefined,
+    readyToApplyExcluded: includeDateArrays ? readyToApplyEvaluation.excluded : undefined,
     staleCoverageRules: {
       days0to7AheadMaxAgeHours: 6,
       days8to21AheadMaxAgeHours: 24,
@@ -14003,7 +14025,7 @@ async function buildMaintenanceRecommendations(startDate, endDate) {
     },
   };
 
-  const prioritizedRecommendedJobs = prioritizeDryScanRecommendations(base);
+  const prioritizedRecommendedJobs = prioritizeDryScanRecommendations({ ...base, dates: dates || [] });
   return {
     ...base,
     recommendedJobs: prioritizedRecommendedJobs,
@@ -14122,21 +14144,95 @@ async function fetchMaintenanceThresholdScanJobs({ statuses, limit = 20, orderBy
   return data || [];
 }
 
-async function buildMaintenanceStatus(startDate, endDate) {
-  const recommendations = await buildMaintenanceRecommendations(startDate, endDate);
+async function buildMaintenanceStatus(startDate, endDate, {
+  compact = true,
+  instrument = null,
+} = {}) {
+  const runOptional = instrument?.runOptionalQuery
+    ? (name, fn, opts) => instrument.runOptionalQuery(name, fn, opts)
+    : async (name, fn) => {
+      try {
+        return { ok: true, value: await fn() };
+      } catch (err) {
+        return {
+          ok: true,
+          skipped: true,
+          warning: { queryName: name, code: err.code || 'query_error', message: err.message },
+          value: null,
+        };
+      }
+    };
+
+  const diagnosticsWarnings = [];
+  const recommendationsResult = await runOptional(
+    'maintenance_recommendations',
+    () => buildMaintenanceRecommendations(startDate, endDate, {
+      instrument,
+      includeDateArrays: !compact,
+    }),
+    { timeoutMs: compact ? 8000 : 15000, required: !compact },
+  );
+  if (recommendationsResult.warning) diagnosticsWarnings.push(recommendationsResult.warning);
+  if (!recommendationsResult.ok || recommendationsResult.skipped || !recommendationsResult.value) {
+    if (!compact) {
+      return {
+        ok: false,
+        error: recommendationsResult.warning?.message || 'maintenance_recommendations_failed',
+        diagnosticsWarnings,
+      };
+    }
+  }
+  const recommendations = recommendationsResult.value || {
+    ok: true,
+    startDate,
+    endDate,
+    generatedAt: new Date().toISOString(),
+    summary: {},
+    recommendedJobs: [],
+    completedDryScansReadyToApply: [],
+    staleCoverageRules: {},
+  };
   if (!recommendations.ok) return recommendations;
 
-  const eligibleDryScans = await filterEligibleDryScanRecommendations(recommendations, { includeStale: true });
-  const [queuedRows, runningRows, failedRows, completedRows] = await Promise.all([
-    fetchMaintenanceThresholdScanJobs({ statuses: ['queued'], limit: 20 }),
-    fetchMaintenanceThresholdScanJobs({ statuses: ['running'], limit: 10 }),
-    fetchMaintenanceThresholdScanJobs({ statuses: ['failed'], limit: 10, orderBy: 'completed_at' }),
-    fetchMaintenanceThresholdScanJobs({ statuses: ['completed'], limit: 10, orderBy: 'completed_at' }),
-  ]);
+  const eligibleDryScans = await filterEligibleDryScanRecommendations(
+    { ...recommendations, dates: recommendations.dates || [] },
+    { includeStale: true },
+  );
+  const jobsFetched = await (instrument?.runInstrumentedQuery
+    ? instrument.runInstrumentedQuery('maintenance_job_snapshots', async () => Promise.all([
+      fetchMaintenanceThresholdScanJobs({ statuses: ['queued'], limit: 20 }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['running'], limit: 10 }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['failed'], limit: 10, orderBy: 'completed_at' }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['completed'], limit: 10, orderBy: 'completed_at' }),
+    ]))
+    : Promise.all([
+      fetchMaintenanceThresholdScanJobs({ statuses: ['queued'], limit: 20 }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['running'], limit: 10 }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['failed'], limit: 10, orderBy: 'completed_at' }),
+      fetchMaintenanceThresholdScanJobs({ statuses: ['completed'], limit: 10, orderBy: 'completed_at' }),
+    ]));
+  const [queuedRows, runningRows, failedRows, completedRows] = jobsFetched.ok === false
+    ? [[], [], [], []]
+    : (jobsFetched.value || jobsFetched);
 
   const nextRecommendedDryScan = eligibleDryScans[0] || null;
-  const thresholdWorker = await buildThresholdWorkerDiagnostics();
-  const adaptiveScheduling = await buildAdaptiveScheduleDiagnostics();
+  const thresholdWorkerResult = await runOptional(
+    'threshold_worker_diagnostics',
+    () => buildThresholdWorkerDiagnostics(),
+    { timeoutMs: 5000 },
+  );
+  if (thresholdWorkerResult.warning) diagnosticsWarnings.push(thresholdWorkerResult.warning);
+  const thresholdWorker = thresholdWorkerResult.value || { adminWarnings: [] };
+
+  const adaptiveScheduling = await buildAdaptiveScheduleDiagnostics({
+    compact,
+    instrument,
+    includeSessionSample: !compact,
+  });
+  if (adaptiveScheduling.diagnosticsWarnings?.length) {
+    diagnosticsWarnings.push(...adaptiveScheduling.diagnosticsWarnings);
+  }
+
   const adminWarnings = [...(thresholdWorker.adminWarnings || [])];
   if (adaptiveScheduling.watchedDueCount > 0 || adaptiveScheduling.generalDueCount > 0) {
     if ((queuedRows.length + runningRows.length) === 0 && adaptiveScheduling.backlog?.unhealthy) {
@@ -14173,6 +14269,7 @@ async function buildMaintenanceStatus(startDate, endDate) {
 
   return {
     ok: true,
+    compact,
     startDate,
     endDate,
     generatedAt: recommendations.generatedAt,
@@ -14183,6 +14280,7 @@ async function buildMaintenanceStatus(startDate, endDate) {
     readyToApply: recommendations.completedDryScansReadyToApply,
     readyToApplyCandidatesRaw: recommendations.readyToApplyCandidatesRaw,
     readyToApplyExcluded: recommendations.readyToApplyExcluded,
+    dates: recommendations.dates,
     queuedJobs: queuedRows.map(compactMaintenanceJob),
     runningJobs: runningRows.map(compactMaintenanceJob),
     recentFailures: failedRows.map(compactMaintenanceJob),
@@ -14190,6 +14288,7 @@ async function buildMaintenanceStatus(startDate, endDate) {
     thresholdWorker,
     adaptiveScheduling,
     adminWarnings,
+    diagnosticsWarnings,
   };
 }
 
@@ -14279,19 +14378,28 @@ async function fetchLatestDateThresholdScanJob() {
   return data;
 }
 
-async function fetchApplyJobForSourceJobId(sourceJobId) {
+async function fetchApplyJobForSourceJobId(sourceJobId, instrument = null) {
   if (!supabase || !sourceJobId) return null;
-  const { data: rows, error } = await supabase
-    .from('threshold_scan_jobs')
-    .select('id, status, mode, error, completed_at, results_json, created_at')
-    .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
-    .order('created_at', { ascending: false })
-    .limit(100);
-  if (error) throw new Error(error.message);
-  return (rows || []).find((job) => job.results_json?.sourceJobId === sourceJobId) || null;
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
+  const fetched = await runQuery('apply_job_for_source', async () => {
+    const { data, error } = await supabase
+      .from('threshold_scan_jobs')
+      .select('id, status, mode, error, completed_at, results_json, created_at')
+      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY)
+      .filter('results_json->>sourceJobId', 'eq', String(sourceJobId))
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  });
+  if (!fetched.ok) throw fetched.error;
+  return fetched.value;
 }
 
-async function fetchDatePipelineQueueCounts() {
+async function fetchDatePipelineQueueCounts(instrument = null) {
   if (!supabase) {
     return {
       queuedDateScans: 0,
@@ -14301,24 +14409,35 @@ async function fetchDatePipelineQueueCounts() {
       readyDateApplies: 0,
     };
   }
-  const [queuedDate, runningDate, queuedApply, runningApply, readyEval] = await Promise.all([
-    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'queued'),
-    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'running'),
-    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'queued'),
-    supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
-      .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'running'),
-    evaluateCompletedDryScansReadyToApply(),
-  ]);
-  return {
-    queuedDateScans: queuedDate.count || 0,
-    runningDateScans: runningDate.count || 0,
-    queuedDateApplies: queuedApply.count || 0,
-    runningDateApplies: runningApply.count || 0,
-    readyDateApplies: (readyEval.ready || []).filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE).length,
-  };
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
+  const fetched = await runQuery('date_pipeline_queue_counts', async () => {
+    const [queuedDate, runningDate, queuedApply, runningApply, readyEval] = await Promise.all([
+      supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+        .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'queued'),
+      supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+        .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE).eq('status', 'running'),
+      supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+        .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'queued'),
+      supabase.from('threshold_scan_jobs').select('*', { count: 'exact', head: true })
+        .eq('mode', THRESHOLD_SCAN_JOB_MODE_APPLY).eq('status', 'running'),
+      evaluateCompletedDryScansReadyToApply(null, null, { dryScanLimit: 20, applyJobLimit: 20, instrument }),
+    ]);
+    if (queuedDate.error) throw new Error(queuedDate.error.message);
+    if (runningDate.error) throw new Error(runningDate.error.message);
+    if (queuedApply.error) throw new Error(queuedApply.error.message);
+    if (runningApply.error) throw new Error(runningApply.error.message);
+    return {
+      queuedDateScans: queuedDate.count || 0,
+      runningDateScans: runningDate.count || 0,
+      queuedDateApplies: queuedApply.count || 0,
+      runningDateApplies: runningApply.count || 0,
+      readyDateApplies: (readyEval.ready || []).filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE).length,
+    };
+  });
+  if (!fetched.ok) throw fetched.error;
+  return fetched.value;
 }
 
 function computeOldestInventoryAges(evaluations = []) {
@@ -14342,43 +14461,141 @@ function computeOldestInventoryAges(evaluations = []) {
   };
 }
 
-async function buildAdaptiveScheduleDiagnostics() {
-  await ensureSessionsForStatus();
+async function fetchNearTermSchedulingSessions(instrument = null) {
+  if (!supabase) return [];
+  const todayIso = getParkTodayIso();
+  const bounds = maintenanceQueries.computeNearTermSchedulingBounds(todayIso, addDaysToParkIso);
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
+  const fetched = await runQuery('near_term_scheduling_sessions', async () => {
+    const { data, error } = await supabase
+      .from('current_sessions')
+      .select(maintenanceQueries.NEAR_TERM_SESSION_SELECT)
+      .eq('park', PARK)
+      .gte('iso_date', bounds.minDate)
+      .lte('iso_date', bounds.maxDate)
+      .order('iso_date', { ascending: true })
+      .order('start_ts', { ascending: true })
+      .limit(2000);
+    if (error) throw error;
+    return (data || []).map(maintenanceQueries.rowToSchedulingSession);
+  });
+  if (!fetched.ok) throw fetched.error;
+  return fetched.value;
+}
+
+async function fetchNearTermDueSummary(instrument = null) {
   const now = new Date();
   const todayIso = getParkTodayIso();
   const watchKeys = watchedSessionKeys();
-  const sessions = allStoredSessions().filter((s) => !adaptiveSchedule.isSessionEnded(s, now));
-  const evaluations = sessions.map((session) => {
-    const watched = watchKeys.has(session.key);
-    return {
-      sessionKey: session.key,
-      isoDate: session.isoDate || session.dateKey || null,
-      watched,
-      inventory: adaptiveSchedule.evaluateInventorySchedule(session, { watched, now }),
-      price: adaptiveSchedule.evaluatePriceSchedule(session, { watched, now }),
-    };
-  });
-  const dueScan = adaptiveSchedule.collectDueDateScanCandidates(sessions, {
+  const sessions = await fetchNearTermSchedulingSessions(instrument);
+  const dueScan = maintenanceQueries.collectDueScanFromSchedulingSessions(sessions, {
     watchKeys,
-    now,
     todayIso,
     daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+    now,
   });
-  const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
+  return maintenanceQueries.compactDueScanSummary(dueScan);
+}
+
+async function buildAdaptiveScheduleDiagnostics({
+  compact = true,
+  instrument = null,
+  includeSessionSample = false,
+} = {}) {
+  const runQuery = instrument?.runInstrumentedQuery
+    ? (name, fn) => instrument.runInstrumentedQuery(name, fn)
+    : async (_name, fn) => ({ ok: true, value: await fn() });
+  const runOptional = instrument?.runOptionalQuery
+    ? (name, fn, opts) => instrument.runOptionalQuery(name, fn, opts)
+    : async (name, fn) => {
+      try {
+        return { ok: true, value: await fn() };
+      } catch (err) {
+        return {
+          ok: true,
+          skipped: true,
+          warning: { queryName: name, code: err.code || 'query_error', message: err.message },
+          value: null,
+        };
+      }
+    };
+
+  const now = new Date();
+  const todayIso = getParkTodayIso();
+  const watchKeys = watchedSessionKeys();
+  const sessions = await fetchNearTermSchedulingSessions(instrument);
+  const dueScan = maintenanceQueries.collectDueScanFromSchedulingSessions(sessions, {
+    watchKeys,
+    todayIso,
+    daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+    now,
+  });
+
+  const activeDateScansFetched = await runQuery('active_date_threshold_scans', () => fetchActiveDateThresholdScanIsoDates());
+  const activeDateScans = activeDateScansFetched.ok ? activeDateScansFetched.value : new Set();
+
   const [
-    latestDateJob,
-    queueCounts,
-    readyEval,
+    latestDateJobResult,
+    queueCountsResult,
+    readyEvalResult,
   ] = await Promise.all([
-    fetchLatestDateThresholdScanJob(),
-    fetchDatePipelineQueueCounts(),
-    evaluateCompletedDryScansReadyToApply(),
+    runQuery('latest_date_threshold_scan_job', () => fetchLatestDateThresholdScanJob()),
+    runQuery('date_pipeline_queue_counts', () => fetchDatePipelineQueueCounts(instrument)),
+    compact
+      ? runOptional('ready_to_apply_eval', () => evaluateCompletedDryScansReadyToApply(null, null, {
+        dryScanLimit: 20,
+        applyJobLimit: 20,
+        instrument,
+      }), { timeoutMs: 5000 })
+      : runQuery('ready_to_apply_eval', () => evaluateCompletedDryScansReadyToApply(null, null, { instrument })),
   ]);
-  const latestApplyJob = latestDateJob
-    ? await fetchApplyJobForSourceJobId(latestDateJob.id)
-    : null;
+
+  const diagnosticsWarnings = [];
+  const latestDateJob = latestDateJobResult.ok ? latestDateJobResult.value : null;
+  const queueCounts = queueCountsResult.ok ? queueCountsResult.value : {
+    queuedDateScans: 0,
+    runningDateScans: 0,
+    queuedDateApplies: 0,
+    runningDateApplies: 0,
+    readyDateApplies: 0,
+  };
+  if (!queueCountsResult.ok) {
+    diagnosticsWarnings.push({
+      queryName: 'date_pipeline_queue_counts',
+      code: queueCountsResult.code || 'query_error',
+      message: queueCountsResult.message || 'Queue count query failed',
+    });
+  }
+
+  let readyEval = { ready: [], candidatesRaw: [], excluded: [] };
+  if (readyEvalResult.warning) diagnosticsWarnings.push(readyEvalResult.warning);
+  if (readyEvalResult.ok && !readyEvalResult.skipped && readyEvalResult.value) {
+    readyEval = readyEvalResult.value;
+  }
+
+  let latestApplyJob = null;
+  if (latestDateJob?.id) {
+    const applyFetched = await runOptional(
+      'apply_job_for_latest_date_scan',
+      () => fetchApplyJobForSourceJobId(latestDateJob.id, instrument),
+      { timeoutMs: 4000 },
+    );
+    if (applyFetched.warning) diagnosticsWarnings.push(applyFetched.warning);
+    latestApplyJob = applyFetched.value || null;
+  }
+
   const readyForLatestDate = (readyEval.ready || []).some((row) => row.sourceJobId === latestDateJob?.id);
-  const inventoryAges = computeOldestInventoryAges(evaluations);
+  const inventoryAges = compact
+    ? {}
+    : computeOldestInventoryAges(sessions.map((session) => {
+      const watched = watchKeys.has(session.key);
+      return {
+        watched,
+        inventory: adaptiveSchedule.evaluateInventorySchedule(session, { watched, now }),
+      };
+    }));
   const nearTermScheduler = thresholdNearTermScheduler.buildNearTermSchedulerDiagnostics({
     inProcessMaintenanceSchedulerEnabled: IN_PROCESS_MAINTENANCE_SCHEDULER_ENABLED,
     inlineThresholdWorkerEnabled: INLINE_THRESHOLD_WORKER_ENABLED,
@@ -14393,18 +14610,19 @@ async function buildAdaptiveScheduleDiagnostics() {
     ...queueCounts,
     ...inventoryAges,
   });
-  return {
+
+  const base = {
     generatedAt: now.toISOString(),
-    ...adaptiveSchedule.buildScheduleDiagnosticsSummary(evaluations),
     watchedDueCount: dueScan.watchedDueCount,
     generalDueCount: dueScan.generalDueCount,
-    dueDateCandidates: dueScan.candidates.slice(0, 10),
-    topDueDateCandidate: dueScan.topCandidate,
+    dueDateCount: dueScan.candidates.length,
+    topDueDateCandidate: maintenanceQueries.compactTopDueDateCandidate(dueScan.topCandidate),
     activeDateScanIsoDates: [...activeDateScans].sort(),
     nearTermScheduler,
     datePipeline,
     backlog,
-    readyToApplyDateScans: (readyEval.ready || []).filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE).slice(0, 5),
+    compact,
+    diagnosticsWarnings,
     cadencePolicy: {
       watchedInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_WATCHED,
       generalInventoryMinutes: adaptiveSchedule.INVENTORY_TARGET_MINUTES_GENERAL,
@@ -14413,16 +14631,40 @@ async function buildAdaptiveScheduleDiagnostics() {
       nearTermDateScanMaxHoursGeneral: adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL,
       nearTermDateScanMaxHoursWatched: adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_WATCHED,
     },
-    sample: evaluations
-      .filter((row) => row.inventory?.due || row.price?.due)
-      .slice(0, 25)
-      .map((row) => ({
-        sessionKey: row.sessionKey,
-        isoDate: row.isoDate,
-        watched: row.watched,
-        inventory: row.inventory,
-        price: row.price,
-      })),
+  };
+
+  if (compact) return base;
+
+  const evaluations = sessions.map((session) => {
+    const watched = watchKeys.has(session.key);
+    return {
+      sessionKey: session.key,
+      isoDate: session.isoDate || session.dateKey || null,
+      watched,
+      inventory: adaptiveSchedule.evaluateInventorySchedule(session, { watched, now }),
+      price: adaptiveSchedule.evaluatePriceSchedule(session, { watched, now }),
+    };
+  });
+
+  return {
+    ...base,
+    ...adaptiveSchedule.buildScheduleDiagnosticsSummary(evaluations),
+    dueDateCandidates: dueScan.candidates.slice(0, 10),
+    readyToApplyDateScans: (readyEval.ready || [])
+      .filter((row) => row.sourceMode === THRESHOLD_SCAN_JOB_MODE_DATE)
+      .slice(0, 5),
+    sample: includeSessionSample
+      ? evaluations
+        .filter((row) => row.inventory?.due || row.price?.due)
+        .slice(0, 25)
+        .map((row) => ({
+          sessionKey: row.sessionKey,
+          isoDate: row.isoDate,
+          watched: row.watched,
+          inventory: row.inventory,
+          price: row.price,
+        }))
+      : undefined,
   };
 }
 
@@ -14456,31 +14698,51 @@ async function runNearTermMaintenanceTick({
   startDate = null,
   endDate = null,
   source = 'unknown',
+  instrument = null,
 } = {}) {
+  const queryInstrument = instrument || maintenanceQueries.createQueryInstrumenter('near-term-tick');
+  const runQuery = queryInstrument.runInstrumentedQuery.bind(queryInstrument);
+
   if (!supabase) {
-    const result = { ok: false, error: 'supabase_not_configured' };
+    const result = maintenanceQueries.buildNearTermTickCompactResult({
+      ok: false,
+      action: 'error',
+      error: 'supabase_not_configured',
+    });
     thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
     return result;
   }
 
-  const scheduleDiagnostics = await buildAdaptiveScheduleDiagnostics();
   const range = resolveMaintenanceDateRange({ startDate, endDate });
 
-  if (await hasQueuedOrRunningThresholdScanJob()) {
-    const result = {
+  const busyFetched = await runQuery('hasQueuedOrRunningThresholdScanJob', () => hasQueuedOrRunningThresholdScanJob());
+  if (!busyFetched.ok) {
+    const result = maintenanceQueries.buildNearTermTickCompactResult({
+      ok: false,
+      action: 'error',
+      error: busyFetched.message || 'job_status_query_failed',
+      ...range,
+    });
+    thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+    return result;
+  }
+  if (busyFetched.value) {
+    const result = maintenanceQueries.buildNearTermTickCompactResult({
       ok: true,
       action: 'skipped',
       reason: 'job_already_running_or_queued',
-      pass: 'near_term',
-      scheduleDiagnostics,
       ...range,
-    };
+    });
     thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
     return result;
   }
 
-  const readyEval = await evaluateCompletedDryScansReadyToApply(range.startDate, range.endDate);
-  if (readyEval.ready.length > 0) {
+  const readyFetched = await runQuery('ready_to_apply_near_term', () => evaluateCompletedDryScansReadyToApply(
+    range.startDate,
+    range.endDate,
+    { dryScanLimit: 10, applyJobLimit: 10, instrument: queryInstrument },
+  ));
+  if (readyFetched.ok && readyFetched.value?.ready?.length > 0) {
     const applyResult = await enqueueReadyMaintenancePrepared({
       startDate: range.startDate,
       endDate: range.endDate,
@@ -14491,36 +14753,49 @@ async function runNearTermMaintenanceTick({
     if (applyResult.enqueuedJobs?.length) {
       const enqueued = applyResult.enqueuedJobs[0];
       await kickThresholdScanJobWorkerIfIdle();
-      const result = {
+      const result = maintenanceQueries.buildNearTermTickCompactResult({
         ok: true,
         action: 'enqueued_apply_prepared',
-        pass: 'near_term',
         job_id: enqueued.jobId,
         sourceJobId: enqueued.sourceJobId,
-        selectedIsoDate: enqueued.targetIsoDate || readyEval.ready[0]?.targetIsoDate || null,
-        scheduleDiagnostics,
+        selectedIsoDate: enqueued.targetIsoDate || readyFetched.value.ready[0]?.targetIsoDate || null,
         ...range,
-      };
+      });
       thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
       return result;
     }
   }
 
-  const activeDateScans = await fetchActiveDateThresholdScanIsoDates();
-  const top = scheduleDiagnostics.topDueDateCandidate;
+  const [dueSummaryFetched, activeDatesFetched] = await Promise.all([
+    runQuery('near_term_due_summary', () => fetchNearTermDueSummary(queryInstrument)),
+    runQuery('active_date_threshold_scans', () => fetchActiveDateThresholdScanIsoDates()),
+  ]);
+  if (!dueSummaryFetched.ok) {
+    const result = maintenanceQueries.buildNearTermTickCompactResult({
+      ok: false,
+      action: 'error',
+      error: dueSummaryFetched.message || 'due_summary_query_failed',
+      ...range,
+    });
+    thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
+    return result;
+  }
+
+  const dueSummary = dueSummaryFetched.value;
+  const activeDateScans = activeDatesFetched.ok ? activeDatesFetched.value : new Set();
+  const top = dueSummary.topDueDateCandidate;
   if (!top || activeDateScans.has(top.isoDate)) {
-    const dueBacklog = (scheduleDiagnostics.watchedDueCount || 0) + (scheduleDiagnostics.generalDueCount || 0);
-    const result = {
+    const dueBacklog = (dueSummary.watchedDueCount || 0) + (dueSummary.generalDueCount || 0);
+    const result = maintenanceQueries.buildNearTermTickCompactResult({
       ok: true,
       action: 'none_needed',
-      pass: 'near_term',
       reason: top
         ? 'due_date_already_queued'
         : (dueBacklog > 0 ? 'due_backlog_no_near_term_candidate' : 'no_due_near_term_dates'),
       unhealthy: dueBacklog > 0 && !top,
-      scheduleDiagnostics,
+      dueSummary,
       ...range,
-    };
+    });
     thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
     return result;
   }
@@ -14531,15 +14806,15 @@ async function runNearTermMaintenanceTick({
     generalDueCount: top.generalDueCount,
   });
   await kickThresholdScanJobWorkerIfIdle();
-  const result = {
+  const result = maintenanceQueries.buildNearTermTickCompactResult({
     ok: true,
     action: 'enqueued_date_scan',
-    pass: 'near_term',
     selectedIsoDate: top.isoDate,
-    ...enqueued,
-    scheduleDiagnostics,
+    isoDate: top.isoDate,
+    job_id: enqueued.jobId,
+    dueSummary,
     ...range,
-  };
+  });
   thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
   return result;
 }
@@ -20564,16 +20839,18 @@ app.get('/api/admin/maintenance-recommendations', async (req, res) => {
 });
 
 app.get('/api/admin/maintenance/status', async (req, res) => {
+  const instrument = maintenanceQueries.createQueryInstrumenter('maintenance-status');
   try {
     const { startDate, endDate } = resolveMaintenanceDateRange(req.query || {});
-    const status = await buildMaintenanceStatus(startDate, endDate);
+    const compact = req.query?.compact !== '0' && req.query?.verbose !== '1';
+    const status = await buildMaintenanceStatus(startDate, endDate, { compact, instrument });
     if (!status.ok) {
       return res.status(400).json(status);
     }
     return res.json(status);
   } catch (err) {
     console.error('maintenance-status error:', err.message);
-    return res.status(500).json({ error: err.message || String(err) });
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -20631,13 +20908,19 @@ app.post('/api/admin/maintenance/apply-ready-prepared', async (req, res) => {
 });
 
 app.post('/api/admin/maintenance/near-term-tick', async (req, res) => {
+  const instrument = maintenanceQueries.createQueryInstrumenter('near-term-tick');
   try {
     const body = req.body || {};
     if (!supabase) {
       return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
     }
     const { startDate, endDate } = resolveMaintenanceDateRange(body);
-    const result = await runNearTermMaintenanceTick({ startDate, endDate, source: 'external' });
+    const result = await runNearTermMaintenanceTick({
+      startDate,
+      endDate,
+      source: 'external',
+      instrument,
+    });
     if (!result.ok && result.error) {
       return res.status(400).json(result);
     }
@@ -20648,9 +20931,15 @@ app.post('/api/admin/maintenance/near-term-tick', async (req, res) => {
   }
 });
 
-app.get('/api/admin/adaptive-schedule/diagnostics', async (_req, res) => {
+app.get('/api/admin/adaptive-schedule/diagnostics', async (req, res) => {
+  const instrument = maintenanceQueries.createQueryInstrumenter('adaptive-schedule-diagnostics');
   try {
-    const diagnostics = await buildAdaptiveScheduleDiagnostics();
+    const compact = req.query?.compact !== '0' && req.query?.verbose !== '1';
+    const diagnostics = await buildAdaptiveScheduleDiagnostics({
+      compact,
+      instrument,
+      includeSessionSample: !compact,
+    });
     return res.json({ ok: true, ...diagnostics });
   } catch (err) {
     console.error('adaptive-schedule diagnostics error:', err.message);
