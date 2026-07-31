@@ -6,7 +6,7 @@ const path = require('path');
 
 console.log('cache version regression');
 
-const RELEASE_VERSION = '10';
+const RELEASE_VERSION = '11';
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'public/sw.js'), 'utf8');
@@ -28,8 +28,9 @@ function extractConst(source, name) {
   const helpers = [
     '/push-client.js?v=10',
     '/profile-auth-client.js?v=10',
-    '/browse-session-filters.js?v=10',
-    '/browse-ui-semantics.js?v=10',
+    '/browse-live-schedule.js?v=11',
+    '/browse-session-filters.js?v=11',
+    '/browse-ui-semantics.js?v=11',
   ];
   for (const src of helpers) {
     assert.ok(html.includes(`src="${src}"`), `missing script ${src}`);
@@ -74,7 +75,7 @@ function extractConst(source, name) {
 }
 
 {
-  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-30-full-card-hierarchy-v10'"));
+  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-31-live-lessons-v11'"));
   assert.ok(html.includes('id="live-panel"'));
   assert.ok(html.includes('id="day-rail"'));
   assert.ok(html.includes('class="watch-btn'));
@@ -100,6 +101,7 @@ function extractConst(source, name) {
 {
   const serverJs = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
   assert.ok(serverJs.includes("app.get('/browse-session-filters.js'"));
+  assert.ok(serverJs.includes("app.get('/browse-live-schedule.js'"));
 }
 
 console.log('cache version regression: ok');

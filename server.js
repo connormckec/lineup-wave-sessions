@@ -77,6 +77,10 @@ app.get('/browse-session-filters.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'browse-session-filters.js'));
 });
+app.get('/browse-live-schedule.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'lib', 'browse-live-schedule.js'));
+});
 app.get('/browse-ui-semantics.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(__dirname, 'lib', 'browse-ui-semantics.js'));

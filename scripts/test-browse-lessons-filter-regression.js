@@ -213,10 +213,48 @@ const allSessions = [
 }
 
 {
+  const lessonOnly = mkSession({
+    key: 'lesson-only-level',
+    wave: 1,
+    waveSide: 'Left Wave',
+    level: 'Lesson Only',
+  });
+  const beginnerLesson = mkSession({
+    key: 'beginner-lesson-only',
+    wave: 2,
+    waveSide: 'Right Wave',
+    level: 'Beginner (lesson only)',
+  });
+  const mixedCase = mkSession({
+    key: 'mixed-case-lesson',
+    wave: 1,
+    waveSide: 'Left Wave',
+    level: 'LESSON slot',
+  });
+  const pool = [...allSessions, lessonOnly, beginnerLesson, mixedCase];
+
+  assert.strictEqual(filters.isLessonSession(lessonOnly), true, 'Lesson Only level');
+  assert.strictEqual(filters.isLessonSession(beginnerLesson), true, 'Beginner (lesson only)');
+  assert.strictEqual(filters.isLessonSession({ waveSide: 'Left Lesson' }), true, 'Left Lesson waveSide');
+  assert.strictEqual(filters.isLessonSession({ waveSide: 'Right Lesson' }), true, 'Right Lesson waveSide');
+  assert.strictEqual(filters.isLessonSession(mixedCase), true, 'mixed capitalization');
+
+  const hidden = visibleBrowseSessions(pool, { showLessons: false });
+  assert.ok(!hidden.some((s) => s.key === 'lesson-only-level'), 'Lesson Only hidden when Show lessons');
+  assert.ok(!hidden.some((s) => s.key === 'beginner-lesson-only'), 'Beginner (lesson only) hidden');
+  assert.ok(!hidden.some((s) => s.key === 'mixed-case-lesson'), 'mixed-case lesson hidden');
+  assert.ok(hidden.some((s) => s.key === 'advanced-turns'), 'non-lesson remains visible');
+
+  const shown = visibleBrowseSessions(pool, { showLessons: true });
+  assert.ok(shown.some((s) => s.key === 'lesson-only-level'), 'Lesson Only visible when Hide lessons');
+}
+
+{
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.ok(html.includes('/browse-session-filters.js'), 'index loads browse-session-filters');
   assert.ok(html.includes('BSF().matchesWaveFilter'), 'index delegates to BrowseSessionFilters');
   assert.ok(html.includes('saveShowLessonsPreference'), 'index persists showLessons');
+  assert.ok(html.includes("showLessons ? 'Hide lessons' : 'Show lessons'"), 'toggle label state');
   assert.ok(!html.includes('LESSON_WAVES.includes'), 'removed wave-only lesson check');
 }
 

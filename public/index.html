@@ -549,8 +549,9 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/browse-session-filters.js?v=10"></script>
-<script src="/browse-ui-semantics.js?v=10"></script>
+<script src="/browse-live-schedule.js?v=11"></script>
+<script src="/browse-session-filters.js?v=11"></script>
+<script src="/browse-ui-semantics.js?v=11"></script>
 <div id="app">
 
   <header id="header">
@@ -709,6 +710,7 @@ input.field:focus{border-color:var(--accent)}
 const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 const PAC = () => window.ProfileAuthClient;
 const SEM = () => window.BrowseUiSemantics;
+const BLS = () => window.BrowseLiveSchedule;
 
 const STORAGE = {
   userKey: 'ap_user_key',
@@ -720,8 +722,8 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '10';
-const APP_SHELL_BUILD = '2026-07-30-full-card-hierarchy-v10';
+const SW_CACHE_VERSION = '11';
+const APP_SHELL_BUILD = '2026-07-31-live-lessons-v11';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
@@ -1827,12 +1829,34 @@ function browserLocalDateIso() {
 }
 
 function isSessionPast(session, nowMs = Date.now()) {
+  const sem = SEM();
+  if (sem?.isSessionPast) return sem.isSessionPast(session, nowMs);
+  if (BLS()?.isSessionPastAt) return BLS().isSessionPastAt(session, nowMs);
   const ts = session?.start_ts ?? session?.ts ?? session?.startTs;
   if (ts == null) return false;
   const startMs = Number(ts) * 1000;
   if (!Number.isFinite(startMs)) return false;
-  const durationMs = (session?.durationMinutes || 90) * 60 * 1000;
-  return nowMs > startMs + durationMs;
+  return nowMs >= startMs + ((session?.durationMinutes || 60) * 60 * 1000);
+}
+
+function liveScheduleDataUnavailable() {
+  if (bootState === 'error' && !allKnownSessions().length) return true;
+  if (selectedDateMeta.statusReason === 'error' && !allKnownSessions().length) return true;
+  if (bootState === 'loading' && uiLoading && !allKnownSessions().length) return false;
+  return false;
+}
+
+function computeLiveNowFallback(sessions, nowMs) {
+  const sem = SEM();
+  if (sem?.computeLiveNowSummary) return sem.computeLiveNowSummary(sessions, nowMs);
+  return {
+    mode: 'idle',
+    nextSession: null,
+    helpText: 'Based on booking inventory; may differ from surfers physically in the water due to no-shows or operational changes.',
+    left: null,
+    right: null,
+    windowLabel: null,
+  };
 }
 
 function normalizeSessionDate(session) {
@@ -1888,7 +1912,8 @@ function surfSessions(list) {
 }
 
 function isLessonSession(s) {
-  return BSF().isLessonSession(s);
+  const bsf = BSF();
+  return bsf?.isLessonSession ? bsf.isLessonSession(s) : false;
 }
 
 function matchesWaveFilter(s) {
@@ -2553,6 +2578,20 @@ let activeLevels  = new Set();
 let pickerDraft   = { dayKey: todayKey(), fromH: null, toH: null };
 let pickerOpen    = false;
 let refreshPollTimer = null;
+let livePanelTimer = null;
+
+function scheduleLivePanelRefresh() {
+  if (livePanelTimer) clearInterval(livePanelTimer);
+  let lastLiveDayKey = todayKey();
+  livePanelTimer = setInterval(() => {
+    const tk = todayKey();
+    if (tk !== lastLiveDayKey) {
+      lastLiveDayKey = tk;
+    }
+    renderLivePanel();
+    if (activeDayKey === todayKey()) renderBrowse();
+  }, 60_000);
+}
 
 function scheduleRefreshPoll() {
   if (refreshPollTimer) clearInterval(refreshPollTimer);
@@ -2649,7 +2688,11 @@ function scheduleFocusRefresh() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') scheduleFocusRefresh();
+  if (document.visibilityState === 'visible') {
+    renderLivePanel();
+    if (activeDayKey === todayKey()) renderBrowse();
+    scheduleFocusRefresh();
+  }
 });
 window.addEventListener('focus', scheduleFocusRefresh);
 window.addEventListener('pageshow', (e) => {
@@ -2749,20 +2792,19 @@ function liveSideHtml(label, side) {
 
 function renderLivePanel() {
   const panel = document.getElementById('live-panel');
-  const sem = SEM();
   if (!panel) return;
-  if (!sem) {
+  if (liveScheduleDataUnavailable()) {
     panel.className = 'live-panel is-idle';
     panel.innerHTML = '<div class="live-empty">Live session data unavailable</div>';
     return;
   }
-  const live = sem.computeLiveNowSummary(sessionsForLiveNow(), Date.now());
+  const live = computeLiveNowFallback(sessionsForLiveNow(), Date.now());
   panel.className = `live-panel${live.mode === 'idle' ? ' is-idle' : ' is-live'}`;
   const help = `<p class="live-help">${live.helpText}</p>`;
   if (live.mode === 'idle') {
     panel.innerHTML = `
       <div class="live-head"><div class="live-title">Live now</div></div>
-      <div class="live-empty">No session currently running${live.nextSession ? ` · Next: ${live.nextSession.time} ${live.nextSession.level}` : ''}</div>
+      <div class="live-empty">No session live right now${live.nextSession ? ` · Next: ${live.nextSession.time} ${live.nextSession.level}` : ''}</div>
       ${help}`;
     return;
   }
@@ -3624,6 +3666,7 @@ initTimeSelects();
     finishLoading('ready');
     safeRenderAll();
     scheduleRefreshPoll();
+    scheduleLivePanelRefresh();
   } catch (err) {
     if (selectedDateSessions.length) {
       finishLoading('ready');
