@@ -252,7 +252,7 @@ const allSessions = [
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   assert.ok(html.includes('/browse-session-filters.js'), 'index loads browse-session-filters');
-  assert.ok(html.includes('BSF().matchesWaveFilter'), 'index delegates to BrowseSessionFilters');
+  assert.ok(html.includes('BSF().matchesWaveFilter') || html.includes('LB().sessionFilters'), 'index delegates to session filters');
   assert.ok(html.includes('saveShowLessonsPreference'), 'index persists showLessons');
   assert.ok(html.includes("showLessons ? 'Hide lessons' : 'Show lessons'"), 'toggle label state');
   assert.ok(!html.includes('LESSON_WAVES.includes'), 'removed wave-only lesson check');

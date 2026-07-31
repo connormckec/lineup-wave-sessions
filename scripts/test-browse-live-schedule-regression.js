@@ -153,7 +153,9 @@ function atLocal(isoDate, clock) {
 
 {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('/browse-live-schedule.js?v=11'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/browse-live-schedule.js?v=12'), 'index loads browse-live-schedule');
+  assert.ok(html.includes('/lineup-config.js?v=12'), 'index loads lineup-config');
+  assert.ok(html.includes('LineupBrowse'), 'index uses LineupBrowse namespace');
   assert.ok(html.includes('liveScheduleDataUnavailable'), 'index distinguishes unavailable vs idle');
   assert.ok(html.includes('No session live right now'), 'idle copy updated');
   assert.ok(html.includes('scheduleLivePanelRefresh'), 'minute refresh wired');

@@ -549,9 +549,10 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/browse-live-schedule.js?v=11"></script>
-<script src="/browse-session-filters.js?v=11"></script>
-<script src="/browse-ui-semantics.js?v=11"></script>
+<script src="/lineup-config.js?v=12"></script>
+<script src="/browse-live-schedule.js?v=12"></script>
+<script src="/browse-session-filters.js?v=12"></script>
+<script src="/browse-ui-semantics.js?v=12"></script>
 <div id="app">
 
   <header id="header">
@@ -709,8 +710,11 @@ input.field:focus{border-color:var(--accent)}
 <script>
 const BOOKING_URL = 'https://booking.atlanticparksurf.com/activity-agenda';
 const PAC = () => window.ProfileAuthClient;
-const SEM = () => window.BrowseUiSemantics;
-const BLS = () => window.BrowseLiveSchedule;
+const LB = () => window.LineupBrowse || {};
+const SEM = () => LB().semantics;
+const BLS = () => LB().liveSchedule;
+const BSF = () => LB().sessionFilters;
+const bookingTimeZone = () => window.LineupConfig?.BOOKING_TZ || 'America/New_York';
 
 const STORAGE = {
   userKey: 'ap_user_key',
@@ -722,8 +726,8 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '11';
-const APP_SHELL_BUILD = '2026-07-31-live-lessons-v11';
+const SW_CACHE_VERSION = '12';
+const APP_SHELL_BUILD = '2026-07-31-browse-script-isolation-v12';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
@@ -1795,9 +1799,6 @@ const WAVE_FILTERS = [
   { wave: 1, label: 'Left Wave' },
   { wave: 2, label: 'Right Wave' },
 ];
-const BOOKING_TZ = 'America/New_York';
-const BSF = () => window.BrowseSessionFilters;
-
 function getParkTodayIso() {
   return todayKey();
 }
@@ -1805,7 +1806,7 @@ function getParkTodayIso() {
 function addDaysToParkIso(isoDate, days) {
   const [y, m, d] = String(isoDate).slice(0, 10).split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
-  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(dt);
+  return new Intl.DateTimeFormat('en-CA', { timeZone: bookingTimeZone() }).format(dt);
 }
 
 function getRelativeDateLabel(isoDate) {
@@ -1819,7 +1820,7 @@ function getRelativeDateLabel(isoDate) {
     weekday: 'short',
     month: 'short',
     day: 'numeric',
-    timeZone: BOOKING_TZ,
+    timeZone: bookingTimeZone(),
   }).format(ref);
 }
 
@@ -1869,7 +1870,7 @@ function normalizeWatchItem(w) {
   const sessionKey = w.session_key || w.key;
   const live = data.sessions.find(s => s.key === sessionKey);
   const iso = w.iso_date || w.isoDate || w.dateKey || (live ? dateKeyFromSession(live) : null)
-    || (w.start_ts || w.ts ? new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date((w.start_ts || w.ts) * 1000)) : null);
+    || (w.start_ts || w.ts ? new Intl.DateTimeFormat('en-CA', { timeZone: bookingTimeZone() }).format(new Date((w.start_ts || w.ts) * 1000)) : null);
   return normalizeSessionDate({
     ...w,
     key: sessionKey,
@@ -2034,7 +2035,7 @@ for (let h = 6; h <= 22; h++) {
 }
 
 function todayKey() {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date());
+  return new Intl.DateTimeFormat('en-CA', { timeZone: bookingTimeZone() }).format(new Date());
 }
 
 function getParkTodayIso() {
@@ -2126,7 +2127,7 @@ function dateKeyFromSession(s) {
   if (s.isoDate) return s.isoDate;
   if (s.iso_date) return s.iso_date;
   if (!s.ts) return '';
-  return new Intl.DateTimeFormat('en-CA', { timeZone: BOOKING_TZ }).format(new Date(s.ts * 1000));
+  return new Intl.DateTimeFormat('en-CA', { timeZone: bookingTimeZone() }).format(new Date(s.ts * 1000));
 }
 
 function dateLabel(dateKey) {

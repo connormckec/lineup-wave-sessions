@@ -88,14 +88,16 @@ async function withTestServer(fn) {
 {
   const html = fs.readFileSync(path.join(__dirname, '../public/browse-prototype.html'), 'utf8');
   const semanticsSrc = fs.readFileSync(path.join(__dirname, '../lib/browse-ui-semantics.js'), 'utf8');
-  assert.match(html, /\/lib\/browse-ui-semantics\.js\?v=2/);
+  assert.match(html, /\/browse-ui-semantics\.js\?v=12/);
+  assert.match(html, /\/lineup-config\.js\?v=12/);
+  assert.match(html, /\/browse-live-schedule\.js\?v=12/);
   assert.match(html, /\/lib\/browse-ui-fixtures\.js\?v=2/);
   assert.match(html, /id="proto-error-root"/);
   assert.match(html, /validateSemanticsContract/);
   assert.match(html, /REQUIRED_SEM_FUNCTIONS/);
   assert.doesNotMatch(html, /browse-ui-semantics\.js"><\/script>/);
   assert.match(semanticsSrc, /computeLiveNowSummary/);
-  assert.match(semanticsSrc, /window\.BrowseUiSemantics = api/);
+  assert.match(semanticsSrc, /window\.LineupBrowse\.semantics = semantics/);
 }
 
 // 5. Production index.html unchanged.
@@ -128,8 +130,8 @@ async function withTestServer(fn) {
       }, { timeout: 15000 });
 
       const state = await page.evaluate(() => ({
-        semType: typeof window.BrowseUiSemantics?.computeLiveNowSummary,
-        semVersion: window.BrowseUiSemantics?.SEMANTICS_API_VERSION || null,
+        semType: typeof window.LineupBrowse?.semantics?.computeLiveNowSummary,
+        semVersion: window.LineupBrowse?.semantics?.SEMANTICS_API_VERSION || null,
         error: document.querySelector('#proto-error-root .proto-error')?.textContent || null,
         errorCount: document.querySelectorAll('.proto-error').length,
         liveText: document.getElementById('live-panel')?.textContent?.trim() || '',
@@ -157,7 +159,7 @@ async function withTestServer(fn) {
     {
       const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const page = await context.newPage();
-      await page.route('**/lib/browse-ui-semantics.js*', (route) => route.abort());
+      await page.route('**/browse-ui-semantics.js*', (route) => route.abort());
       await page.goto(`${origin}/browse-prototype.html`, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('#proto-error-root .proto-error', { timeout: 10000 });
       const failure = await page.evaluate(() => ({

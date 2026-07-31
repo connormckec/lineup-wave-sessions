@@ -282,8 +282,10 @@ body{overflow:hidden}
     <aside id="sidebar" aria-label="Browse summary"></aside>
   </div>
 </div>
+<script src="/lineup-config.js?v=12"></script>
+<script src="/browse-live-schedule.js?v=12"></script>
 <script src="/lib/browse-ui-fixtures.js?v=2"></script>
-<script src="/lib/browse-ui-semantics.js?v=2"></script>
+<script src="/browse-ui-semantics.js?v=12"></script>
 <script>
 'use strict';
 
@@ -576,7 +578,7 @@ function initBrowsePrototype() {
   if (initFailed) return;
   try {
     FIX = window.BrowseUiFixtures;
-    SEM = window.BrowseUiSemantics;
+    SEM = window.LineupBrowse?.semantics;
     if (!FIX) {
       showInitError(`Missing fixture script: <code>/lib/browse-ui-fixtures.js?v=${PROTO_ASSET_VERSION}</code>.`, 'fixtures');
       return;
