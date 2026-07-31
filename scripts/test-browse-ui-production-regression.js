@@ -33,6 +33,11 @@ const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8
   assert.match(html, /sessionsForLiveNow/);
   assert.match(html, /watchButtonHtml/);
   assert.match(html, /aria-label="Previous day"/);
+  assert.match(html, /id="selected-date-label"/);
+  assert.match(html, /formatSelectedDateBrowseLabel/);
+  assert.match(html, /renderSelectedDateLabel/);
+  assert.match(html, /Book now/);
+  assert.doesNotMatch(html, /Book at Atlantic Park/);
   assert.match(html, /aria-label="Next day"/);
 }
 

@@ -112,11 +112,19 @@ html,body{height:100%;background:var(--surface);color:var(--text);font-family:va
 .pane-header{font-family:var(--font-display);font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-secondary);margin:14px 16px 16px}
 #pane-watching,#pane-setup{padding:14px 16px var(--content-pad-bottom)}
 #sidebar{display:none}
-.day-rail-wrap{padding:8px 0 4px;background:var(--surface);position:sticky;top:0;z-index:5;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:4px;padding-left:6px;padding-right:6px}
+.day-rail-wrap{padding:8px 6px 4px;background:var(--surface);position:sticky;top:0;z-index:5;border-bottom:1px solid var(--card-border)}
+.day-nav-row{display:flex;align-items:center;gap:4px;margin-bottom:6px}
+.selected-date-label{
+  flex:1;min-width:0;border:none;background:none;
+  font-family:var(--font-display);font-size:clamp(13px,3.6vw,16px);font-weight:700;
+  color:var(--text);text-align:center;cursor:pointer;padding:8px 4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.2;
+}
+.selected-date-label:active{color:var(--accent)}
 .day-nav-btn{width:44px;height:44px;border:1px solid var(--card-border);border-radius:var(--radius-sm);background:var(--card);color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:0}
 .day-nav-btn:disabled{opacity:.35;cursor:default}
 .day-nav-btn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
-.day-rail{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:0 4px;scroll-padding-left:4px;-webkit-overflow-scrolling:touch;flex:1;min-width:0}
+.day-rail{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:0 2px;scroll-padding-left:2px;-webkit-overflow-scrolling:touch;min-width:0}
 .day-rail::-webkit-scrollbar{display:none}
 .day-cal-btn{width:44px;height:44px;border:1px solid var(--card-border);border-radius:var(--radius-sm);background:var(--card);color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .day-chip{flex:0 0 auto;min-width:58px;padding:7px 10px 6px;background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-sm);text-align:center;cursor:pointer;position:relative;font:inherit;color:inherit}
@@ -560,18 +568,21 @@ input.field:focus{border-color:var(--accent)}
 
     <div class="pane active" id="pane-browse">
       <div class="day-rail-wrap">
-        <button type="button" id="date-prev" class="day-nav-btn" aria-label="Previous day">
-          <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
-        </button>
+        <div class="day-nav-row">
+          <button type="button" id="date-prev" class="day-nav-btn" aria-label="Previous day">
+            <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <button type="button" id="selected-date-label" class="selected-date-label" aria-label="Selected date">Today</button>
+          <button type="button" id="date-next" class="day-nav-btn" aria-label="Next day">
+            <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+          <button type="button" id="cal-btn" class="day-cal-btn" aria-label="Open calendar">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+            </svg>
+          </button>
+        </div>
         <div class="day-rail" id="day-rail"></div>
-        <button type="button" id="date-next" class="day-nav-btn" aria-label="Next day">
-          <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
-        </button>
-        <button type="button" id="cal-btn" class="day-cal-btn" aria-label="Pick date and time">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
-          </svg>
-        </button>
       </div>
       <div class="filter-bar"><div class="filter-tabs filter-wave-tabs" id="wave-chips"></div></div>
       <div class="lessons-toggle-row" id="lessons-toggle-row"></div>
@@ -2071,6 +2082,31 @@ function dateLabel(dateKey) {
   return getRelativeDateLabel(dateKey);
 }
 
+function formatSelectedDateBrowseLabel(isoDate) {
+  if (!isoDate) return '';
+  const [y, mo, da] = isoDate.split('-').map(Number);
+  const ref = new Date(y, mo - 1, da, 12, 0, 0);
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  }).format(ref);
+  if (isoDate === browserLocalDateIso()) return `Today · ${formatted}`;
+  return formatted;
+}
+
+function renderSelectedDateLabel() {
+  const el = document.getElementById('selected-date-label');
+  if (!el) return;
+  const label = formatSelectedDateBrowseLabel(activeDayKey);
+  el.textContent = label;
+  el.setAttribute('aria-label', `Selected date ${label}, open calendar`);
+}
+
+function bookButtonHtml() {
+  return `<a class="book-btn" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer" aria-label="Book now at Atlantic Park"><span>Book now</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>`;
+}
+
 function getPickerDays() {
   const weeks = data.scrapeMeta?.scrapeWeeksAhead
     || data.scrapeWeeksAhead
@@ -2692,7 +2728,7 @@ function liveSideHtml(label, side) {
     <div class="live-time">${timeLabel}${side.stateLabel ? ` · ${side.stateLabel}` : ''}</div>
     <div class="live-occupancy">${availability}</div>
     <div class="live-verified${side.stale ? ' stale' : ''}">${side.verifiedLine}</div>
-    ${watchButtonHtml(s, 'watch-btn live-watch-btn')}
+      ${watchButtonHtml(s, 'watch-btn live-watch-btn')}
   </div>`;
 }
 
@@ -2738,6 +2774,7 @@ function renderDayRail() {
       <div class="day-open">${d.openCount} open</div>
     </button>`).join('');
   updateDateNavButtons();
+  renderSelectedDateLabel();
 }
 
 function selectedDayMetaForSidebar() {
@@ -3069,7 +3106,7 @@ function sessionCardHtml(s) {
     </div>
     <div class="sc-side">
       <button type="button" class="watch-btn ${watchClass}" data-watch="${payload}" aria-label="${watch.label} this session">${watch.label}</button>
-      <a class="book-btn" href="${BOOKING_URL}" target="_blank" rel="noopener noreferrer"><span>Book at Atlantic Park</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>
+      ${bookButtonHtml()}
     </div>
   </article>`;
 }
@@ -3136,7 +3173,7 @@ function renderWatching() {
       </div>
       <div class="wc-foot">
         ${statusHtml}
-        <a class="book-link wc-book" href="${bookUrl}" target="_blank" rel="noopener noreferrer">Book at Atlantic Park</a>
+        <a class="book-link wc-book" href="${bookUrl}" target="_blank" rel="noopener noreferrer" aria-label="Book now at Atlantic Park">Book now</a>
       </div>
     </div>`;
   }).join('');
@@ -3465,6 +3502,7 @@ document.getElementById('day-rail').addEventListener('click', (e) => {
 
 document.getElementById('date-prev').addEventListener('click', () => shiftActiveDay(-1));
 document.getElementById('date-next').addEventListener('click', () => shiftActiveDay(1));
+document.getElementById('selected-date-label').addEventListener('click', openPicker);
 
 document.getElementById('live-panel').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-watch]');
