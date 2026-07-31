@@ -254,6 +254,45 @@ html,body{height:100%;background:var(--surface);color:var(--text);font-family:va
   touch-action:none;
 }
 .picker-sheet.open{transform:translate(-50%,0)}
+
+/* ── Beta footer & feedback ── */
+.beta-footer{
+  flex-shrink:0;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--card-border);background:var(--surface);text-align:center;
+}
+.beta-footer-text{margin:0 0 6px;font-size:10px;line-height:1.45;color:var(--text-muted)}
+.beta-footer-link{
+  background:none;border:none;padding:0;font-size:10px;color:var(--text-secondary);
+  text-decoration:underline;cursor:pointer;font-family:inherit;
+}
+.beta-footer-link:hover{color:var(--text)}
+.report-backdrop{
+  position:fixed;inset:0;background:rgba(2,12,27,.65);z-index:210;
+  opacity:0;pointer-events:none;transition:opacity .25s;
+}
+.report-backdrop.open{opacity:1;pointer-events:auto}
+.report-sheet{
+  position:fixed;left:50%;bottom:0;transform:translate(-50%,100%);
+  width:100%;max-width:480px;background:var(--card);border:1px solid var(--border);
+  border-radius:16px 16px 0 0;padding:12px 16px calc(16px + env(safe-area-inset-bottom));
+  z-index:211;transition:transform .3s cubic-bezier(.32,.72,0,1);
+}
+.report-sheet.open{transform:translate(-50%,0)}
+.report-sheet[hidden]{display:none!important}
+.report-title{
+  font-family:var(--font-display);font-size:13px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--sub);margin-bottom:8px;
+}
+.report-hint{font-size:12px;color:var(--sub);line-height:1.45;margin:0 0 10px}
+.report-field{
+  width:100%;min-height:96px;resize:vertical;border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:10px 12px;font:inherit;font-size:13px;
+  background:var(--surface);color:var(--text);box-sizing:border-box;
+}
+.report-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.report-msg{font-size:12px;color:var(--sub);margin:10px 0 0;min-height:1.2em}
+#report-issue-preview{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+
 .picker-handle{
   width:36px;height:4px;border-radius:2px;background:var(--muted);
   margin:0 auto 14px;
@@ -541,12 +580,12 @@ input.field:focus{border-color:var(--accent)}
 </head>
 <body>
 <script src="/session-data-status.js"></script>
-<script src="/lineup-config.js?v=16"></script>
-<script src="/session-capacity-config.js?v=16"></script>
-<script src="/browse-session-filters.js?v=16"></script>
-<script src="/browse-live-schedule.js?v=16"></script>
-<script src="/browse-availability-view.js?v=16"></script>
-<script src="/browse-ui-semantics.js?v=16"></script>
+<script src="/lineup-config.js?v=17"></script>
+<script src="/session-capacity-config.js?v=17"></script>
+<script src="/browse-session-filters.js?v=17"></script>
+<script src="/browse-live-schedule.js?v=17"></script>
+<script src="/browse-availability-view.js?v=17"></script>
+<script src="/browse-ui-semantics.js?v=17"></script>
 <div id="app">
 
   <header id="header">
@@ -678,6 +717,24 @@ input.field:focus{border-color:var(--accent)}
   <aside id="sidebar" aria-label="Browse summary"></aside>
   </div>
 
+  <footer id="beta-footer" class="beta-footer">
+    <p class="beta-footer-text">Unofficial beta companion for Atlantic Park. Not affiliated with Atlantic Park. Availability may change. All bookings are completed through Atlantic Park.</p>
+    <button type="button" class="beta-footer-link" id="report-issue-btn">Report an issue</button>
+  </footer>
+
+  <div id="report-backdrop" class="report-backdrop" hidden></div>
+  <div id="report-sheet" class="report-sheet" hidden aria-hidden="true" role="dialog" aria-labelledby="report-title">
+    <div class="report-title" id="report-title">Report an issue</div>
+    <p class="report-hint">Describe what went wrong. We attach app version, page, date, and device info — never secrets or notification endpoints.</p>
+    <textarea id="report-issue-description" class="report-field" placeholder="What happened?" maxlength="2000"></textarea>
+    <div class="report-actions">
+      <button type="button" class="btn btn-outline" id="report-issue-cancel">Cancel</button>
+      <button type="button" class="btn btn-outline" id="report-issue-submit">Copy report</button>
+    </div>
+    <p id="report-issue-msg" class="report-msg"></p>
+    <pre id="report-issue-preview" aria-hidden="true"></pre>
+  </div>
+
   <div id="picker-backdrop" class="picker-backdrop"></div>
   <div id="picker-sheet" class="picker-sheet" aria-hidden="true">
     <div class="picker-handle" id="picker-handle"></div>
@@ -721,8 +778,8 @@ const STORAGE = {
   showLessons: 'ap_show_lessons',
 };
 
-const SW_CACHE_VERSION = '16';
-const APP_SHELL_BUILD = '2026-07-31-availability-view-v14';
+const SW_CACHE_VERSION = '17';
+const APP_SHELL_BUILD = '2026-07-31-beta-hardening-v1';
 const LPC = () => window.LineupPushClient;
 let pushUiStatus = { uiState: 'loading', thisDeviceActive: false };
 let cachedUserKey = null;
@@ -2654,6 +2711,7 @@ let data          = {
 let activeDayKey  = todayKey();
 let activeWave    = null;
 let showLessons   = loadShowLessonsPreference();
+let activeTab     = 'browse';
 let filterFromH   = null;
 let filterToH     = null;
 let activeLevels  = new Set();
@@ -3593,7 +3651,117 @@ async function removeWatch(id) {
   renderAll();
 }
 
+function getActiveTabName() {
+  const active = document.querySelector('.pane.active');
+  if (active?.id?.startsWith('pane-')) return active.id.slice(5);
+  return activeTab;
+}
+
+function buildReportIssueContext() {
+  const watchedKeys = watchlistForUi().map((w) => w.session_key || w.key).filter(Boolean);
+  return {
+    appVersion: APP_SHELL_BUILD,
+    appRelease: data.appVersion || null,
+    page: getActiveTabName(),
+    selectedDate: activeDayKey || todayKey(),
+    sessionKeys: watchedKeys.length ? watchedKeys : null,
+    generatedAt: new Date().toISOString(),
+    appUrl: `${window.location.origin}${window.location.pathname}${window.location.search}`,
+    browser: {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      language: navigator.language,
+      viewport: `${window.innerWidth}x${window.innerHeight}`,
+    },
+    dataAgeMinutes: data.dataAgeMinutes ?? null,
+    lastSuccessfulScrape: data.lastSuccessfulScrape ?? null,
+    dataSource: browseState.meta.dataSource || data.dataSource || data.source || null,
+  };
+}
+
+function buildReportIssueText(description) {
+  const ctx = buildReportIssueContext();
+  const lines = [
+    'Lineup beta feedback',
+    '',
+    `Description: ${String(description || '').trim() || '(none)'}`,
+    '',
+    '--- Context (no secrets) ---',
+    `Report generated: ${ctx.generatedAt}`,
+    `App URL: ${ctx.appUrl}`,
+    `App version: ${ctx.appVersion}`,
+    ctx.appRelease ? `Release: ${ctx.appRelease}` : null,
+    `Page: ${ctx.page}`,
+    `Selected date: ${ctx.selectedDate}`,
+    ctx.sessionKeys ? `Session key(s): ${ctx.sessionKeys.join(', ')}` : 'Session key: n/a',
+    `Data age (minutes): ${ctx.dataAgeMinutes ?? 'unknown'}`,
+    `Last successful scrape: ${ctx.lastSuccessfulScrape ?? 'unknown'}`,
+    `Data source: ${ctx.dataSource ?? 'unknown'}`,
+    '',
+    '--- Device ---',
+    `User agent: ${ctx.browser.userAgent}`,
+    `Platform: ${ctx.browser.platform}`,
+    `Language: ${ctx.browser.language}`,
+    `Viewport: ${ctx.browser.viewport}`,
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function openReportIssue() {
+  const backdrop = document.getElementById('report-backdrop');
+  const sheet = document.getElementById('report-sheet');
+  const msg = document.getElementById('report-issue-msg');
+  if (!backdrop || !sheet) return;
+  if (msg) msg.textContent = '';
+  backdrop.hidden = false;
+  sheet.hidden = false;
+  requestAnimationFrame(() => {
+    backdrop.classList.add('open');
+    sheet.classList.add('open');
+    sheet.setAttribute('aria-hidden', 'false');
+  });
+  document.getElementById('report-issue-description')?.focus();
+}
+
+function closeReportIssue() {
+  const backdrop = document.getElementById('report-backdrop');
+  const sheet = document.getElementById('report-sheet');
+  if (!backdrop || !sheet) return;
+  backdrop.classList.remove('open');
+  sheet.classList.remove('open');
+  sheet.setAttribute('aria-hidden', 'true');
+  window.setTimeout(() => {
+    backdrop.hidden = true;
+    sheet.hidden = true;
+  }, 260);
+}
+
+async function submitReportIssue() {
+  const input = document.getElementById('report-issue-description');
+  const msg = document.getElementById('report-issue-msg');
+  const preview = document.getElementById('report-issue-preview');
+  const text = buildReportIssueText(input?.value || '');
+  if (preview) preview.textContent = text;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      if (msg) {
+        msg.textContent = 'Report copied. Paste it into an email or message to Connor.';
+        msg.style.color = '#00c9a7';
+      }
+      return;
+    }
+  } catch (err) {
+    console.warn('[reportIssue]', err);
+  }
+  if (msg) {
+    msg.textContent = 'Could not copy automatically — select and copy the report text below.';
+    msg.style.color = 'var(--sub)';
+  }
+}
+
 function showTab(name, btn) {
+  activeTab = name;
   document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach((b) => b.classList.remove('on'));
   document.getElementById('pane-' + name).classList.add('active');
@@ -3731,6 +3899,13 @@ document.getElementById('wave-chips').addEventListener('click', (e) => {
 document.getElementById('lessons-toggle-row').addEventListener('click', (e) => {
   if (e.target.closest('#lessons-toggle')) toggleLessons();
 });
+
+document.getElementById('report-issue-btn')?.addEventListener('click', openReportIssue);
+document.getElementById('report-issue-cancel')?.addEventListener('click', closeReportIssue);
+document.getElementById('report-issue-submit')?.addEventListener('click', () => {
+  submitReportIssue().catch((err) => console.warn('[reportIssue]', err));
+});
+document.getElementById('report-backdrop')?.addEventListener('click', closeReportIssue);
 
 document.getElementById('cal-btn').addEventListener('click', openPicker);
 document.getElementById('picker-backdrop').addEventListener('click', closePicker);

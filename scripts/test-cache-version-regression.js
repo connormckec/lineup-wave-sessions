@@ -6,7 +6,7 @@ const path = require('path');
 
 console.log('cache version regression');
 
-const RELEASE_VERSION = '16';
+const RELEASE_VERSION = '17';
 const ROOT = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
 const sw = fs.readFileSync(path.join(ROOT, 'public/sw.js'), 'utf8');
@@ -28,12 +28,12 @@ function extractConst(source, name) {
   const helpers = [
     '/push-client.js?v=10',
     '/profile-auth-client.js?v=10',
-    '/lineup-config.js?v=16',
-    '/session-capacity-config.js?v=16',
-    '/browse-live-schedule.js?v=16',
-    '/browse-session-filters.js?v=16',
-    '/browse-availability-view.js?v=16',
-    '/browse-ui-semantics.js?v=16',
+    '/lineup-config.js?v=17',
+    '/session-capacity-config.js?v=17',
+    '/browse-live-schedule.js?v=17',
+    '/browse-session-filters.js?v=17',
+    '/browse-availability-view.js?v=17',
+    '/browse-ui-semantics.js?v=17',
   ];
   for (const src of helpers) {
     assert.ok(html.includes(`src="${src}"`), `missing script ${src}`);
@@ -78,7 +78,9 @@ function extractConst(source, name) {
 }
 
 {
-  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-31-availability-view-v14'"));
+  assert.ok(html.includes("APP_SHELL_BUILD = '2026-07-31-beta-hardening-v1'"));
+  assert.ok(html.includes('id="beta-footer"'));
+  assert.ok(html.includes('id="report-issue-btn"'));
   assert.ok(html.includes('id="live-panel"'));
   assert.ok(html.includes('id="day-rail"'));
   assert.ok(html.includes('class="watch-btn'));
