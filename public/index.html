@@ -3099,6 +3099,9 @@ function cardVerifiedLabel(s) {
     const detailedAt = s.lastDetailedCheckAt || s.last_detailed_check_at;
     if (detailedAt) return `Details ${formatRelativeTime(detailedAt)}`;
   }
+  if (s?.available !== false) {
+    return 'Count not yet verified';
+  }
   const basicAt = s.lastBasicCheckAt || s.last_basic_check_at;
   if (basicAt) return `Schedule ${formatRelativeTime(basicAt)}`;
   return '';

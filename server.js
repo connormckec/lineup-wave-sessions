@@ -14482,7 +14482,7 @@ function computeOldestInventoryAges(evaluations = []) {
     oldestTrusted = oldestTrusted == null ? age : Math.max(oldestTrusted, age);
     if (row.watched) {
       oldestWatched = oldestWatched == null ? age : Math.max(oldestWatched, age);
-    } else if ((row.inventory?.hoursUntilStart ?? 999) <= 72) {
+    } else if ((row.inventory?.hoursUntilStart ?? 999) <= adaptiveSchedule.NEAR_TERM_DATE_SCAN_MAX_HOURS_GENERAL) {
       oldestGeneralNearTerm = oldestGeneralNearTerm == null ? age : Math.max(oldestGeneralNearTerm, age);
     }
   }
@@ -14838,6 +14838,10 @@ async function runNearTermMaintenanceTick({
     generalDueCount: top.generalDueCount,
   });
   await kickThresholdScanJobWorkerIfIdle();
+  const selectedDateDiagnostics = maintenanceQueries.buildSelectedDateDiagnostics(top, {
+    remainingDueDateCount: Math.max(0, (dueSummary.dueDateCount || 0) - 1),
+    selectionReason: top.watchedDueCount > 0 ? 'watched_due_priority' : 'general_most_overdue',
+  });
   const result = maintenanceQueries.buildNearTermTickCompactResult({
     ok: true,
     action: 'enqueued_date_scan',
@@ -14845,6 +14849,7 @@ async function runNearTermMaintenanceTick({
     isoDate: top.isoDate,
     job_id: enqueued.jobId,
     dueSummary,
+    selectedDateDiagnostics,
     ...range,
   });
   thresholdNearTermScheduler.recordNearTermMaintenanceTick(result, source);
