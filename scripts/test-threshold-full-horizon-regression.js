@@ -449,4 +449,209 @@ function daysFromTodayFn(isoDate, todayIso = '2026-07-27') {
   assert.strictEqual(diag.configuredLatestSupportedDate, '2026-08-23');
 }
 
+function dueBucket(isoDate, hours, targetMin, actualMin, lastCheck = null) {
+  return {
+    isoDate,
+    watchedDueCount: 0,
+    generalDueCount: 1,
+    earliestHoursUntilStart: hours,
+    mostOverdueMinutes: actualMin == null
+      ? targetMin
+      : Math.max(0, actualMin - targetMin),
+    sessions: [{
+      targetFreshnessMinutes: targetMin,
+      actualFreshnessMinutes: actualMin,
+      lastSuccessfulCheck: lastCheck,
+      due: true,
+    }],
+  };
+}
+
+{
+  const near = dueBucket('2026-07-28', 30, 120, 500, '2026-07-25T12:00:00.000Z');
+  const week1 = dueBucket('2026-07-31', 94, 360, 2000, '2026-07-20T12:00:00.000Z');
+  const week2 = dueBucket('2026-08-08', 280, 1440, 10000, '2026-07-20T12:00:00.000Z');
+  const week3 = dueBucket('2026-08-15', 450, 4320, 20000, '2026-07-20T12:00:00.000Z');
+  const candidates = [week3, week2, week1, near];
+
+  const normalOnly = thresholdDatePipeline.trySelectFirstEligible(
+    thresholdDatePipeline.sortDateScanCandidates(candidates, { daysFromTodayFn, todayIso: '2026-07-27' }),
+    { daysFromTodayFn, todayIso: '2026-07-27' },
+  );
+  assert.strictEqual(normalOnly.selected?.isoDate, '2026-07-28', 'strict band ordering starves distant dates');
+
+  const fairnessPick = thresholdDatePipeline.selectDueDateScanCandidate(candidates, {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 0,
+  });
+  assert.strictEqual(fairnessPick.selectionPath, 'future_horizon_fairness');
+  assert.ok(fairnessPick.selected.earliestHoursUntilStart > 72);
+  assert.strictEqual(fairnessPick.selected.isoDate, '2026-08-08', 'highest normalized overdue wins future slot');
+}
+
+{
+  const near = dueBucket('2026-07-28', 30, 120, 200, '2026-07-27T08:00:00.000Z');
+  const week1 = dueBucket('2026-07-31', 94, 360, 5000, '2026-07-20T12:00:00.000Z');
+  const week2 = dueBucket('2026-08-08', 280, 1440, 10000, '2026-07-20T12:00:00.000Z');
+  const candidates = [week2, week1, near];
+  const tickStartMs = Date.parse('2026-07-27T12:00:00.000Z');
+  const selections = [];
+  let recentBeyond72GeneralScanCount = 0;
+  let lastBeyond72GeneralScanAt = null;
+  let recentGeneralEnqueueCount = 0;
+  let lastGeneralEnqueueAt = null;
+
+  for (let tick = 0; tick < 13; tick += 1) {
+    const nowMs = tickStartMs + tick * thresholdDatePipeline.NEAR_TERM_TICK_INTERVAL_MS;
+    if (lastBeyond72GeneralScanAt
+      && nowMs - new Date(lastBeyond72GeneralScanAt).getTime() >= thresholdDatePipeline.FUTURE_HORIZON_FAIRNESS_WINDOW_MS) {
+      recentBeyond72GeneralScanCount = 0;
+      lastBeyond72GeneralScanAt = null;
+    }
+    if (lastGeneralEnqueueAt
+      && nowMs - new Date(lastGeneralEnqueueAt).getTime() >= thresholdDatePipeline.GENERAL_SCAN_ADMISSION_WINDOW_MS) {
+      recentGeneralEnqueueCount = 0;
+      lastGeneralEnqueueAt = null;
+    }
+    const generalScanAdmission = thresholdDatePipeline.evaluateGeneralScanAdmission({
+      recentGeneralEnqueueCount,
+      lastGeneralEnqueueAt,
+      nowMs,
+    });
+    const result = thresholdDatePipeline.selectDueDateScanCandidate(candidates, {
+      daysFromTodayFn,
+      todayIso: '2026-07-27',
+      recentBeyond72GeneralScanCount,
+      lastBeyond72GeneralScanAt,
+      generalScanAdmission,
+      nowMs,
+    });
+    if (!result.selected || !generalScanAdmission.allowed) continue;
+    selections.push({
+      isoDate: result.selected.isoDate,
+      selectionPath: result.selectionPath,
+      tick,
+    });
+    recentGeneralEnqueueCount += 1;
+    lastGeneralEnqueueAt = new Date(nowMs).toISOString();
+    if (result.selected.earliestHoursUntilStart > 72) {
+      recentBeyond72GeneralScanCount = 1;
+      lastBeyond72GeneralScanAt = new Date(nowMs).toISOString();
+    }
+  }
+
+  const futurePicks = selections.filter((row) => row.selectionPath === 'future_horizon_fairness');
+  assert.ok(futurePicks.length >= 2, 'future fairness fires at least twice across a 60-minute window');
+  assert.ok(selections.some((row) => row.isoDate === '2026-07-28'), 'near-term still receives scans');
+}
+
+{
+  const neverVerified = dueBucket('2026-08-10', 336, 1440, null, null);
+  const stale = dueBucket('2026-08-15', 450, 4320, 9000, '2026-07-01T12:00:00.000Z');
+  const sorted = thresholdDatePipeline.sortFutureFairnessCandidates([stale, neverVerified]);
+  assert.strictEqual(sorted[0].isoDate, '2026-08-10', 'never-verified dates outrank merely stale dates');
+  const neverFreshness = thresholdDatePipeline.evaluateOverdueFreshness({
+    targetFreshnessMinutes: 1440,
+    actualFreshnessMinutes: null,
+  });
+  assert.strictEqual(neverFreshness.neverVerified, true);
+  assert.strictEqual(neverFreshness.normalizedOverdueRatio, null);
+}
+
+{
+  const at72 = {
+    isoDate: '2026-07-30',
+    watchedDueCount: 0,
+    generalDueCount: 1,
+    earliestHoursUntilStart: 72,
+    sessions: [{ targetFreshnessMinutes: 120, actualFreshnessMinutes: 500, due: true }],
+  };
+  const beyond72 = {
+    isoDate: '2026-07-31',
+    watchedDueCount: 0,
+    generalDueCount: 1,
+    earliestHoursUntilStart: 72.01,
+    sessions: [{ targetFreshnessMinutes: 360, actualFreshnessMinutes: 5000, due: true }],
+  };
+  assert.strictEqual(
+    thresholdDatePipeline.isBeyond72HourGeneralBucket(at72, { daysFromTodayFn, todayIso: '2026-07-27' }),
+    false,
+    '<=72 hours stays on near-term priority',
+  );
+  assert.strictEqual(
+    thresholdDatePipeline.isBeyond72HourGeneralBucket(beyond72, { daysFromTodayFn, todayIso: '2026-07-27' }),
+    true,
+    '>72 hours is eligible for future-horizon fairness',
+  );
+  const fairnessOverride = thresholdDatePipeline.selectDueDateScanCandidate([
+    beyond72,
+    dueBucket('2026-07-28', 30, 120, 500, '2026-07-25T12:00:00.000Z'),
+  ], {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 0,
+  });
+  assert.strictEqual(fairnessOverride.selectionPath, 'future_horizon_fairness');
+  assert.strictEqual(fairnessOverride.selected?.isoDate, '2026-07-31');
+  const nearOnly = thresholdDatePipeline.selectDueDateScanCandidate([at72], {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 0,
+  });
+  assert.strictEqual(nearOnly.selectionPath, 'near_term_priority');
+  assert.strictEqual(nearOnly.selected?.isoDate, '2026-07-30');
+  assert.strictEqual(nearOnly.futureFairness?.applied, false);
+}
+
+{
+  const near = dueBucket('2026-07-28', 30, 120, 200, '2026-07-27T08:00:00.000Z');
+  const week1 = dueBucket('2026-07-31', 94, 360, 5000, '2026-07-20T12:00:00.000Z');
+  const result = thresholdDatePipeline.selectDueDateScanCandidate([week1, near], {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 1,
+    lastBeyond72GeneralScanAt: '2026-07-27T12:00:00.000Z',
+  });
+  assert.strictEqual(result.selectionPath, 'near_term_priority');
+  assert.strictEqual(result.selected?.isoDate, '2026-07-28');
+}
+
+{
+  const watched = {
+    isoDate: '2026-08-15',
+    watchedDueCount: 1,
+    generalDueCount: 0,
+    earliestHoursUntilStart: 450,
+    sessions: [{ targetFreshnessMinutes: 5, actualFreshnessMinutes: 10, due: true, watched: true }],
+  };
+  const near = dueBucket('2026-07-28', 30, 120, 500, '2026-07-25T12:00:00.000Z');
+  const far = dueBucket('2026-08-15', 450, 4320, 20000, '2026-07-01T12:00:00.000Z');
+  const result = thresholdDatePipeline.selectDueDateScanCandidate([far, near, watched], {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 0,
+  });
+  assert.strictEqual(result.selected?.isoDate, '2026-08-15');
+  assert.strictEqual(result.selectionPath, 'watched_priority');
+}
+
+{
+  const week2 = dueBucket('2026-08-08', 280, 1440, 10000, '2026-07-01T12:00:00.000Z');
+  const week3 = dueBucket('2026-08-15', 450, 4320, 12000, '2026-07-01T12:00:00.000Z');
+  const futurePick = thresholdDatePipeline.selectDueDateScanCandidate([week3, week2], {
+    daysFromTodayFn,
+    todayIso: '2026-07-27',
+    recentBeyond72GeneralScanCount: 0,
+  });
+  assert.strictEqual(futurePick.selected?.isoDate, '2026-08-08', '8–14-day dates can win over >14-day when more overdue');
+}
+
+{
+  const serverJs = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  assert.match(serverJs, /fetchRecentBeyond72GeneralDateScanState/);
+  assert.match(serverJs, /futureHorizonFairness/);
+  assert.match(serverJs, /nearTermMaintenanceSelection/);
+}
+
 console.log('threshold full horizon regression: ok');

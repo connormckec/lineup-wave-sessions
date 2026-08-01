@@ -14501,6 +14501,47 @@ async function fetchRecentFarGeneralDateScanCount(todayIso, {
   return count;
 }
 
+async function fetchRecentBeyond72GeneralDateScanState(todayIso, {
+  withinMs = thresholdDatePipeline.FUTURE_HORIZON_FAIRNESS_WINDOW_MS,
+} = {}) {
+  if (!supabase) {
+    return thresholdDatePipeline.evaluateFutureHorizonFairness({
+      overdueBeyond72Count: 0,
+      recentBeyond72GeneralScanCount: 0,
+    });
+  }
+  const since = new Date(Date.now() - withinMs).toISOString();
+  const { data, error } = await supabase
+    .from('threshold_scan_jobs')
+    .select('id, dates, created_at, results_json')
+    .eq('mode', THRESHOLD_SCAN_JOB_MODE_DATE)
+    .in('status', ['queued', 'running', 'completed'])
+    .gte('created_at', since)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(error.message);
+
+  let recentBeyond72GeneralScanCount = 0;
+  let lastBeyond72GeneralScanAt = null;
+  for (const job of data || []) {
+    const isoDate = job.dates?.[0] || job.results_json?.targetIsoDate;
+    if (!isoDate) continue;
+    const watchedDueCount = Number(job.results_json?.watchedDueCount ?? 0);
+    if (watchedDueCount > 0) continue;
+    const createdDay = dateKeyInBookingTz(new Date(job.created_at));
+    const daysAhead = Math.round(
+      (parseDateKey(isoDate) - parseDateKey(createdDay)) / 86_400_000,
+    );
+    if (daysAhead > 3) {
+      recentBeyond72GeneralScanCount += 1;
+      if (!lastBeyond72GeneralScanAt) lastBeyond72GeneralScanAt = job.created_at;
+    }
+  }
+  return {
+    recentBeyond72GeneralScanCount,
+    lastBeyond72GeneralScanAt,
+  };
+}
+
 async function fetchActiveDateThresholdScanIsoDates() {
   if (!supabase) return new Set();
   const { data, error } = await supabase
@@ -14655,6 +14696,9 @@ async function fetchNearTermDueSummary(instrument = null) {
   const recentFarGeneralScanCount = supabase
     ? await fetchRecentFarGeneralDateScanCount(todayIso)
     : 0;
+  const beyond72ScanState = supabase
+    ? await fetchRecentBeyond72GeneralDateScanState(todayIso)
+    : { recentBeyond72GeneralScanCount: 0, lastBeyond72GeneralScanAt: null };
   const generalScanAdmission = supabase
     ? await fetchGeneralScanAdmissionState()
     : thresholdDatePipeline.evaluateGeneralScanAdmission({ recentGeneralEnqueueCount: 0 });
@@ -14663,6 +14707,17 @@ async function fetchNearTermDueSummary(instrument = null) {
     todayIso,
     recentFarGeneralScanCount,
     generalScanAdmission,
+    recentBeyond72GeneralScanCount: beyond72ScanState.recentBeyond72GeneralScanCount,
+    lastBeyond72GeneralScanAt: beyond72ScanState.lastBeyond72GeneralScanAt,
+  });
+  const futureFairness = thresholdDatePipeline.evaluateFutureHorizonFairness({
+    overdueBeyond72Count: selection.overdueByHorizonBand
+      ? (selection.overdueByHorizonBand['72-168h'] || 0)
+        + (selection.overdueByHorizonBand['8-14d'] || 0)
+        + (selection.overdueByHorizonBand['>14d'] || 0)
+      : 0,
+    recentBeyond72GeneralScanCount: beyond72ScanState.recentBeyond72GeneralScanCount,
+    lastBeyond72GeneralScanAt: beyond72ScanState.lastBeyond72GeneralScanAt,
   });
   const dueScanWithSelection = {
     ...dueScan,
@@ -14680,6 +14735,13 @@ async function fetchNearTermDueSummary(instrument = null) {
     recentFarGeneralScanCount,
     farGeneralHourlyBudget: thresholdDatePipeline.FAR_GENERAL_SCAN_BUDGET_PER_HOUR,
     generalScanAdmission,
+    selectionPath: selection.selectionPath || null,
+    futureHorizonFairness: {
+      ...(selection.futureFairness || futureFairness),
+      lastBeyond72GeneralScanAt: beyond72ScanState.lastBeyond72GeneralScanAt,
+      recentBeyond72GeneralScanCount: beyond72ScanState.recentBeyond72GeneralScanCount,
+    },
+    overdueByHorizonBand: selection.overdueByHorizonBand || null,
     deferredFarGeneralScan: selection.deferredFarCandidate
       ? {
         isoDate: selection.deferredFarCandidate.isoDate,
@@ -15024,20 +15086,46 @@ async function runNearTermMaintenanceTick({
     remainingDueDateCount: Math.max(0, (dueSummary.dueDateCount || 0) - 1),
     selectionReason: top.watchedDueCount > 0
       ? 'watched_due_priority'
-      : `general_band_${thresholdDatePipeline.resolveGeneralPriorityBand(top, {
-        daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
-        todayIso: getParkTodayIso(),
-      })}_normalized_overdue`,
+      : (dueSummary.selectionPath === 'future_horizon_fairness'
+        ? 'future_horizon_fairness'
+        : `general_band_${thresholdDatePipeline.resolveGeneralPriorityBand(top, {
+          daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+          todayIso: getParkTodayIso(),
+        })}_normalized_overdue`),
     horizon: dueSummary.horizon || getRuntimeSupportedHorizon(),
     remainingOverdueByCadenceTier: dueSummary.remainingOverdueByCadenceTier || null,
     generalPriorityBand: thresholdDatePipeline.resolveGeneralPriorityBand(top, {
       daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
       todayIso: getParkTodayIso(),
     }),
+    horizonSelectionBand: thresholdDatePipeline.resolveHorizonSelectionBand(top, {
+      daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+      todayIso: getParkTodayIso(),
+    }),
+    selectionPath: dueSummary.selectionPath || null,
+    futureHorizonFairness: dueSummary.futureHorizonFairness || null,
+    overdueByHorizonBand: dueSummary.overdueByHorizonBand || null,
     deferredFarGeneralScan: dueSummary.deferredFarGeneralScan || null,
     deferredGeneralScanAdmission: dueSummary.deferredGeneralScanAdmission || null,
     generalScanAdmission: dueSummary.generalScanAdmission || null,
   });
+  console.log(JSON.stringify({
+    nearTermMaintenanceSelection: {
+      selectedIsoDate: top.isoDate,
+      selectionPath: dueSummary.selectionPath || null,
+      horizonSelectionBand: thresholdDatePipeline.resolveHorizonSelectionBand(top, {
+        daysFromTodayFn: (isoDate) => daysFromToday(isoDate),
+        todayIso: getParkTodayIso(),
+      }),
+      targetCadenceMinutes: selectedDateDiagnostics?.targetFreshnessMinutes ?? null,
+      actualFreshnessMinutes: selectedDateDiagnostics?.actualFreshnessMinutes ?? null,
+      neverVerified: selectedDateDiagnostics?.neverVerified === true,
+      normalizedOverdueRatio: selectedDateDiagnostics?.normalizedOverdueRatio ?? null,
+      hoursUntilEarliestSession: selectedDateDiagnostics?.hoursUntilEarliestSession ?? null,
+      futureHorizonFairness: dueSummary.futureHorizonFairness || null,
+      overdueByHorizonBand: dueSummary.overdueByHorizonBand || null,
+    },
+  }));
   const result = maintenanceQueries.buildNearTermTickCompactResult({
     ok: true,
     action: 'enqueued_date_scan',
